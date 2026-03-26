@@ -72,4 +72,6 @@ def parse_stream_event(payload: Mapping[str, Any]) -> IncomingChatMessage:
         sender_id=sender_id,
         message_type=message_type.lower(),
         text=_extract_text(event),
+        sender_staff_id=_pick_string(event, ("senderStaffId", "sender_staff_id", "staffId", "userid")) or sender_id,
+        sender_nick=_pick_string(event, ("senderNick", "sender_nick", "nick", "name")),
     )

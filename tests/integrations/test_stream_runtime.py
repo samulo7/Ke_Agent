@@ -9,6 +9,7 @@ from app.integrations.dingtalk.stream_runtime import (
     handle_single_chat_payload,
     load_stream_credentials,
 )
+from app.schemas.user_context import UserContext
 from app.services.single_chat import SingleChatService
 
 
@@ -24,6 +25,14 @@ class _FakeSender:
         self.card_payloads.append(dict(card_payload))
 
 
+class _FakeResolver:
+    def __init__(self, context: UserContext) -> None:
+        self._context = context
+
+    def resolve(self, message: Any) -> UserContext:
+        return self._context
+
+
 def _make_payload(*, text: str, conversation_type: str = "single", message_type: str = "text") -> dict[str, Any]:
     return {
         "event_id": "evt-a05-001",
@@ -36,6 +45,19 @@ def _make_payload(*, text: str, conversation_type: str = "single", message_type:
 
 
 class StreamRuntimeTests(unittest.TestCase):
+    def _build_resolver(self) -> _FakeResolver:
+        return _FakeResolver(
+            UserContext(
+                user_id="user-a05-001",
+                user_name="Alice",
+                dept_id="dept-finance",
+                dept_name="Finance",
+                identity_source="openapi",
+                is_degraded=False,
+                resolved_at="2026-03-26T00:00:00+00:00",
+            )
+        )
+
     def test_load_stream_credentials_uses_default_endpoint(self) -> None:
         credentials = load_stream_credentials(
             {
@@ -59,11 +81,13 @@ class StreamRuntimeTests(unittest.TestCase):
             _make_payload(text="你好"),
             service=SingleChatService(),
             sender=sender,
+            user_context_resolver=self._build_resolver(),
         )
 
         self.assertEqual("text", outcome["channel"])
         self.assertEqual(1, len(sender.text_messages))
         self.assertEqual(0, len(sender.card_payloads))
+        self.assertEqual("user-a05-001", outcome["user_context"]["user_id"])
 
     def test_handle_single_chat_payload_sends_card_for_application_question(self) -> None:
         sender = _FakeSender()
@@ -71,6 +95,7 @@ class StreamRuntimeTests(unittest.TestCase):
             _make_payload(text="我要申请采购制度文件"),
             service=SingleChatService(),
             sender=sender,
+            user_context_resolver=self._build_resolver(),
         )
 
         self.assertEqual("interactive_card", outcome["channel"])
@@ -85,6 +110,7 @@ class StreamRuntimeTests(unittest.TestCase):
                 {"conversation_type": "single"},
                 service=SingleChatService(),
                 sender=sender,
+                user_context_resolver=self._build_resolver(),
             )
 
 

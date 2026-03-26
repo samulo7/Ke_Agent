@@ -15,6 +15,8 @@ class IncomingChatMessage:
     sender_id: str
     message_type: str
     text: str
+    sender_staff_id: str = ""
+    sender_nick: str = ""
 
 
 @dataclass(frozen=True)

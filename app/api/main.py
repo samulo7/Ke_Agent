@@ -11,12 +11,14 @@ from app.core.structured_logging import configure_structured_logging
 from app.core.trace_middleware import TraceMiddleware
 from app.services.health import HealthService
 from app.services.single_chat import SingleChatService
+from app.services.user_context import UserContextResolver, build_default_user_context_resolver
 
 
 def create_app(
     *,
     health_service: HealthService | None = None,
     single_chat_service: SingleChatService | None = None,
+    user_context_resolver: UserContextResolver | None = None,
     log_level: str = "INFO",
     log_stream: TextIO | None = None,
 ) -> FastAPI:
@@ -25,6 +27,7 @@ def create_app(
     app.add_middleware(TraceMiddleware)
     app.state.health_service = health_service or HealthService()
     app.state.single_chat_service = single_chat_service or SingleChatService()
+    app.state.user_context_resolver = user_context_resolver or build_default_user_context_resolver()
     app.include_router(health_router)
     app.include_router(dingtalk_router)
     return app

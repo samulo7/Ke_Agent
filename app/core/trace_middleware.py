@@ -34,6 +34,10 @@ class TraceMiddleware(BaseHTTPMiddleware):
         trace_id = incoming_trace or str(uuid4())
         token = set_trace_id(trace_id)
         request.state.trace_id = trace_id
+        request.state.user_id = getattr(request.state, "user_id", "unknown")
+        request.state.dept_id = getattr(request.state, "dept_id", "unknown")
+        request.state.identity_source = getattr(request.state, "identity_source", "event_fallback")
+        request.state.is_degraded = getattr(request.state, "is_degraded", True)
 
         started = perf_counter()
         try:
@@ -47,6 +51,10 @@ class TraceMiddleware(BaseHTTPMiddleware):
                     "obs": {
                         "module": "api.middleware",
                         "trace_id": trace_id,
+                        "user_id": getattr(request.state, "user_id", "unknown"),
+                        "dept_id": getattr(request.state, "dept_id", "unknown"),
+                        "identity_source": getattr(request.state, "identity_source", "event_fallback"),
+                        "is_degraded": getattr(request.state, "is_degraded", True),
                         "event": "request_exception",
                         "path": str(request.url.path),
                         "method": request.method,
@@ -69,6 +77,10 @@ class TraceMiddleware(BaseHTTPMiddleware):
                 "obs": {
                     "module": "api.middleware",
                     "trace_id": trace_id,
+                    "user_id": getattr(request.state, "user_id", "unknown"),
+                    "dept_id": getattr(request.state, "dept_id", "unknown"),
+                    "identity_source": getattr(request.state, "identity_source", "event_fallback"),
+                    "is_degraded": getattr(request.state, "is_degraded", True),
                     "event": "request_completed",
                     "path": str(request.url.path),
                     "method": request.method,

@@ -10,6 +10,7 @@ from uuid import uuid4
 from app.core.trace_context import reset_trace_id, set_trace_id
 from app.integrations.dingtalk.stream_parser import parse_stream_event
 from app.services.single_chat import SingleChatService
+from app.services.user_context import UserContextResolver
 
 DEFAULT_STREAM_ENDPOINT = "https://api.dingtalk.com/v1.0/gateway/connections/open"
 DEFAULT_CHATBOT_TOPIC = "/v1.0/im/bot/messages/get"
@@ -102,8 +103,10 @@ def handle_single_chat_payload(
     *,
     service: SingleChatService,
     sender: ReplySender,
+    user_context_resolver: UserContextResolver,
 ) -> dict[str, Any]:
     incoming_message = parse_stream_event(payload)
+    user_context = user_context_resolver.resolve(incoming_message)
     result = service.handle(incoming_message)
     reply = result.reply
 
@@ -116,6 +119,7 @@ def handle_single_chat_payload(
         "handled": result.handled,
         "reason": result.reason,
         "channel": reply.channel,
+        "user_context": user_context.to_dict(),
     }
 
 
@@ -166,6 +170,7 @@ def build_stream_client(
     credentials: DingTalkStreamCredentials,
     *,
     single_chat_service: SingleChatService | None = None,
+    user_context_resolver: UserContextResolver | None = None,
     stream_logger: logging.Logger | None = None,
     observability_logger: logging.Logger | None = None,
 ) -> Any:
@@ -173,6 +178,16 @@ def build_stream_client(
     stream_module.DingTalkStreamClient.OPEN_CONNECTION_API = credentials.stream_endpoint
 
     service = single_chat_service or SingleChatService()
+    context_resolver = user_context_resolver
+    if context_resolver is None:
+        from app.integrations.dingtalk.openapi_identity import DingTalkOpenAPIIdentityClient
+
+        context_resolver = UserContextResolver(
+            identity_client=DingTalkOpenAPIIdentityClient(
+                client_id=credentials.client_id,
+                client_secret=credentials.client_secret,
+            )
+        )
     sdk_logger = stream_logger or logging.getLogger("keagent.dingtalk.stream")
     obs_logger = observability_logger or logging.getLogger(OBS_LOGGER_NAME)
 
@@ -196,7 +211,9 @@ def build_stream_client(
                     incoming_message.to_dict(),
                     service=service,
                     sender=sender,
+                    user_context_resolver=context_resolver,
                 )
+                callback_message.extensions["user_context"] = outcome["user_context"]
                 return sdk.AckMessage.STATUS_OK, {
                     "trace_id": trace_id,
                     "result": outcome,
@@ -226,6 +243,18 @@ def build_stream_client(
                         "obs": {
                             "module": "integrations.dingtalk.stream",
                             "trace_id": trace_id,
+                            "user_id": outcome.get("user_context", {}).get("user_id", "unknown")
+                            if "outcome" in locals()
+                            else "unknown",
+                            "dept_id": outcome.get("user_context", {}).get("dept_id", "unknown")
+                            if "outcome" in locals()
+                            else "unknown",
+                            "identity_source": outcome.get("user_context", {}).get("identity_source", "event_fallback")
+                            if "outcome" in locals()
+                            else "event_fallback",
+                            "is_degraded": outcome.get("user_context", {}).get("is_degraded", True)
+                            if "outcome" in locals()
+                            else True,
                             "event": event,
                             "path": getattr(callback_message.headers, "topic", DEFAULT_CHATBOT_TOPIC),
                             "method": "STREAM_CALLBACK",
@@ -249,12 +278,14 @@ def run_stream_client_forever(
     credentials: DingTalkStreamCredentials,
     *,
     single_chat_service: SingleChatService | None = None,
+    user_context_resolver: UserContextResolver | None = None,
     stream_logger: logging.Logger | None = None,
     observability_logger: logging.Logger | None = None,
 ) -> None:
     client = build_stream_client(
         credentials,
         single_chat_service=single_chat_service,
+        user_context_resolver=user_context_resolver,
         stream_logger=stream_logger,
         observability_logger=observability_logger,
     )
