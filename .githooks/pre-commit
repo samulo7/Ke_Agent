@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "[INFO] Running memory-bank validation..."
+
+if command -v pwsh >/dev/null 2>&1; then
+  pwsh -NoProfile -ExecutionPolicy Bypass -File "./infra/scripts/validate-memory-bank.ps1"
+elif command -v powershell >/dev/null 2>&1; then
+  powershell -NoProfile -ExecutionPolicy Bypass -File "./infra/scripts/validate-memory-bank.ps1"
+else
+  echo "[FAIL] Neither 'pwsh' nor 'powershell' is available. Cannot run validation."
+  exit 1
+fi
+
+echo "[PASS] pre-commit memory-bank validation completed."
