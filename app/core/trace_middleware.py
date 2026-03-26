@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+import logging
+from time import perf_counter
+from typing import Any
+from uuid import uuid4
+
+from fastapi import Request
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from app.core.trace_context import reset_trace_id, set_trace_id
+
+TRACE_HEADER = "X-Trace-Id"
+OBS_LOGGER_NAME = "keagent.observability"
+
+
+def _derive_error_category(status_code: int) -> str | None:
+    if 400 <= status_code < 500:
+        return "client_error"
+    if status_code >= 500:
+        return "server_error"
+    return None
+
+
+class TraceMiddleware(BaseHTTPMiddleware):
+    """Propagate trace_id across request context, headers, and logs."""
+
+    def __init__(self, app: Any) -> None:
+        super().__init__(app)
+        self._logger = logging.getLogger(OBS_LOGGER_NAME)
+
+    async def dispatch(self, request: Request, call_next: Any):  # type: ignore[override]
+        incoming_trace = (request.headers.get(TRACE_HEADER) or "").strip()
+        trace_id = incoming_trace or str(uuid4())
+        token = set_trace_id(trace_id)
+        request.state.trace_id = trace_id
+
+        started = perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = round((perf_counter() - started) * 1000, 3)
+            error_category = getattr(request.state, "error_category", "server_error")
+            self._logger.error(
+                "request.exception",
+                extra={
+                    "obs": {
+                        "module": "api.middleware",
+                        "trace_id": trace_id,
+                        "event": "request_exception",
+                        "path": str(request.url.path),
+                        "method": request.method,
+                        "status_code": 500,
+                        "duration_ms": elapsed_ms,
+                        "error_category": error_category,
+                    }
+                },
+            )
+            reset_trace_id(token)
+            raise
+
+        elapsed_ms = round((perf_counter() - started) * 1000, 3)
+        status_code = int(response.status_code)
+        default_category = _derive_error_category(status_code)
+        error_category = getattr(request.state, "error_category", default_category)
+        self._logger.info(
+            "request.completed",
+            extra={
+                "obs": {
+                    "module": "api.middleware",
+                    "trace_id": trace_id,
+                    "event": "request_completed",
+                    "path": str(request.url.path),
+                    "method": request.method,
+                    "status_code": status_code,
+                    "duration_ms": elapsed_ms,
+                    "error_category": error_category,
+                }
+            },
+        )
+        response.headers[TRACE_HEADER] = trace_id
+        reset_trace_id(token)
+        return response
