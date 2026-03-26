@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 ConversationType = Literal["single", "group", "unknown"]
 OutputChannel = Literal["text", "interactive_card"]
+IntentType = Literal["policy_process", "document_request", "reimbursement", "leave", "fixed_quote", "other"]
+PermissionDecision = Literal["allow", "summary_only", "deny"]
 
 
 @dataclass(frozen=True)
@@ -43,11 +45,23 @@ class AgentReply:
 class ChatHandleResult:
     handled: bool
     reason: str
+    intent: IntentType
     reply: AgentReply
+    source_ids: tuple[str, ...] = ()
+    permission_decision: PermissionDecision = "allow"
+    knowledge_version: str = ""
+    answered_at: str = ""
+    citations: tuple[dict[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "handled": self.handled,
             "reason": self.reason,
+            "intent": self.intent,
             "reply": self.reply.to_dict(),
+            "source_ids": list(self.source_ids),
+            "permission_decision": self.permission_decision,
+            "knowledge_version": self.knowledge_version,
+            "answered_at": self.answered_at,
+            "citations": [dict(item) for item in self.citations],
         }

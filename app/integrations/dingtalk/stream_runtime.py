@@ -118,7 +118,13 @@ def handle_single_chat_payload(
     return {
         "handled": result.handled,
         "reason": result.reason,
+        "intent": result.intent,
         "channel": reply.channel,
+        "source_ids": list(result.source_ids),
+        "permission_decision": result.permission_decision,
+        "knowledge_version": result.knowledge_version,
+        "answered_at": result.answered_at,
+        "citations": [dict(item) for item in result.citations],
         "user_context": user_context.to_dict(),
     }
 
@@ -249,12 +255,21 @@ def build_stream_client(
                             "dept_id": outcome.get("user_context", {}).get("dept_id", "unknown")
                             if "outcome" in locals()
                             else "unknown",
+                            "intent": outcome.get("intent", "other") if "outcome" in locals() else "other",
                             "identity_source": outcome.get("user_context", {}).get("identity_source", "event_fallback")
                             if "outcome" in locals()
                             else "event_fallback",
                             "is_degraded": outcome.get("user_context", {}).get("is_degraded", True)
                             if "outcome" in locals()
                             else True,
+                            "source_ids": outcome.get("source_ids", []) if "outcome" in locals() else [],
+                            "permission_decision": outcome.get("permission_decision", "allow")
+                            if "outcome" in locals()
+                            else "allow",
+                            "knowledge_version": outcome.get("knowledge_version", "")
+                            if "outcome" in locals()
+                            else "",
+                            "answered_at": outcome.get("answered_at", "") if "outcome" in locals() else "",
                             "event": event,
                             "path": getattr(callback_message.headers, "topic", DEFAULT_CHATBOT_TOPIC),
                             "method": "STREAM_CALLBACK",

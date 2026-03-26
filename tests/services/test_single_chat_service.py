@@ -23,18 +23,43 @@ def make_message(
 
 
 class SingleChatServiceTests(unittest.TestCase):
-    def test_returns_text_for_generic_message(self) -> None:
+    def test_returns_knowledge_text_answer_for_policy_question(self) -> None:
         service = SingleChatService()
-        result = service.handle(make_message(text="hello there"))
+        result = service.handle(make_message(text="宴请标准是什么"))
         self.assertTrue(result.handled)
         self.assertEqual("text", result.reply.channel)
+        self.assertEqual("policy_process", result.intent)
+        self.assertEqual("knowledge_answer", result.reason)
+        self.assertIn("doc-policy-banquet-2026-01", result.source_ids)
+        self.assertEqual("allow", result.permission_decision)
+        self.assertTrue(result.knowledge_version)
+        self.assertTrue(result.answered_at)
+        self.assertGreaterEqual(len(result.citations), 1)
 
-    def test_returns_flow_guidance_card(self) -> None:
+    def test_returns_no_hit_when_knowledge_is_missing(self) -> None:
+        service = SingleChatService()
+        result = service.handle(make_message(text="hello there"))
+        self.assertFalse(result.handled)
+        self.assertEqual("text", result.reply.channel)
+        self.assertEqual("other", result.intent)
+        self.assertEqual("knowledge_no_hit", result.reason)
+        self.assertEqual(0, len(result.source_ids))
+
+    def test_returns_flow_guidance_card_for_leave(self) -> None:
         service = SingleChatService()
         result = service.handle(make_message(text="请假流程入口在哪"))
         self.assertTrue(result.handled)
         self.assertEqual("interactive_card", result.reply.channel)
         self.assertEqual("flow_guidance", result.reply.interactive_card["card_type"])
+        self.assertEqual("leave", result.intent)
+
+    def test_returns_flow_guidance_card_for_reimbursement(self) -> None:
+        service = SingleChatService()
+        result = service.handle(make_message(text="出差报销怎么弄"))
+        self.assertTrue(result.handled)
+        self.assertEqual("interactive_card", result.reply.channel)
+        self.assertEqual("flow_guidance", result.reply.interactive_card["card_type"])
+        self.assertEqual("reimbursement", result.intent)
 
     def test_returns_application_draft_card(self) -> None:
         service = SingleChatService()
@@ -42,12 +67,14 @@ class SingleChatServiceTests(unittest.TestCase):
         self.assertTrue(result.handled)
         self.assertEqual("interactive_card", result.reply.channel)
         self.assertEqual("application_draft", result.reply.interactive_card["card_type"])
+        self.assertEqual("document_request", result.intent)
 
     def test_rejects_non_single_chat(self) -> None:
         service = SingleChatService()
         result = service.handle(make_message(conversation_type="group"))
         self.assertFalse(result.handled)
         self.assertEqual("non_single_chat", result.reason)
+        self.assertEqual("other", result.intent)
 
 
 if __name__ == "__main__":

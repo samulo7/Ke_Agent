@@ -80,6 +80,7 @@ class DingTalkIdentityContextApiTests(unittest.TestCase):
         )
         self.assertEqual(200, response.status_code)
         body = response.json()
+        self.assertEqual("other", body["intent"])
         self.assertEqual("staff-a", body["user_context"]["user_id"])
         self.assertEqual("dept-finance", body["user_context"]["dept_id"])
         self.assertEqual("openapi", body["user_context"]["identity_source"])
@@ -94,8 +95,13 @@ class DingTalkIdentityContextApiTests(unittest.TestCase):
         self.assertEqual(trace_id, log["trace_id"])
         self.assertEqual(body["user_context"]["user_id"], log["user_id"])
         self.assertEqual(body["user_context"]["dept_id"], log["dept_id"])
+        self.assertEqual(body["intent"], log["intent"])
         self.assertEqual(body["user_context"]["identity_source"], log["identity_source"])
         self.assertEqual(body["user_context"]["is_degraded"], log["is_degraded"])
+        self.assertEqual(body["source_ids"], log["source_ids"])
+        self.assertEqual(body["permission_decision"], log["permission_decision"])
+        self.assertEqual(body["knowledge_version"], log["knowledge_version"])
+        self.assertEqual(body["answered_at"], log["answered_at"])
 
     def test_same_question_cross_department_has_no_context_mismatch(self) -> None:
         log_stream = StringIO()
@@ -117,6 +123,8 @@ class DingTalkIdentityContextApiTests(unittest.TestCase):
         self.assertEqual(200, response_b.status_code)
         body_a = response_a.json()
         body_b = response_b.json()
+        self.assertEqual("reimbursement", body_a["intent"])
+        self.assertEqual("reimbursement", body_b["intent"])
         self.assertEqual("dept-finance", body_a["user_context"]["dept_id"])
         self.assertEqual("dept-hr", body_b["user_context"]["dept_id"])
         self.assertNotEqual(body_a["user_context"]["dept_id"], body_b["user_context"]["dept_id"])
@@ -124,4 +132,3 @@ class DingTalkIdentityContextApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

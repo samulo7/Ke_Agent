@@ -21,8 +21,13 @@ async def receive_dingtalk_stream_event(
     trace_id = getattr(request.state, "trace_id", "")
     request.state.user_id = "unknown"
     request.state.dept_id = "unknown"
+    request.state.intent = "other"
     request.state.identity_source = "event_fallback"
     request.state.is_degraded = True
+    request.state.source_ids = []
+    request.state.permission_decision = "allow"
+    request.state.knowledge_version = ""
+    request.state.answered_at = ""
 
     try:
         incoming_message = parse_stream_event(payload)
@@ -47,6 +52,11 @@ async def receive_dingtalk_stream_event(
 
     single_chat_service: SingleChatService = request.app.state.single_chat_service
     outcome = single_chat_service.handle(incoming_message)
+    request.state.intent = outcome.intent
+    request.state.source_ids = list(outcome.source_ids)
+    request.state.permission_decision = outcome.permission_decision
+    request.state.knowledge_version = outcome.knowledge_version
+    request.state.answered_at = outcome.answered_at
     return JSONResponse(
         status_code=200,
         content={
@@ -57,6 +67,12 @@ async def receive_dingtalk_stream_event(
             "sender_id": incoming_message.sender_id,
             "handled": outcome.handled,
             "reason": outcome.reason,
+            "intent": outcome.intent,
+            "source_ids": list(outcome.source_ids),
+            "permission_decision": outcome.permission_decision,
+            "knowledge_version": outcome.knowledge_version,
+            "answered_at": outcome.answered_at,
+            "citations": [dict(item) for item in outcome.citations],
             "user_context": user_context.to_dict(),
             "reply": outcome.reply.to_dict(),
             "dingtalk_payload": build_dingtalk_payload(outcome.reply),

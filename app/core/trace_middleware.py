@@ -36,8 +36,13 @@ class TraceMiddleware(BaseHTTPMiddleware):
         request.state.trace_id = trace_id
         request.state.user_id = getattr(request.state, "user_id", "unknown")
         request.state.dept_id = getattr(request.state, "dept_id", "unknown")
+        request.state.intent = getattr(request.state, "intent", "other")
         request.state.identity_source = getattr(request.state, "identity_source", "event_fallback")
         request.state.is_degraded = getattr(request.state, "is_degraded", True)
+        request.state.source_ids = getattr(request.state, "source_ids", [])
+        request.state.permission_decision = getattr(request.state, "permission_decision", "allow")
+        request.state.knowledge_version = getattr(request.state, "knowledge_version", "")
+        request.state.answered_at = getattr(request.state, "answered_at", "")
 
         started = perf_counter()
         try:
@@ -53,8 +58,13 @@ class TraceMiddleware(BaseHTTPMiddleware):
                         "trace_id": trace_id,
                         "user_id": getattr(request.state, "user_id", "unknown"),
                         "dept_id": getattr(request.state, "dept_id", "unknown"),
+                        "intent": getattr(request.state, "intent", "other"),
                         "identity_source": getattr(request.state, "identity_source", "event_fallback"),
                         "is_degraded": getattr(request.state, "is_degraded", True),
+                        "source_ids": list(getattr(request.state, "source_ids", [])),
+                        "permission_decision": getattr(request.state, "permission_decision", "allow"),
+                        "knowledge_version": getattr(request.state, "knowledge_version", ""),
+                        "answered_at": getattr(request.state, "answered_at", ""),
                         "event": "request_exception",
                         "path": str(request.url.path),
                         "method": request.method,
@@ -79,8 +89,13 @@ class TraceMiddleware(BaseHTTPMiddleware):
                     "trace_id": trace_id,
                     "user_id": getattr(request.state, "user_id", "unknown"),
                     "dept_id": getattr(request.state, "dept_id", "unknown"),
+                    "intent": getattr(request.state, "intent", "other"),
                     "identity_source": getattr(request.state, "identity_source", "event_fallback"),
                     "is_degraded": getattr(request.state, "is_degraded", True),
+                    "source_ids": list(getattr(request.state, "source_ids", [])),
+                    "permission_decision": getattr(request.state, "permission_decision", "allow"),
+                    "knowledge_version": getattr(request.state, "knowledge_version", ""),
+                    "answered_at": getattr(request.state, "answered_at", ""),
                     "event": "request_completed",
                     "path": str(request.url.path),
                     "method": request.method,

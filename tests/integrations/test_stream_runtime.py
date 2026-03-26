@@ -85,9 +85,35 @@ class StreamRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual("text", outcome["channel"])
+        self.assertEqual("other", outcome["intent"])
+        self.assertFalse(outcome["handled"])
+        self.assertEqual("knowledge_no_hit", outcome["reason"])
         self.assertEqual(1, len(sender.text_messages))
         self.assertEqual(0, len(sender.card_payloads))
         self.assertEqual("user-a05-001", outcome["user_context"]["user_id"])
+        self.assertEqual([], outcome["source_ids"])
+        self.assertEqual("allow", outcome["permission_decision"])
+        self.assertTrue(outcome["knowledge_version"])
+        self.assertTrue(outcome["answered_at"])
+
+    def test_handle_single_chat_payload_returns_traceable_knowledge_fields(self) -> None:
+        sender = _FakeSender()
+        outcome = handle_single_chat_payload(
+            _make_payload(text="宴请标准是什么"),
+            service=SingleChatService(),
+            sender=sender,
+            user_context_resolver=self._build_resolver(),
+        )
+
+        self.assertTrue(outcome["handled"])
+        self.assertEqual("knowledge_answer", outcome["reason"])
+        self.assertEqual("policy_process", outcome["intent"])
+        self.assertEqual("text", outcome["channel"])
+        self.assertIn("doc-policy-banquet-2026-01", outcome["source_ids"])
+        self.assertEqual("allow", outcome["permission_decision"])
+        self.assertTrue(outcome["knowledge_version"])
+        self.assertTrue(outcome["answered_at"])
+        self.assertGreaterEqual(len(outcome["citations"]), 1)
 
     def test_handle_single_chat_payload_sends_card_for_application_question(self) -> None:
         sender = _FakeSender()
@@ -99,6 +125,7 @@ class StreamRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual("interactive_card", outcome["channel"])
+        self.assertEqual("document_request", outcome["intent"])
         self.assertEqual(0, len(sender.text_messages))
         self.assertEqual(1, len(sender.card_payloads))
         self.assertEqual("application_draft", sender.card_payloads[0]["card_type"])
