@@ -19,6 +19,7 @@ Last Updated: 2026-03-27
 | app/services/single_chat.py | A-11 fallback/handoff orchestrator for ambiguous input, low-confidence routing, and runtime-error degradation in single-chat path |
 | tests/services/test_single_chat_service.py | A-11 service-level fallback coverage for ambiguous/low-confidence/system-error scenarios |
 | tests/api/test_dingtalk_single_chat.py + tests/integrations/test_stream_runtime.py | A-11 channel-level regression coverage ensuring API/Stream return executable fallback responses instead of blank/error crashes |
+| docs/a12-regression-freeze-report-2026-03-27.md | A-12 regression and freeze evidence report with pass rates, defect grading, and blocker summary |
 
 ## A-01 Architecture Insights
 
@@ -138,6 +139,14 @@ Last Updated: 2026-03-27
 | app/integrations/dingtalk/stream_runtime.py | Aligns Stream callback logs with A-11 degradation semantics by emitting `stream_callback_degraded` and `dependency_error` when fallback reason is `system_fallback`. | Used in real Stream callback runtime after service outcome is produced. | Upstream: stream payload + single-chat handling outcome. Downstream: operator-visible degraded-event metrics without breaking callback ACK flow. |
 | tests/services/test_single_chat_service.py | Verifies three new fallback branches and keeps existing behavior regression-safe (knowledge hits, cards, non-single rejection). | Run in service regression pipeline for A-11 acceptance. | Upstream: `SingleChatService` logic. Downstream: proof that ambiguous/low-confidence/system-error scenarios no longer collapse to blank/crash behavior. |
 | tests/api/test_dingtalk_single_chat.py + tests/integrations/test_stream_runtime.py | Verifies API/Stream channel behavior for fallback paths, including degraded downstream failure returning actionable text instead of exception propagation. | Run in API/integration regression before milestone handoff. | Upstream: route/runtime adapters and fallback reasons. Downstream: cross-channel consistency evidence for FR-09 minimal fallback and handoff execution path. |
+
+## A-12 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| docs/a12-regression-freeze-report-2026-03-27.md | Captures A-12 regression evidence package: key-path and full-suite command outputs, threshold checks, defect grading (`P0/P1`), blocker summary, and freeze decision. | Produced at A-12 completion before any B-stage implementation starts. | Upstream: latest tested code baseline and regression command outputs. Downstream: auditable handoff artifact for deciding whether to freeze milestone A and gate B-13 start. |
+| memory-bank/progress.md | Records A-12 completion with quantitative verification outcomes and explicit pause constraint before B-13 pending user verification. | Updated immediately after regression and report generation. | Upstream: executed regression evidence. Downstream: execution timeline and compliance checkpoint for subsequent contributors. |
+| memory-bank/architecture.md | Maintains A-12 file-role updates and documents how freeze evidence is represented in repo artifacts. | Updated during milestone closeout documentation step. | Upstream: newly added A-12 report artifact and progress record. Downstream: long-term maintainability and onboarding clarity. |
 
 ## GOV-SKILL-01 Architecture Insights
 
