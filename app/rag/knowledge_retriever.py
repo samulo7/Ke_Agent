@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from app.repos.knowledge_repository import KnowledgeRepository
 from app.schemas.dingtalk_chat import IntentType
-from app.schemas.knowledge import KnowledgeEntry, RetrievedEvidence
+from app.schemas.knowledge import KnowledgeAccessContext, KnowledgeEntry, RetrievedEvidence
 
 DEFAULT_TOP_K = 5
 
@@ -38,15 +38,22 @@ class KnowledgeRetriever:
         self._repository = repository
         self._top_k = top_k if top_k is not None and top_k > 0 else resolve_top_k_from_env()
 
-    def retrieve(self, *, question: str, intent: IntentType) -> tuple[RetrievedEvidence, ...]:
+    def retrieve(
+        self,
+        *,
+        question: str,
+        intent: IntentType,
+        access_context: KnowledgeAccessContext | None = None,
+    ) -> tuple[RetrievedEvidence, ...]:
         normalized_question = _normalize(question)
         if not normalized_question:
             return ()
 
         candidates: list[_ScoredEntry] = []
-        for entry in self._repository.list_entries():
-            if intent not in entry.intents:
-                continue
+        for entry in self._repository.list_entries_for_retrieval(
+            intent=intent,
+            access_context=access_context,
+        ):
             score = self._score(entry, normalized_question)
             if score <= 0:
                 continue

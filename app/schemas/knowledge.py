@@ -14,6 +14,12 @@ def utc_now_iso() -> str:
 
 
 @dataclass(frozen=True)
+class KnowledgeAccessContext:
+    user_id: str = ""
+    dept_id: str = ""
+
+
+@dataclass(frozen=True)
 class KnowledgeEntry:
     source_id: str
     source_type: KnowledgeSourceType
