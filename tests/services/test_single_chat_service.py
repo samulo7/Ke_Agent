@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from app.rag.knowledge_retriever import KnowledgeRetriever
 from app.repos.sql_knowledge_repository import SQLKnowledgeRepository, bootstrap_sqlite_schema
-from app.schemas.dingtalk_chat import IncomingChatMessage
+from app.schemas.dingtalk_chat import AgentReply, ChatHandleResult, IncomingChatMessage
 from app.schemas.user_context import UserContext
+from app.services.document_request_draft import DocumentRequestDraftOrchestrator
+from app.services.intent_classifier import IntentClassification
 from app.services.knowledge_answering import KnowledgeAnswerService
 from app.services.single_chat import SingleChatService
 from app.services.tone_resolver import ToneResolver
@@ -17,17 +20,51 @@ class _RaisingKnowledgeAnswerService:
         raise RuntimeError("simulated downstream failure")
 
 
+class _CountingKnowledgeAnswerService:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def answer(self, *, question: str, intent: str, access_context=None):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        raise RuntimeError("should not be called in file_request path")
+
+
+class _StubIntentClassifier:
+    def __init__(self, *, intent: str, confidence: float = 0.99) -> None:
+        self._intent = intent
+        self._confidence = confidence
+
+    def classify(self, text: str) -> IntentClassification:
+        return IntentClassification(intent=self._intent, confidence=self._confidence)  # type: ignore[arg-type]
+
+
+class _StubFileRequestService:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def handle(self, *, message, query_text, user_context=None):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        return ChatHandleResult(
+            handled=False,
+            reason="file_lookup_collecting",
+            intent="file_request",
+            reply=AgentReply(channel="text", text="请问您需要纸质版还是扫描版？"),
+        )
+
+
 def make_message(
     *,
     conversation_type: str = "single",
     message_type: str = "text",
     text: str = "hello",
+    conversation_id: str = "conv-1",
+    sender_id: str = "user-1",
 ) -> IncomingChatMessage:
     return IncomingChatMessage(
         event_id="evt-1",
-        conversation_id="conv-1",
+        conversation_id=conversation_id,
         conversation_type=conversation_type,  # type: ignore[arg-type]
-        sender_id="user-1",
+        sender_id=sender_id,
         message_type=message_type,
         text=text,
     )
@@ -43,6 +80,17 @@ def make_user_context(*, user_id: str, dept_id: str) -> UserContext:
         is_degraded=False,
         resolved_at="2026-03-27T00:00:00+00:00",
     )
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self._current = datetime(2026, 3, 27, 0, 0, tzinfo=timezone.utc)
+
+    def now(self) -> datetime:
+        return self._current
+
+    def advance(self, *, seconds: int) -> None:
+        self._current = self._current + timedelta(seconds=seconds)
 
 
 def _build_permission_aware_service() -> tuple[SingleChatService, sqlite3.Connection]:
@@ -155,6 +203,22 @@ def _build_permission_aware_service() -> tuple[SingleChatService, sqlite3.Connec
 
 
 class SingleChatServiceTests(unittest.TestCase):
+    def test_file_request_routes_to_file_service_without_calling_knowledge_service(self) -> None:
+        knowledge_service = _CountingKnowledgeAnswerService()
+        file_service = _StubFileRequestService()
+        service = SingleChatService(
+            intent_classifier=_StubIntentClassifier(intent="file_request"),
+            knowledge_answer_service=knowledge_service,
+            file_request_service=file_service,  # type: ignore[arg-type]
+        )
+
+        result = service.handle(make_message(text="帮我找一下定影器的采购合同"))
+
+        self.assertEqual("file_lookup_collecting", result.reason)
+        self.assertEqual("file_request", result.intent)
+        self.assertEqual(1, file_service.calls)
+        self.assertEqual(0, knowledge_service.calls)
+
     def test_returns_knowledge_text_answer_for_policy_question(self) -> None:
         service = SingleChatService()
         result = service.handle(make_message(text="宴请标准是什么"))
@@ -223,9 +287,155 @@ class SingleChatServiceTests(unittest.TestCase):
         service = SingleChatService()
         result = service.handle(make_message(text="我要申请项目资料"))
         self.assertTrue(result.handled)
+        self.assertEqual("application_draft_collecting", result.reason)
         self.assertEqual("interactive_card", result.reply.channel)
-        self.assertEqual("application_draft", result.reply.interactive_card["card_type"])
+        self.assertEqual("application_draft_collecting", result.reply.interactive_card["card_type"])
         self.assertEqual("document_request", result.intent)
+
+    def test_document_request_completes_with_one_followup(self) -> None:
+        service = SingleChatService()
+        start = service.handle(
+            make_message(
+                text="我要申请采购制度文件",
+                conversation_id="conv-b14-1",
+                sender_id="user-b14-1",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+        self.assertEqual("application_draft_collecting", start.reason)
+        self.assertEqual("application_draft_collecting", start.reply.interactive_card["card_type"])
+
+        ready = service.handle(
+            make_message(
+                text="用途: 月度预算复盘；使用时间: 下周一",
+                conversation_id="conv-b14-1",
+                sender_id="user-b14-1",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+        self.assertTrue(ready.handled)
+        self.assertEqual("application_draft_ready", ready.reason)
+        self.assertEqual("interactive_card", ready.reply.channel)
+        self.assertEqual("application_draft_ready", ready.reply.interactive_card["card_type"])
+        draft_fields = ready.reply.interactive_card["draft_fields"]
+        for key in (
+            "applicant_name",
+            "department",
+            "requested_item",
+            "request_purpose",
+            "suggested_approver",
+        ):
+            self.assertTrue(str(draft_fields.get(key, "")).strip(), f"missing field: {key}")
+        self.assertEqual("人事行政", str(draft_fields.get("suggested_approver", "")))
+        self.assertGreaterEqual(len(ready.reply.interactive_card.get("process_path", [])), 3)
+
+    def test_document_request_natural_purpose_phrase_moves_to_next_missing_field(self) -> None:
+        service = SingleChatService()
+        start = service.handle(
+            make_message(
+                text="我要申请采购制度文件",
+                conversation_id="conv-b14-purpose-1",
+                sender_id="user-b14-purpose-1",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+        self.assertEqual("application_draft_collecting", start.reason)
+        self.assertEqual("申请用途", start.reply.interactive_card.get("missing_field"))
+
+        ready = service.handle(
+            make_message(
+                text="用作采购",
+                conversation_id="conv-b14-purpose-1",
+                sender_id="user-b14-purpose-1",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+        self.assertEqual("application_draft_ready", ready.reason)
+        self.assertEqual("interactive_card", ready.reply.channel)
+        self.assertEqual("人事行政", ready.reply.interactive_card["draft_fields"]["suggested_approver"])
+
+    def test_document_request_exceeds_followup_limit_returns_incomplete(self) -> None:
+        service = SingleChatService()
+        service.handle(
+            make_message(
+                text="我要申请采购制度文件",
+                conversation_id="conv-b14-2",
+                sender_id="user-b14-2",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+        incomplete = service.handle(
+            make_message(
+                text="我先看看",
+                conversation_id="conv-b14-2",
+                sender_id="user-b14-2",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+        self.assertFalse(incomplete.handled)
+        self.assertEqual("application_draft_incomplete", incomplete.reason)
+        self.assertEqual("text", incomplete.reply.channel)
+        self.assertIn("人事行政", incomplete.reply.text or "")
+
+    def test_document_request_times_out_lazily_and_clears_session(self) -> None:
+        clock = _FakeClock()
+        orchestrator = DocumentRequestDraftOrchestrator(now_provider=clock.now)
+        service = SingleChatService(document_request_orchestrator=orchestrator)
+
+        service.handle(
+            make_message(
+                text="我要申请采购制度文件",
+                conversation_id="conv-b14-3",
+                sender_id="user-b14-3",
+            )
+        )
+        clock.advance(seconds=301)
+        timed_out = service.handle(
+            make_message(
+                text="用途: 项目复盘",
+                conversation_id="conv-b14-3",
+                sender_id="user-b14-3",
+            )
+        )
+        self.assertFalse(timed_out.handled)
+        self.assertEqual("application_draft_timeout", timed_out.reason)
+
+        restarted = service.handle(
+            make_message(
+                text="我要申请采购制度文件",
+                conversation_id="conv-b14-3",
+                sender_id="user-b14-3",
+            )
+        )
+        self.assertEqual("application_draft_collecting", restarted.reason)
+
+    def test_document_request_can_be_cancelled_explicitly(self) -> None:
+        service = SingleChatService()
+        service.handle(
+            make_message(
+                text="我要申请采购制度文件",
+                conversation_id="conv-b14-4",
+                sender_id="user-b14-4",
+            )
+        )
+        cancelled = service.handle(
+            make_message(
+                text="取消",
+                conversation_id="conv-b14-4",
+                sender_id="user-b14-4",
+            )
+        )
+        self.assertFalse(cancelled.handled)
+        self.assertEqual("application_draft_cancelled", cancelled.reason)
+
+        post_cancel = service.handle(
+            make_message(
+                text="hello there",
+                conversation_id="conv-b14-4",
+                sender_id="user-b14-4",
+            )
+        )
+        self.assertEqual("knowledge_no_hit", post_cancel.reason)
 
     def test_rejects_non_single_chat(self) -> None:
         service = SingleChatService()

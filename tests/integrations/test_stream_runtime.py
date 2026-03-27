@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from app.integrations.dingtalk.stream_runtime import (
     DEFAULT_STREAM_ENDPOINT,
     StreamRuntimeError,
+    _extract_card_text_lines,
     handle_single_chat_payload,
     load_stream_credentials,
 )
 from app.rag.knowledge_retriever import KnowledgeRetriever
 from app.repos.sql_knowledge_repository import SQLKnowledgeRepository, bootstrap_sqlite_schema
 from app.schemas.user_context import UserContext
+from app.services.document_request_draft import DocumentRequestDraftOrchestrator
 from app.services.knowledge_answering import KnowledgeAnswerService
 from app.services.single_chat import SingleChatService
 from app.services.tone_resolver import ToneResolver
@@ -43,12 +46,30 @@ class _RaisingKnowledgeAnswerService:
         raise RuntimeError("simulated downstream failure")
 
 
-def _make_payload(*, text: str, conversation_type: str = "single", message_type: str = "text") -> dict[str, Any]:
+class _FakeClock:
+    def __init__(self) -> None:
+        self._current = datetime(2026, 3, 27, 0, 0, tzinfo=timezone.utc)
+
+    def now(self) -> datetime:
+        return self._current
+
+    def advance(self, *, seconds: int) -> None:
+        self._current = self._current + timedelta(seconds=seconds)
+
+
+def _make_payload(
+    *,
+    text: str,
+    conversation_type: str = "single",
+    conversation_id: str = "conv-a05-001",
+    sender_id: str = "user-a05-001",
+    message_type: str = "text",
+) -> dict[str, Any]:
     return {
         "event_id": "evt-a05-001",
-        "conversation_id": "conv-a05-001",
+        "conversation_id": conversation_id,
         "conversation_type": conversation_type,
-        "sender_id": "user-a05-001",
+        "sender_id": sender_id,
         "message_type": message_type,
         "text": text,
     }
@@ -194,6 +215,46 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertIn("DINGTALK_CLIENT_SECRET", str(context.exception))
         self.assertIn("DINGTALK_AGENT_ID", str(context.exception))
 
+    def test_extract_card_lines_uses_chinese_labels_for_draft_fields(self) -> None:
+        title, lines = _extract_card_text_lines(
+            {
+                "title": "文档申请草稿",
+                "draft_fields": {
+                    "applicant_name": "Alice",
+                    "department": "Finance",
+                    "requested_item": "采购制度文件",
+                },
+            }
+        )
+
+        self.assertEqual("文档申请草稿", title)
+        self.assertIn("申请人姓名: Alice", lines)
+        self.assertIn("所属部门: Finance", lines)
+        self.assertIn("申请资料名称: 采购制度文件", lines)
+
+    def test_extract_card_lines_marks_missing_and_actions(self) -> None:
+        _, lines = _extract_card_text_lines(
+            {
+                "title": "申请信息收集 · 采购制度文件",
+                "draft_fields": {
+                    "applicant_name": "Alice",
+                    "request_purpose": "采购",
+                    "expected_use_time": "",
+                },
+                "field_status": {
+                    "applicant_name": "filled",
+                    "request_purpose": "needs_detail",
+                    "expected_use_time": "missing",
+                },
+                "actions": ["确认提交", "取消"],
+            }
+        )
+
+        self.assertIn("申请人姓名: Alice", lines)
+        self.assertIn("【需细化】申请用途: 采购", lines)
+        self.assertIn("【待补充】期望使用时间: ____", lines)
+        self.assertIn("可操作：确认提交 / 取消", lines)
+
     def test_handle_single_chat_payload_sends_text_for_general_question(self) -> None:
         sender = _FakeSender()
         outcome = handle_single_chat_payload(
@@ -262,9 +323,123 @@ class StreamRuntimeTests(unittest.TestCase):
 
         self.assertEqual("interactive_card", outcome["channel"])
         self.assertEqual("document_request", outcome["intent"])
+        self.assertEqual("application_draft_collecting", outcome["reason"])
         self.assertEqual(0, len(sender.text_messages))
         self.assertEqual(1, len(sender.card_payloads))
-        self.assertEqual("application_draft", sender.card_payloads[0]["card_type"])
+        self.assertEqual("application_draft_collecting", sender.card_payloads[0]["card_type"])
+
+    def test_handle_single_chat_payload_document_request_reaches_ready_state(self) -> None:
+        sender = _FakeSender()
+        resolver = _FakeResolver(
+            UserContext(
+                user_id="alice",
+                user_name="Alice",
+                dept_id="finance",
+                dept_name="Finance",
+                identity_source="openapi",
+                is_degraded=False,
+                resolved_at="2026-03-27T00:00:00+00:00",
+            )
+        )
+        service = SingleChatService()
+
+        first = handle_single_chat_payload(
+            _make_payload(
+                text="我要申请采购制度文件",
+                conversation_id="conv-b14-stream-1",
+                sender_id="user-b14-stream-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertEqual("application_draft_collecting", first["reason"])
+
+        second = handle_single_chat_payload(
+            _make_payload(
+                text="用途: 月度预算复盘；使用时间: 下周一",
+                conversation_id="conv-b14-stream-1",
+                sender_id="user-b14-stream-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertTrue(second["handled"])
+        self.assertEqual("application_draft_ready", second["reason"])
+        self.assertEqual("interactive_card", second["channel"])
+        self.assertEqual("application_draft_ready", sender.card_payloads[-1]["card_type"])
+        self.assertEqual("人事行政", sender.card_payloads[-1]["draft_fields"]["suggested_approver"])
+        self.assertIn("人事行政", sender.card_payloads[-1].get("next_action", ""))
+
+    def test_handle_single_chat_payload_document_request_timeout(self) -> None:
+        clock = _FakeClock()
+        service = SingleChatService(document_request_orchestrator=DocumentRequestDraftOrchestrator(now_provider=clock.now))
+        sender = _FakeSender()
+        resolver = self._build_resolver()
+
+        handle_single_chat_payload(
+            _make_payload(
+                text="我要申请采购制度文件",
+                conversation_id="conv-b14-stream-2",
+                sender_id="user-b14-stream-2",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        clock.advance(seconds=301)
+        outcome = handle_single_chat_payload(
+            _make_payload(
+                text="用途: 项目预算",
+                conversation_id="conv-b14-stream-2",
+                sender_id="user-b14-stream-2",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertFalse(outcome["handled"])
+        self.assertEqual("application_draft_timeout", outcome["reason"])
+        self.assertEqual("text", outcome["channel"])
+
+    def test_handle_single_chat_payload_file_request_sends_sequence_in_order(self) -> None:
+        sender = _FakeSender()
+        resolver = self._build_resolver()
+        service = SingleChatService()
+
+        first = handle_single_chat_payload(
+            _make_payload(
+                text="帮我找一下定影器的采购合同",
+                conversation_id="conv-file-stream-1",
+                sender_id="user-file-stream-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertEqual("file_lookup_collecting", first["reason"])
+        self.assertEqual("file_request", first["intent"])
+        self.assertEqual(1, len(sender.text_messages))
+
+        second = handle_single_chat_payload(
+            _make_payload(
+                text="扫描版",
+                conversation_id="conv-file-stream-1",
+                sender_id="user-file-stream-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertTrue(second["handled"])
+        self.assertEqual("file_lookup_sent", second["reason"])
+        self.assertEqual("file_request", second["intent"])
+        self.assertEqual(4, len(sender.text_messages))
+        self.assertIn("优先为您提供扫描版", sender.text_messages[1])
+        self.assertIn("已在文件库找到匹配文件", sender.text_messages[2])
+        self.assertIn("文件已发送，请查收", sender.text_messages[3])
+        self.assertEqual([], sender.card_payloads)
 
     def test_handle_single_chat_payload_permission_restricted_summary_only(self) -> None:
         service, connection = _build_permission_service()

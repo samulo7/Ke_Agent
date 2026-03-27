@@ -28,6 +28,16 @@ LABELED_SAMPLES: list[tuple[str, IntentType]] = [
     ("我想查看请假制度文件", "document_request"),
     ("请申请项目流程手册", "document_request"),
     ("我要获取行政管理模板", "document_request"),
+    ("帮我找一下定影器的采购合同", "file_request"),
+    ("我要找采购合同扫描件", "file_request"),
+    ("找一下劳动合同纸质版", "file_request"),
+    ("帮我查下合同文件", "file_request"),
+    ("想找付款协议扫描版", "file_request"),
+    ("给我找下2024版采购合同", "file_request"),
+    ("请检索销售合同原件", "file_request"),
+    ("需要找合同附件", "file_request"),
+    ("合同文件在哪，我要扫描版", "file_request"),
+    ("帮我从文件库找合同", "file_request"),
     ("出差报销怎么弄", "reimbursement"),
     ("报销流程是什么", "reimbursement"),
     ("发票报销要准备什么", "reimbursement"),
@@ -77,6 +87,8 @@ class IntentClassifierTests(unittest.TestCase):
 
     def test_priority_rules_for_overlapping_keywords(self) -> None:
         self.assertEqual("document_request", self.classifier.classify("我要申请报销制度文件").intent)
+        self.assertEqual("file_request", self.classifier.classify("帮我找一下定影器的采购合同").intent)
+        self.assertEqual("file_request", self.classifier.classify("请帮我找采购合同扫描件").intent)
         self.assertEqual("reimbursement", self.classifier.classify("报销流程怎么走").intent)
         self.assertEqual("leave", self.classifier.classify("请假流程怎么走").intent)
         self.assertEqual("fixed_quote", self.classifier.classify("定影器报价流程").intent)
@@ -89,7 +101,7 @@ class IntentClassifierTests(unittest.TestCase):
     def test_offline_dataset_meets_sample_and_accuracy_threshold(self) -> None:
         self.assertGreaterEqual(len(LABELED_SAMPLES), 60)
         per_intent = Counter(intent for _, intent in LABELED_SAMPLES)
-        for intent in ("policy_process", "document_request", "reimbursement", "leave", "fixed_quote", "other"):
+        for intent in ("policy_process", "document_request", "file_request", "reimbursement", "leave", "fixed_quote", "other"):
             self.assertGreaterEqual(per_intent[intent], 10, msg=f"insufficient samples for {intent}")
 
         predictions = [self.classifier.classify(text).intent for text, _ in LABELED_SAMPLES]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 
 from fastapi.testclient import TestClient
@@ -10,6 +11,7 @@ from app.api.main import create_app
 from app.rag.knowledge_retriever import KnowledgeRetriever
 from app.repos.sql_knowledge_repository import SQLKnowledgeRepository, bootstrap_sqlite_schema
 from app.schemas.user_context import UserContext
+from app.services.document_request_draft import DocumentRequestDraftOrchestrator
 from app.services.knowledge_answering import KnowledgeAnswerService
 from app.services.single_chat import SingleChatService
 from app.services.tone_resolver import ToneResolver
@@ -42,6 +44,17 @@ class _PermissionResolver:
             is_degraded=False,
             resolved_at="2026-03-27T00:00:00+00:00",
         )
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self._current = datetime(2026, 3, 27, 0, 0, tzinfo=timezone.utc)
+
+    def now(self) -> datetime:
+        return self._current
+
+    def advance(self, *, seconds: int) -> None:
+        self._current = self._current + timedelta(seconds=seconds)
 
 
 def build_permission_single_chat_service() -> tuple[SingleChatService, sqlite3.Connection]:
@@ -158,11 +171,12 @@ def make_stream_payload(
     text: str = "hello",
     conversation_type: str = "single",
     sender_id: str = "user-001",
+    conversation_id: str = "conv-001",
     message_type: str = "text",
 ) -> dict[str, object]:
     return {
         "event_id": "evt-001",
-        "conversation_id": "conv-001",
+        "conversation_id": conversation_id,
         "conversation_type": conversation_type,
         "sender_id": sender_id,
         "message_type": message_type,
@@ -310,12 +324,160 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         body = response.json()
 
         self.assertTrue(body["handled"])
-        self.assertEqual("application_draft_card", body["reason"])
+        self.assertEqual("application_draft_collecting", body["reason"])
         self.assertEqual("document_request", body["intent"])
         self.assertEqual("interactive_card", body["reply"]["channel"])
-        self.assertEqual("application_draft", body["reply"]["interactive_card"]["card_type"])
+        self.assertEqual("application_draft_collecting", body["reply"]["interactive_card"]["card_type"])
         self.assertEqual([], body["source_ids"])
         self.assertEqual("allow", body["permission_decision"])
+
+    def test_document_request_can_reach_ready_card_with_followup(self) -> None:
+        app = create_app(log_stream=StringIO(), user_context_resolver=_PermissionResolver())
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要申请采购制度文件",
+                sender_id="finance-user",
+                conversation_id="conv-b14-api-1",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+        body_first = first.json()
+        self.assertEqual("application_draft_collecting", body_first["reason"])
+
+        second = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="用途: 月度预算复盘；使用时间: 下周一",
+                sender_id="finance-user",
+                conversation_id="conv-b14-api-1",
+            ),
+        )
+        self.assertEqual(200, second.status_code)
+        body_second = second.json()
+
+        self.assertTrue(body_second["handled"])
+        self.assertEqual("application_draft_ready", body_second["reason"])
+        self.assertEqual("interactive_card", body_second["reply"]["channel"])
+        self.assertEqual("application_draft_ready", body_second["reply"]["interactive_card"]["card_type"])
+        self.assertEqual("document_request", body_second["intent"])
+        self.assertEqual("人事行政", body_second["reply"]["interactive_card"]["draft_fields"]["suggested_approver"])
+        self.assertIn("人事行政", body_second["reply"]["interactive_card"]["next_action"])
+
+    def test_document_request_ready_state_is_final_without_confirmation(self) -> None:
+        app = create_app(log_stream=StringIO(), user_context_resolver=_PermissionResolver())
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要申请采购制度文件",
+                sender_id="finance-user",
+                conversation_id="conv-b14-api-confirm-1",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+
+        second = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="用途: 用于内部采购流程参考；使用时间: 下周一",
+                sender_id="finance-user",
+                conversation_id="conv-b14-api-confirm-1",
+            ),
+        )
+        self.assertEqual(200, second.status_code)
+        self.assertEqual("application_draft_ready", second.json()["reason"])
+        self.assertEqual("interactive_card", second.json()["reply"]["channel"])
+
+        third = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="hello there",
+                sender_id="finance-user",
+                conversation_id="conv-b14-api-confirm-1",
+            ),
+        )
+        self.assertEqual(200, third.status_code)
+        body_third = third.json()
+        self.assertFalse(body_third["handled"])
+        self.assertEqual("knowledge_no_hit", body_third["reason"])
+        self.assertEqual("text", body_third["reply"]["channel"])
+
+    def test_file_request_sent_response_contains_reply_sequences(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="帮我找一下定影器的采购合同",
+                sender_id="user-file-api-1",
+                conversation_id="conv-file-api-1",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+        body_first = first.json()
+        self.assertEqual("file_lookup_collecting", body_first["reason"])
+        self.assertEqual("file_request", body_first["intent"])
+        self.assertEqual(1, len(body_first["replies"]))
+        self.assertEqual(body_first["reply"], body_first["replies"][0])
+        self.assertEqual(1, len(body_first["dingtalk_payloads"]))
+        self.assertEqual(body_first["dingtalk_payload"], body_first["dingtalk_payloads"][0])
+
+        second = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="扫描版",
+                sender_id="user-file-api-1",
+                conversation_id="conv-file-api-1",
+            ),
+        )
+        self.assertEqual(200, second.status_code)
+        body_second = second.json()
+        self.assertTrue(body_second["handled"])
+        self.assertEqual("file_lookup_sent", body_second["reason"])
+        self.assertEqual("file_request", body_second["intent"])
+        self.assertEqual(3, len(body_second["replies"]))
+        self.assertEqual(body_second["reply"], body_second["replies"][0])
+        self.assertEqual(3, len(body_second["dingtalk_payloads"]))
+        self.assertEqual(body_second["dingtalk_payload"], body_second["dingtalk_payloads"][0])
+        self.assertIn("优先为您提供扫描版", body_second["replies"][0]["text"])
+        self.assertIn("已在文件库找到匹配文件", body_second["replies"][1]["text"])
+        self.assertIn("文件已发送，请查收", body_second["replies"][2]["text"])
+
+    def test_document_request_timeout_returns_fallback_reason(self) -> None:
+        clock = _FakeClock()
+        service = SingleChatService(document_request_orchestrator=DocumentRequestDraftOrchestrator(now_provider=clock.now))
+        app = create_app(log_stream=StringIO(), single_chat_service=service)
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要申请采购制度文件",
+                conversation_id="conv-b14-api-2",
+                sender_id="user-b14-api-2",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+        self.assertEqual("application_draft_collecting", first.json()["reason"])
+
+        clock.advance(seconds=301)
+        second = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="用途: 项目预算",
+                conversation_id="conv-b14-api-2",
+                sender_id="user-b14-api-2",
+            ),
+        )
+        self.assertEqual(200, second.status_code)
+        body = second.json()
+        self.assertFalse(body["handled"])
+        self.assertEqual("application_draft_timeout", body["reason"])
 
     def test_permission_restricted_summary_only_returns_stable_reason(self) -> None:
         service, connection = build_permission_single_chat_service()
