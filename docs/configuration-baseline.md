@@ -43,6 +43,8 @@ The command returns a non-zero exit code when required keys are missing, values 
 | logging | `LOG_LEVEL` | No | `INFO` | No | Log level. |
 | logging | `LOG_FORMAT` | No | `json` | No | Log format (`json/text`). |
 | logging | `LOG_MASK_SECRETS` | No | `true` | No | Secret masking in logs. |
+| reply | `RESPONSE_TONE_DEFAULT` | No | `conversational` | No | Default reply tone (`conversational/formal/neutral`). |
+| reply | `RESPONSE_TONE_BY_INTENT` | No | empty | No | Per-intent tone overrides, format `intent:tone,intent:tone`. |
 | safety | `DEV_BYPASS_AUTH` | No | `false` | Yes | Dev-only bypass switch. |
 | safety | `LOCAL_FAKE_DINGTALK_USER` | No | empty | Yes | Dev-only fake user id. |
 | safety | `USE_MOCK_QWEN` | No | `false` | Yes | Dev-only mock model switch. |

@@ -52,6 +52,30 @@ def _extract_text(payload: Mapping[str, Any]) -> str:
     return ""
 
 
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def _repair_possible_mojibake(text: str) -> str:
+    """
+    Best-effort repair for common UTF-8 bytes decoded as Latin-1/CP1252.
+    This helps manual PowerShell/API tests where request encoding is inconsistent.
+    """
+    if not text:
+        return text
+    if _contains_cjk(text):
+        return text
+    if not any(ord(ch) > 127 for ch in text):
+        return text
+
+    try:
+        repaired = text.encode("latin-1").decode("utf-8")
+    except UnicodeError:
+        return text
+
+    return repaired if _contains_cjk(repaired) else text
+
+
 def parse_stream_event(payload: Mapping[str, Any]) -> IncomingChatMessage:
     event = _extract_mapping(payload)
     sender_id = _pick_string(event, ("sender_id", "senderStaffId", "senderId", "staffId", "userid"))
@@ -71,7 +95,7 @@ def parse_stream_event(payload: Mapping[str, Any]) -> IncomingChatMessage:
         conversation_type=conversation_type,
         sender_id=sender_id,
         message_type=message_type.lower(),
-        text=_extract_text(event),
+        text=_repair_possible_mojibake(_extract_text(event)),
         sender_staff_id=_pick_string(event, ("senderStaffId", "sender_staff_id", "staffId", "userid")) or sender_id,
         sender_nick=_pick_string(event, ("senderNick", "sender_nick", "nick", "name")),
     )

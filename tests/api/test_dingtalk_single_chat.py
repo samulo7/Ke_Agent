@@ -26,6 +26,15 @@ def make_stream_payload(
 
 
 class DingTalkSingleChatApiTests(unittest.TestCase):
+    def test_response_content_type_declares_utf8_charset(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post("/dingtalk/stream/events", json=make_stream_payload(text="你好"))
+        self.assertEqual(200, response.status_code)
+        self.assertIn("application/json", response.headers["content-type"].lower())
+        self.assertIn("charset=utf-8", response.headers["content-type"].lower())
+
     def test_greeting_returns_no_hit_text_channel(self) -> None:
         app = create_app(log_stream=StringIO())
         client = TestClient(app)
@@ -67,6 +76,21 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertTrue(body["knowledge_version"])
         self.assertTrue(body["answered_at"])
         self.assertGreaterEqual(len(body["citations"]), 1)
+
+    def test_policy_query_with_mojibake_text_is_repaired(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        original = "宴请标准是什么"
+        mojibake = original.encode("utf-8").decode("latin-1")
+        response = client.post("/dingtalk/stream/events", json=make_stream_payload(text=mojibake))
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+
+        self.assertTrue(body["handled"])
+        self.assertEqual("knowledge_answer", body["reason"])
+        self.assertEqual("policy_process", body["intent"])
+        self.assertIn("doc-policy-banquet-2026-01", body["source_ids"])
 
     def test_flow_query_returns_interactive_card(self) -> None:
         app = create_app(log_stream=StringIO())

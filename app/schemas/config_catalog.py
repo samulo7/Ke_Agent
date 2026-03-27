@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from app.schemas.tone import parse_intent_tone_overrides, parse_tone_profile
+
 ConfigParser = Callable[[str], Any]
 
 
@@ -302,6 +304,27 @@ CONFIG_RULES: tuple[ConfigRule, ...] = (
         parser=parse_bool,
         description="Mask secrets in logs.",
         remediation="Set LOG_MASK_SECRETS to true/false.",
+    ),
+    ConfigRule(
+        key="RESPONSE_TONE_DEFAULT",
+        category="reply",
+        required=False,
+        default="conversational",
+        parser=parse_tone_profile,
+        description="Default reply tone profile.",
+        remediation="Set RESPONSE_TONE_DEFAULT to conversational/formal/neutral.",
+    ),
+    ConfigRule(
+        key="RESPONSE_TONE_BY_INTENT",
+        category="reply",
+        required=False,
+        default="",
+        parser=parse_intent_tone_overrides,
+        description="Per-intent tone overrides, format intent:tone,intent:tone.",
+        remediation=(
+            "Set RESPONSE_TONE_BY_INTENT using intent:tone pairs, "
+            "e.g. policy_process:formal,fixed_quote:neutral."
+        ),
     ),
     ConfigRule(
         key="DEV_BYPASS_AUTH",

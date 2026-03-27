@@ -57,6 +57,26 @@ class ConfigValidationTests(unittest.TestCase):
         matches = [err for err in result.errors if err.key == "DEV_BYPASS_AUTH" and err.code == "PRODUCTION_FORBIDDEN"]
         self.assertEqual(1, len(matches))
 
+    def test_tone_configuration_accepts_default_and_intent_overrides(self) -> None:
+        env = make_valid_env()
+        env["RESPONSE_TONE_DEFAULT"] = "formal"
+        env["RESPONSE_TONE_BY_INTENT"] = "policy_process:neutral,fixed_quote:formal"
+        result = validate_config(env)
+        self.assertTrue(result.ok)
+        self.assertEqual("formal", result.resolved["RESPONSE_TONE_DEFAULT"])
+        self.assertEqual(
+            {"policy_process": "neutral", "fixed_quote": "formal"},
+            result.resolved["RESPONSE_TONE_BY_INTENT"],
+        )
+
+    def test_tone_configuration_rejects_invalid_values(self) -> None:
+        env = make_valid_env()
+        env["RESPONSE_TONE_BY_INTENT"] = "policy_process:loud"
+        result = validate_config(env)
+        self.assertFalse(result.ok)
+        matches = [err for err in result.errors if err.key == "RESPONSE_TONE_BY_INTENT" and err.code == "INVALID_VALUE"]
+        self.assertEqual(1, len(matches))
+
 
 if __name__ == "__main__":
     unittest.main()

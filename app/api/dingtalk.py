@@ -11,6 +11,7 @@ from app.services.single_chat import SingleChatService
 from app.services.user_context import UserContextResolver
 
 router = APIRouter()
+UTF8_JSON_MEDIA_TYPE = "application/json; charset=utf-8"
 
 
 @router.post("/dingtalk/stream/events")
@@ -35,6 +36,7 @@ async def receive_dingtalk_stream_event(
         request.state.error_category = "client_error"
         return JSONResponse(
             status_code=400,
+            media_type=UTF8_JSON_MEDIA_TYPE,
             content={
                 "ack": "invalid",
                 "trace_id": trace_id,
@@ -59,6 +61,7 @@ async def receive_dingtalk_stream_event(
     request.state.answered_at = outcome.answered_at
     return JSONResponse(
         status_code=200,
+        media_type=UTF8_JSON_MEDIA_TYPE,
         content={
             "ack": "ok",
             "trace_id": trace_id,
