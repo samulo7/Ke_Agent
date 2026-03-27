@@ -4,6 +4,8 @@ import logging
 from typing import Any
 
 from app.schemas.dingtalk_chat import AgentReply, ChatHandleResult, IncomingChatMessage
+from app.schemas.knowledge import KnowledgeAccessContext
+from app.schemas.user_context import UserContext
 from app.services.intent_classifier import IntentClassifier
 from app.services.knowledge_answering import KnowledgeAnswerService, build_default_knowledge_answer_service
 
@@ -28,7 +30,7 @@ LOW_CONFIDENCE_EXCLUSIONS = {
 
 
 class SingleChatService:
-    """MVP A-05 single-chat responder with text/card output channels."""
+    """MVP single-chat responder with text/card output channels."""
 
     def __init__(
         self,
@@ -40,7 +42,12 @@ class SingleChatService:
         self._knowledge_answer_service = knowledge_answer_service or build_default_knowledge_answer_service()
         self._logger = logging.getLogger("keagent.observability")
 
-    def handle(self, message: IncomingChatMessage) -> ChatHandleResult:
+    def handle(
+        self,
+        message: IncomingChatMessage,
+        *,
+        user_context: UserContext | None = None,
+    ) -> ChatHandleResult:
         if message.conversation_type != "single":
             return ChatHandleResult(
                 handled=False,
@@ -135,7 +142,11 @@ class SingleChatService:
             )
 
         try:
-            knowledge_answer = self._knowledge_answer_service.answer(question=question, intent=intent)
+            knowledge_answer = self._knowledge_answer_service.answer(
+                question=question,
+                intent=intent,
+                access_context=self._to_access_context(user_context),
+            )
         except Exception:
             self._logger.exception("single_chat.answer_failed")
             return ChatHandleResult(
@@ -147,9 +158,16 @@ class SingleChatService:
                     text="系统当前处理异常，请稍后再试；如需紧急处理，请直接联系对应岗位。",
                 ),
             )
+
+        reason = "knowledge_answer" if knowledge_answer.found else "knowledge_no_hit"
+        handled = knowledge_answer.found
+        if knowledge_answer.permission_decision in {"summary_only", "deny"}:
+            reason = "permission_restricted"
+            handled = False
+
         return ChatHandleResult(
-            handled=knowledge_answer.found,
-            reason="knowledge_answer" if knowledge_answer.found else "knowledge_no_hit",
+            handled=handled,
+            reason=reason,
             intent=intent,
             reply=AgentReply(
                 channel="text",
@@ -160,6 +178,15 @@ class SingleChatService:
             knowledge_version=knowledge_answer.knowledge_version,
             answered_at=knowledge_answer.answered_at,
             citations=tuple(citation.to_dict() for citation in knowledge_answer.citations),
+        )
+
+    @staticmethod
+    def _to_access_context(user_context: UserContext | None) -> KnowledgeAccessContext | None:
+        if user_context is None:
+            return None
+        return KnowledgeAccessContext(
+            user_id=(user_context.user_id or "").strip(),
+            dept_id=(user_context.dept_id or "").strip(),
         )
 
     @staticmethod

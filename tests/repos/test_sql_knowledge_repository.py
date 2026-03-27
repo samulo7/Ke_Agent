@@ -99,6 +99,24 @@ class SQLKnowledgeRepositoryTests(unittest.TestCase):
                     "public",
                     "",
                 ),
+                (
+                    "doc-sensitive-budget",
+                    "document",
+                    "高管预算审批规则",
+                    "高管预算审批阈值与审批链路说明。",
+                    "适用于财务预算审批岗",
+                    "通过钉钉“预算审批”流程提交并抄送财务负责人",
+                    "https://example.local/docs/sensitive-budget",
+                    "2026-03-21",
+                    "active",
+                    "finance-owner",
+                    "budget",
+                    "v2",
+                    "高管,预算,审批,敏感",
+                    "policy_process",
+                    "sensitive",
+                    "finance",
+                ),
             ),
         )
         self.connection.executemany(
@@ -115,6 +133,7 @@ class SQLKnowledgeRepositoryTests(unittest.TestCase):
                 ("chunk-public-1", "doc-public-policy", 0, "公共报销流程入口说明", "[0.1,0.2]"),
                 ("chunk-finance-1", "doc-finance-policy", 0, "财务制度细则中的报销要求", "[0.4,0.6]"),
                 ("chunk-archived-1", "doc-archived-policy", 0, "历史归档报销资料", "[0.9,0.3]"),
+                ("chunk-sensitive-1", "doc-sensitive-budget", 0, "敏感预算审批流程说明", "[0.8,0.6]"),
             ),
         )
         self.connection.commit()
@@ -142,7 +161,7 @@ class SQLKnowledgeRepositoryTests(unittest.TestCase):
         finance_ids = {item.source_id for item in finance_entries}
 
         self.assertEqual({"doc-public-policy"}, sales_ids)
-        self.assertEqual({"doc-public-policy", "doc-finance-policy"}, finance_ids)
+        self.assertEqual({"doc-public-policy", "doc-finance-policy", "doc-sensitive-budget"}, finance_ids)
 
     def test_retriever_uses_sql_permission_filtered_candidates(self) -> None:
         retriever = KnowledgeRetriever(repository=self.repository, top_k=5)
@@ -162,6 +181,28 @@ class SQLKnowledgeRepositoryTests(unittest.TestCase):
 
         self.assertEqual({"doc-public-policy"}, sales_ids)
         self.assertEqual({"doc-public-policy", "doc-finance-policy"}, finance_ids)
+
+    def test_restricted_entries_distinguish_summary_only_and_deny(self) -> None:
+        sales_restricted = self.repository.list_restricted_entries_for_retrieval(
+            intent="policy_process",
+            access_context=KnowledgeAccessContext(user_id="u-sales", dept_id="sales"),
+        )
+        finance_restricted = self.repository.list_restricted_entries_for_retrieval(
+            intent="policy_process",
+            access_context=KnowledgeAccessContext(user_id="u-finance", dept_id="finance"),
+        )
+
+        sales_map = {item.source_id: item.permission_scope for item in sales_restricted}
+        finance_map = {item.source_id: item.permission_scope for item in finance_restricted}
+
+        self.assertEqual(
+            {
+                "doc-finance-policy": "department",
+                "doc-sensitive-budget": "sensitive",
+            },
+            sales_map,
+        )
+        self.assertEqual({}, finance_map)
 
     def _table_columns(self, table_name: str) -> set[str]:
         rows = self.connection.execute(f"PRAGMA table_info({table_name})").fetchall()

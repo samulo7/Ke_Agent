@@ -53,7 +53,7 @@ async def receive_dingtalk_stream_event(
     request.state.user_context = user_context.to_dict()
 
     single_chat_service: SingleChatService = request.app.state.single_chat_service
-    outcome = single_chat_service.handle(incoming_message)
+    outcome = single_chat_service.handle(incoming_message, user_context=user_context)
     request.state.intent = outcome.intent
     request.state.source_ids = list(outcome.source_ids)
     request.state.permission_decision = outcome.permission_decision

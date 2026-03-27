@@ -4,14 +4,21 @@ from app.rag.knowledge_retriever import KnowledgeRetriever
 from app.repos.in_memory_knowledge_repository import InMemoryKnowledgeRepository
 from app.repos.knowledge_repository import KnowledgeRepository
 from app.schemas.dingtalk_chat import IntentType
-from app.schemas.knowledge import KnowledgeAnswer, KnowledgeCitation, RetrievedEvidence, utc_now_iso
+from app.schemas.knowledge import (
+    KnowledgeAccessContext,
+    KnowledgeAnswer,
+    KnowledgeCitation,
+    RestrictedKnowledgeEntry,
+    RetrievedEvidence,
+    utc_now_iso,
+)
 from app.schemas.tone import ToneProfile
 from app.services.answer_template import build_unified_answer_template
 from app.services.tone_resolver import ToneResolver, build_tone_resolver_from_env
 
 
 class KnowledgeAnswerService:
-    """Compose deterministic A-08/A-09 answers from retrieved knowledge evidence."""
+    """Compose deterministic A-08/A-09/B-13 answers from retrieved knowledge evidence."""
 
     def __init__(
         self,
@@ -24,33 +31,64 @@ class KnowledgeAnswerService:
         self._repository = repository
         self._tone_resolver = tone_resolver or build_tone_resolver_from_env()
 
-    def answer(self, *, question: str, intent: IntentType) -> KnowledgeAnswer:
-        evidences = self._retriever.retrieve(question=question, intent=intent)
+    def answer(
+        self,
+        *,
+        question: str,
+        intent: IntentType,
+        access_context: KnowledgeAccessContext | None = None,
+    ) -> KnowledgeAnswer:
+        evidences = self._retriever.retrieve(
+            question=question,
+            intent=intent,
+            access_context=access_context,
+        )
         knowledge_version = self._repository.knowledge_version()
         tone_profile = self._tone_resolver.resolve(intent=intent)
 
-        if not evidences:
-            return KnowledgeAnswer.not_found(
-                text=self._build_no_hit_text(intent=intent, tone_profile=tone_profile),
+        if evidences:
+            citations = tuple(self._build_citation(item) for item in evidences)
+            template = build_unified_answer_template(
+                evidences=evidences,
+                citations=citations,
+                intent=intent,
+                tone_profile=tone_profile,
+            )
+            source_ids = tuple(citation.source_id for citation in citations)
+            return KnowledgeAnswer(
+                found=True,
+                text=template.to_text(),
+                source_ids=source_ids,
+                permission_decision="allow",
                 knowledge_version=knowledge_version,
+                answered_at=utc_now_iso(),
+                citations=citations,
             )
 
-        citations = tuple(self._build_citation(item) for item in evidences)
-        template = build_unified_answer_template(
-            evidences=evidences,
-            citations=citations,
+        restricted_evidences = self._retriever.retrieve_restricted(
+            question=question,
             intent=intent,
-            tone_profile=tone_profile,
+            access_context=access_context,
         )
-        source_ids = tuple(citation.source_id for citation in citations)
-        return KnowledgeAnswer(
-            found=True,
-            text=template.to_text(),
-            source_ids=source_ids,
-            permission_decision="allow",
+        if restricted_evidences:
+            top_hit = restricted_evidences[0].entry
+            if top_hit.permission_scope == "sensitive":
+                return KnowledgeAnswer.restricted(
+                    text=self._build_deny_text(top_hit),
+                    knowledge_version=knowledge_version,
+                    permission_decision="deny",
+                    source_ids=(top_hit.source_id,),
+                )
+            return KnowledgeAnswer.restricted(
+                text=self._build_summary_only_text(top_hit),
+                knowledge_version=knowledge_version,
+                permission_decision="summary_only",
+                source_ids=(top_hit.source_id,),
+            )
+
+        return KnowledgeAnswer.not_found(
+            text=self._build_no_hit_text(intent=intent, tone_profile=tone_profile),
             knowledge_version=knowledge_version,
-            answered_at=utc_now_iso(),
-            citations=citations,
         )
 
     @staticmethod
@@ -61,6 +99,30 @@ class KnowledgeAnswerService:
             title=evidence.entry.title,
             source_uri=evidence.entry.source_uri,
             updated_at=evidence.entry.updated_at,
+        )
+
+    @staticmethod
+    def _resolve_contact(entry: RestrictedKnowledgeEntry) -> str:
+        owner = (entry.owner or "").strip()
+        return owner if owner else "人事/财务/商务"
+
+    def _build_summary_only_text(self, entry: RestrictedKnowledgeEntry) -> str:
+        contact = self._resolve_contact(entry)
+        return (
+            "该资料属于受控内容，当前不可直接查看正文。\n"
+            f"脱敏摘要：{entry.summary}\n"
+            f"申请路径：{entry.next_step}\n"
+            f"建议联系人：{contact}\n"
+            "如需我继续协助，可直接回复“帮我生成申请草稿”。"
+        )
+
+    def _build_deny_text(self, entry: RestrictedKnowledgeEntry) -> str:
+        contact = self._resolve_contact(entry)
+        return (
+            "该资料属于敏感受控内容，当前权限下不可查看，且无法提供摘要。\n"
+            f"申请路径：{entry.next_step}\n"
+            f"建议联系人：{contact}\n"
+            "如需我继续协助，可直接回复“帮我生成申请草稿”。"
         )
 
     @staticmethod

@@ -107,7 +107,7 @@ def handle_single_chat_payload(
 ) -> dict[str, Any]:
     incoming_message = parse_stream_event(payload)
     user_context = user_context_resolver.resolve(incoming_message)
-    result = service.handle(incoming_message)
+    result = service.handle(incoming_message, user_context=user_context)
     reply = result.reply
 
     if reply.channel == "text":

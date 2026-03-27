@@ -1,4 +1,4 @@
-﻿## Progress Log
+## Progress Log
 
 Use this file to track each completed implementation step.
 
@@ -29,3 +29,4 @@ Use this file to track each completed implementation step.
 | 2026-03-27 | A-12 | DONE | Key-path regression command passed (41/41), full-suite regression command passed (70/70), and thresholds met (`key-path=100%`, `overall=100%`, `P0/P1=0`); report written at `docs/a12-regression-freeze-report-2026-03-27.md`. | Completed A-12 baseline regression and freeze with no blocker defects; generated structured regression report including pass rates, defect grading, and freeze decision. Paused before B-13 and will not start step 13 until user-side verification is explicitly confirmed. Skills: `brainstorming -> writing-plans -> verification-before-completion -> requesting-code-review`. |
 
 
+| 2026-03-27 | B-13 | DONE | `C:\Users\13635\AppData\Local\Programs\Python\Python312\python.exe -m unittest tests.repos.test_sql_knowledge_repository tests.services.test_knowledge_answering tests.services.test_single_chat_service tests.api.test_dingtalk_single_chat tests.api.test_identity_context tests.integrations.test_stream_runtime -v` passed (49/49), and `... -m unittest discover -s tests -v` passed (82/82). | Implemented FR-05 permission control end-to-end with decision matrix `allow/summary_only/deny`: added SQL restricted-hit probing (`department/sensitive`), propagated `user_context -> KnowledgeAccessContext` through API/Stream/service/retriever chain, introduced stable `reason=permission_restricted`, and enforced non-leakage replies (`summary_only` includes脱敏摘要+申请路径, `deny` omits摘要/正文). Added cross-layer tests for same-question multi-permission identities and log consistency. Paused before B-14 and will not start step 14 until user-side verification is explicitly confirmed. Skills: `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion -> requesting-code-review`. |
