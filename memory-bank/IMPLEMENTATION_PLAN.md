@@ -43,6 +43,39 @@
 | FR-09 兜底与转人工 | A-11 |
 | FR-10 知识维护与运营基础能力 | B-17 |
 
+### 0.6 步骤级技能执行链（强制）
+除文档门禁步骤外，所有实现步骤默认使用 `systematic-debugging` 作为失败时强制介入流程。每个步骤完成后，`progress.md` 对应行 `Notes` 必须包含 `Skills:` 记录。
+
+| Step ID | Mandatory Skill Chain |
+| --- | --- |
+| A-01 | `brainstorming -> writing-plans -> verification-before-completion` |
+| A-02 | `brainstorming -> writing-plans -> verification-before-completion` |
+| A-03 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion` |
+| A-04 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion` |
+| A-05 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion` |
+| A-06 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion` |
+| A-07 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion` |
+| A-08 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion` |
+| A-09 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion` |
+| A-10 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion` |
+| A-11 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion` |
+| A-12 | `brainstorming -> writing-plans -> verification-before-completion -> requesting-code-review` |
+| B-13 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion -> requesting-code-review` |
+| B-14 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion -> requesting-code-review` |
+| B-15 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion -> requesting-code-review` |
+| B-16 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion -> requesting-code-review` |
+| B-17 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion -> requesting-code-review` |
+| B-18 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion -> requesting-code-review` |
+| B-19 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion -> requesting-code-review` |
+| B-20 | `brainstorming -> writing-plans -> verification-before-completion -> requesting-code-review` |
+
+### 0.7 技能追溯门禁升级检查点（GOV-SKILL-02）
+为避免在里程碑后段遗忘升级，设定以下强制门禁：
+
+1. 在记录 `B-17`、`B-18`、`B-19`、`B-20` 任一实施步骤前，`progress.md` 必须先出现 `GOV-SKILL-02` 且状态为 `DONE`。
+2. `GOV-SKILL-02` 定义：将 `validate-memory-bank.ps1` 从“仅最新行强制 `Skills:`”升级为“`GOV-SKILL-02` 之后新增行全部强制 `Skills:`”。
+3. 升级前保留低摩擦策略（仅最新行强制），不追溯历史记录；升级后按分界点向后强制。
+
 ---
 
 ## 1. 里程碑 A：基础功能（必须先完成）

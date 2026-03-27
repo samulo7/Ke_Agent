@@ -33,6 +33,11 @@ class _FakeResolver:
         return self._context
 
 
+class _RaisingKnowledgeAnswerService:
+    def answer(self, *, question: str, intent: str):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated downstream failure")
+
+
 def _make_payload(*, text: str, conversation_type: str = "single", message_type: str = "text") -> dict[str, Any]:
     return {
         "event_id": "evt-a05-001",
@@ -114,6 +119,23 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertTrue(outcome["knowledge_version"])
         self.assertTrue(outcome["answered_at"])
         self.assertGreaterEqual(len(outcome["citations"]), 1)
+
+    def test_handle_single_chat_payload_returns_system_fallback_on_service_error(self) -> None:
+        sender = _FakeSender()
+        service = SingleChatService(knowledge_answer_service=_RaisingKnowledgeAnswerService())
+        outcome = handle_single_chat_payload(
+            _make_payload(text="宴请标准是什么"),
+            service=service,
+            sender=sender,
+            user_context_resolver=self._build_resolver(),
+        )
+
+        self.assertFalse(outcome["handled"])
+        self.assertEqual("system_fallback", outcome["reason"])
+        self.assertEqual("text", outcome["channel"])
+        self.assertEqual(1, len(sender.text_messages))
+        self.assertEqual(0, len(sender.card_payloads))
+        self.assertEqual([], outcome["source_ids"])
 
     def test_handle_single_chat_payload_sends_card_for_application_question(self) -> None:
         sender = _FakeSender()

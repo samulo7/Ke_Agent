@@ -59,6 +59,8 @@ async def receive_dingtalk_stream_event(
     request.state.permission_decision = outcome.permission_decision
     request.state.knowledge_version = outcome.knowledge_version
     request.state.answered_at = outcome.answered_at
+    if outcome.reason == "system_fallback":
+        request.state.error_category = "dependency_error"
     return JSONResponse(
         status_code=200,
         media_type=UTF8_JSON_MEDIA_TYPE,

@@ -15,6 +15,10 @@ These rules are mandatory for every coding task.
 5. After each major feature or milestone, update `memory-bank/architecture.md` with module responsibilities and changed file roles.
 6. Before merge or milestone handoff, run `.\infra\scripts\validate-memory-bank.ps1` and fix all reported failures.
 7. If any required memory-bank file is missing, stop implementation and request it before coding.
+8. For any new feature, behavior change, or cross-module refactor, follow this mandatory skill chain: `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion`.
+9. If verification fails or behavior is unexpected, run `systematic-debugging` before changing implementation direction.
+10. Before requesting review, run `requesting-code-review`; when handling review feedback, run `receiving-code-review`.
+11. Every newly added row in `memory-bank/progress.md` must include a `Skills:` segment in the `Notes` column, listing the executed skill chain for traceability.
 
 ## Build, Test, and Development Commands
 No project-local build, test, or run scripts are committed yet.

@@ -8,14 +8,17 @@ Last Updated: 2026-03-27
 | --- | --- |
 | memory-bank/PRD-钉钉企业内部Agent-MVP.md | Product requirements and acceptance scope |
 | memory-bank/tech-stack.md | Technical stack baseline and design constraints |
-| memory-bank/IMPLEMENTATION_PLAN.md | Decision-complete implementation plan for MVP milestones A+B, including FR mapping, quantified gates, and interface contracts |
-| memory-bank/progress.md | Execution progress tracking and verification outcomes |
-| AGENTS.md | Repository-wide contributor rules and Always constraints |
-| infra/scripts/validate-memory-bank.ps1 | Automated gate to verify memory-bank completeness and update discipline |
+| memory-bank/IMPLEMENTATION_PLAN.md | Decision-complete implementation plan for MVP milestones A+B, including FR mapping, quantified gates, interface contracts, mandatory step-level superpower skill chains, and GOV-SKILL-02 upgrade checkpoint |
+| memory-bank/progress.md | Execution progress tracking and verification outcomes; latest row must carry `Skills:` traceability notes |
+| AGENTS.md | Repository-wide contributor rules, Always constraints, and mandatory superpower workflow policy |
+| infra/scripts/validate-memory-bank.ps1 | Automated gate to verify memory-bank completeness, date/step discipline, B-17+ requires prior GOV-SKILL-02 completion, and `Skills:` traceability rules (latest row now, all rows after GOV-SKILL-02) |
 | .githooks/pre-commit | Git pre-commit entrypoint that runs memory-bank validation |
 | infra/scripts/setup-git-hooks.ps1 | One-time script to configure Git `core.hooksPath` to `.githooks` |
 | app/repos/sql_knowledge_repository.py | A-10 SQL split-table repository and JOIN-based permission filtering boundary implementation |
 | tests/repos/test_sql_knowledge_repository.py | A-10 verification suite for split-table schema boundary and SQL permission filtering accuracy |
+| app/services/single_chat.py | A-11 fallback/handoff orchestrator for ambiguous input, low-confidence routing, and runtime-error degradation in single-chat path |
+| tests/services/test_single_chat_service.py | A-11 service-level fallback coverage for ambiguous/low-confidence/system-error scenarios |
+| tests/api/test_dingtalk_single_chat.py + tests/integrations/test_stream_runtime.py | A-11 channel-level regression coverage ensuring API/Stream return executable fallback responses instead of blank/error crashes |
 
 ## A-01 Architecture Insights
 
@@ -125,6 +128,33 @@ Last Updated: 2026-03-27
 | app/repos/knowledge_repository.py | Extends repository contract with `list_entries_for_retrieval(intent, access_context)` default method to centralize pre-ranking candidate filtering responsibility in repository layer. | Called by retriever for every retrieval request; default behavior remains backward-compatible with in-memory repository. | Upstream: retriever query intent + optional access context. Downstream: repository-specific filtering strategy (in-memory vs SQL JOIN). |
 | app/rag/knowledge_retriever.py | Switches candidate source from raw `list_entries()` traversal to repository-provided retrieval candidates so SQL permission filtering can happen before scoring/ranking. | Invoked for policy/fixed-quote/other retrieval requests. | Upstream: repository retrieval contract and normalized question text. Downstream: ranked evidence list that already respects repository-side permission scope. |
 | tests/repos/test_sql_knowledge_repository.py | Adds A-10 acceptance tests for two hard gates: (1) permission fields only exist on `knowledge_docs` (zero permission-field redundancy in `doc_chunks`), (2) SQL JOIN permission filtering returns department-correct candidates (100% in test dataset), plus retriever integration assertion. | Executed during A-10 and regression pipelines. | Upstream: SQL repository implementation and bootstrap schema. Downstream: objective pass/fail evidence for A-10 threshold claims. |
+
+## A-11 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/single_chat.py | Adds FR-09 fallback decision branches on top of existing routing: `ambiguous_question` (one-round clarification), `low_confidence_fallback` (intent uncertainty handoff guidance), and `system_fallback` (downstream exception degradation with non-empty reply). | Executed on every single-chat text message before/around intent + knowledge answer flow. | Upstream: normalized user text + intent classifier confidence + downstream answer service availability. Downstream: stable `ChatHandleResult.reason` and channel-safe fallback replies used by API/Stream handlers. |
+| app/api/dingtalk.py | Marks `system_fallback` outcomes with `request.state.error_category=dependency_error` while keeping callback response as `200` with executable fallback text. | Used during `/dingtalk/stream/events` success path when service degrades instead of throwing. | Upstream: `SingleChatService` fallback reason. Downstream: structured observability logs can distinguish degraded-but-served requests from normal hits. |
+| app/integrations/dingtalk/stream_runtime.py | Aligns Stream callback logs with A-11 degradation semantics by emitting `stream_callback_degraded` and `dependency_error` when fallback reason is `system_fallback`. | Used in real Stream callback runtime after service outcome is produced. | Upstream: stream payload + single-chat handling outcome. Downstream: operator-visible degraded-event metrics without breaking callback ACK flow. |
+| tests/services/test_single_chat_service.py | Verifies three new fallback branches and keeps existing behavior regression-safe (knowledge hits, cards, non-single rejection). | Run in service regression pipeline for A-11 acceptance. | Upstream: `SingleChatService` logic. Downstream: proof that ambiguous/low-confidence/system-error scenarios no longer collapse to blank/crash behavior. |
+| tests/api/test_dingtalk_single_chat.py + tests/integrations/test_stream_runtime.py | Verifies API/Stream channel behavior for fallback paths, including degraded downstream failure returning actionable text instead of exception propagation. | Run in API/integration regression before milestone handoff. | Upstream: route/runtime adapters and fallback reasons. Downstream: cross-channel consistency evidence for FR-09 minimal fallback and handoff execution path. |
+
+## GOV-SKILL-01 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| AGENTS.md | Establishes mandatory workflow chain for future feature work (`brainstorming -> writing-plans -> test-driven-development -> verification-before-completion`) and review/debugging requirements. | Read before every coding task and referenced during execution handoff. | Upstream: repository governance decision to institutionalize superpower workflows. Downstream: contributor behavior, delivery consistency, and review discipline. |
+| memory-bank/IMPLEMENTATION_PLAN.md | Adds step-level mandatory skill-chain matrix for A-01~B-20 so process requirements are attached to each implementation step. | Used while selecting and executing the current step. | Upstream: AGENTS workflow policy. Downstream: deterministic execution flow and easier onboarding for future contributors. |
+| infra/scripts/validate-memory-bank.ps1 | Validates that the latest `progress.md` row includes `Skills:` in Notes, turning workflow traceability from convention into gate. | Run before merge/milestone handoff and pre-commit checks. | Upstream: newly appended progress row and existing memory-bank structure. Downstream: PASS/FAIL signal that blocks non-traceable handoffs. |
+| memory-bank/progress.md | Records `GOV-SKILL-01` completion and starts `Skills:`-annotated step logging convention for future records. | Updated after governance-rule implementation and each subsequent completed step. | Upstream: completed governance/document/script changes. Downstream: audit trail for executed skill chains. |
+
+## GOV-SKILL-01-HF1 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| infra/scripts/validate-memory-bank.ps1 | Adds automatic timing gate for future upgrade: `B-17/B-18/B-19/B-20` entries are blocked unless `GOV-SKILL-02` is already recorded as `DONE`; once `GOV-SKILL-02` exists, all subsequent rows must carry `Skills:` in Notes. | Run before milestone handoff and any pre-commit memory-bank validation. | Upstream: ordered rows in `progress.md`. Downstream: prevents forgetting the full-traceability upgrade and enforces the post-upgrade policy deterministically. |
+| memory-bank/IMPLEMENTATION_PLAN.md | Documents `GOV-SKILL-02` as explicit governance checkpoint in section 0.7, aligned with validator enforcement behavior. | Reviewed before execution of late-stage milestone steps and when updating governance policy. | Upstream: governance decision on low-friction-now / strict-later rollout. Downstream: contributor clarity on when and why validator behavior tightens. |
+| memory-bank/progress.md | Records HF1 rollout evidence and keeps the newest row compliant with current `Skills:` rule. | Updated immediately after validator enhancement. | Upstream: completed script and plan updates. Downstream: auditable history of the trigger-based gate rollout. |
 
 Operational Note (A-06):
 - Local API startup must load runtime credentials (`uvicorn app.api.main:app --env-file .env` or equivalent exported env vars). If `DINGTALK_CLIENT_ID` / `DINGTALK_CLIENT_SECRET` are absent at process start, resolver cannot create OpenAPI client and will intentionally degrade to `identity_source=event_fallback`.

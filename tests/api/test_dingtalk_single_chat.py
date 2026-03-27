@@ -6,6 +6,12 @@ from io import StringIO
 from fastapi.testclient import TestClient
 
 from app.api.main import create_app
+from app.services.single_chat import SingleChatService
+
+
+class _RaisingKnowledgeAnswerService:
+    def answer(self, *, question: str, intent: str):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated downstream failure")
 
 
 def make_stream_payload(
@@ -59,6 +65,37 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertTrue(body["answered_at"])
         self.assertEqual([], body["citations"])
 
+    def test_ambiguous_question_returns_clarification_once(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post("/dingtalk/stream/events", json=make_stream_payload(text="这个怎么弄"))
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+
+        self.assertFalse(body["handled"])
+        self.assertEqual("ambiguous_question", body["reason"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("仅追问一次", body["reply"]["text"])
+        self.assertEqual([], body["source_ids"])
+
+    def test_low_confidence_question_returns_handoff_guidance(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(text="我想问个事儿，帮我处理一下"),
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+
+        self.assertFalse(body["handled"])
+        self.assertEqual("low_confidence_fallback", body["reason"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("无法准确判断", body["reply"]["text"])
+        self.assertEqual([], body["source_ids"])
+
     def test_policy_query_returns_knowledge_with_source_metadata(self) -> None:
         app = create_app(log_stream=StringIO())
         client = TestClient(app)
@@ -76,6 +113,22 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertTrue(body["knowledge_version"])
         self.assertTrue(body["answered_at"])
         self.assertGreaterEqual(len(body["citations"]), 1)
+
+    def test_system_failure_returns_text_fallback_instead_of_500(self) -> None:
+        app = create_app(
+            log_stream=StringIO(),
+            single_chat_service=SingleChatService(knowledge_answer_service=_RaisingKnowledgeAnswerService()),
+        )
+        client = TestClient(app)
+
+        response = client.post("/dingtalk/stream/events", json=make_stream_payload(text="宴请标准是什么"))
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+
+        self.assertFalse(body["handled"])
+        self.assertEqual("system_fallback", body["reason"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("稍后再试", body["reply"]["text"])
 
     def test_policy_query_with_mojibake_text_is_repaired(self) -> None:
         app = create_app(log_stream=StringIO())

@@ -57,6 +57,73 @@ $progressRowPattern = "(?m)^\|\s*\d{4}-\d{2}-\d{2}\s*\|\s*[^|]+\|\s*(DONE|IN_PRO
 if ($progress -notmatch $progressRowPattern) {
     $errors.Add("progress.md must include at least one valid table row: Date | Step ID | Status | Verification | Notes.")
 }
+else {
+    $progressRows = @(
+        ($progress -split "`r?`n") |
+        Where-Object { $_ -match "^\|\s*\d{4}-\d{2}-\d{2}\s*\|" }
+    )
+
+    if ($progressRows.Count -gt 0) {
+        $rowPattern = "^\|\s*(?<date>\d{4}-\d{2}-\d{2})\s*\|\s*(?<step>[^|]+?)\s*\|\s*(?<status>DONE|IN_PROGRESS|BLOCKED)\s*\|\s*(?<verification>[^|]+?)\s*\|\s*(?<notes>[^|]+?)\s*\|\s*$"
+        $parsedRows = @()
+
+        foreach ($row in $progressRows) {
+            if ($row -match $rowPattern) {
+                $parsedRows += [PSCustomObject]@{
+                    Date = $Matches["date"].Trim()
+                    Step = $Matches["step"].Trim()
+                    Status = $Matches["status"].Trim()
+                    Verification = $Matches["verification"].Trim()
+                    Notes = $Matches["notes"].Trim()
+                    Raw = $row
+                }
+            }
+            else {
+                $errors.Add("Unable to parse progress row: $row")
+            }
+        }
+
+        if ($parsedRows.Count -gt 0) {
+            $latestRow = $parsedRows[-1]
+            if ($latestRow.Notes -notmatch "(?i)\bSkills\s*:") {
+                $errors.Add("The latest progress row must include a 'Skills:' segment in Notes for workflow traceability.")
+            }
+
+            $firstGovSkill02DoneIndex = -1
+            $firstB17OrHigherIndex = -1
+            $b17OrHigherPattern = "^B-(17|18|19|20)(\b|$)"
+
+            for ($i = 0; $i -lt $parsedRows.Count; $i++) {
+                $row = $parsedRows[$i]
+
+                if ($firstGovSkill02DoneIndex -lt 0 -and $row.Step -eq "GOV-SKILL-02" -and $row.Status -eq "DONE") {
+                    $firstGovSkill02DoneIndex = $i
+                }
+                if ($firstB17OrHigherIndex -lt 0 -and $row.Step -match $b17OrHigherPattern) {
+                    $firstB17OrHigherIndex = $i
+                }
+            }
+
+            if ($firstB17OrHigherIndex -ge 0 -and ($firstGovSkill02DoneIndex -lt 0 -or $firstGovSkill02DoneIndex -gt $firstB17OrHigherIndex)) {
+                $bStep = $parsedRows[$firstB17OrHigherIndex].Step
+                $bDate = $parsedRows[$firstB17OrHigherIndex].Date
+                $errors.Add("Step '$bStep' ($bDate) requires 'GOV-SKILL-02' with status DONE to appear earlier in progress.md.")
+            }
+
+            if ($firstGovSkill02DoneIndex -ge 0) {
+                for ($i = $firstGovSkill02DoneIndex + 1; $i -lt $parsedRows.Count; $i++) {
+                    $row = $parsedRows[$i]
+                    if ($row.Notes -notmatch "(?i)\bSkills\s*:") {
+                        $errors.Add("Row '$($row.Date) | $($row.Step)' is after GOV-SKILL-02 and must include a 'Skills:' segment in Notes.")
+                    }
+                }
+            }
+        }
+        else {
+            $errors.Add("Unable to parse progress rows for Skills traceability checks.")
+        }
+    }
+}
 
 if ($architecture -notmatch "(?m)^##\s+File Responsibilities\s*$") {
     $errors.Add("architecture.md must contain heading: '## File Responsibilities'.")

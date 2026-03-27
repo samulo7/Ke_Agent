@@ -219,6 +219,9 @@ def build_stream_client(
                     sender=sender,
                     user_context_resolver=context_resolver,
                 )
+                if outcome.get("reason") == "system_fallback":
+                    event = "stream_callback_degraded"
+                    explicit_error_category = "dependency_error"
                 callback_message.extensions["user_context"] = outcome["user_context"]
                 return sdk.AckMessage.STATUS_OK, {
                     "trace_id": trace_id,

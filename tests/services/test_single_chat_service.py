@@ -6,6 +6,11 @@ from app.schemas.dingtalk_chat import IncomingChatMessage
 from app.services.single_chat import SingleChatService
 
 
+class _RaisingKnowledgeAnswerService:
+    def answer(self, *, question: str, intent: str):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated downstream failure")
+
+
 def make_message(
     *,
     conversation_type: str = "single",
@@ -44,6 +49,32 @@ class SingleChatServiceTests(unittest.TestCase):
         self.assertEqual("other", result.intent)
         self.assertEqual("knowledge_no_hit", result.reason)
         self.assertEqual(0, len(result.source_ids))
+
+    def test_returns_clarification_for_ambiguous_question(self) -> None:
+        service = SingleChatService()
+        result = service.handle(make_message(text="这个怎么弄"))
+        self.assertFalse(result.handled)
+        self.assertEqual("text", result.reply.channel)
+        self.assertEqual("ambiguous_question", result.reason)
+        self.assertIn("仅追问一次", result.reply.text or "")
+        self.assertIn("请补充", result.reply.text or "")
+
+    def test_returns_low_confidence_fallback_for_unclear_scope(self) -> None:
+        service = SingleChatService()
+        result = service.handle(make_message(text="我想问个事儿，帮我处理一下"))
+        self.assertFalse(result.handled)
+        self.assertEqual("text", result.reply.channel)
+        self.assertEqual("low_confidence_fallback", result.reason)
+        self.assertIn("无法准确判断", result.reply.text or "")
+
+    def test_returns_system_fallback_when_answer_service_raises(self) -> None:
+        service = SingleChatService(knowledge_answer_service=_RaisingKnowledgeAnswerService())
+        result = service.handle(make_message(text="宴请标准是什么"))
+        self.assertFalse(result.handled)
+        self.assertEqual("text", result.reply.channel)
+        self.assertEqual("system_fallback", result.reason)
+        self.assertIn("稍后再试", result.reply.text or "")
+        self.assertIn("联系", result.reply.text or "")
 
     def test_returns_flow_guidance_card_for_leave(self) -> None:
         service = SingleChatService()
