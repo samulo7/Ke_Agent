@@ -21,6 +21,14 @@
 ### 0.3 默认技术基线
 `Stream + OpenAPI + 互动卡片 + PostgreSQL + pgvector + Redis`
 
+### 0.3.1 LLM 落地强约束（补充）
+1. 本项目产品定位为“LLM 辅助企业 Agent”，`Qwen` 运行时接入为必须项，不得以纯规则引擎形态作为最终交付。
+2. 当前 A/B 阶段已交付能力中，若存在“配置了 `QWEN_*` 但未实际调用模型”的情况，必须在后续补充里程碑中闭环修正。
+3. LLM 接入后仍需保留强约束边界：
+   - 权限决策仍以系统规则与数据权限为准，不可由模型越权判定；
+   - 文件发放审批链路仍以业务流程为准，不可由模型绕过审批；
+   - 模型故障时必须可降级到可执行兜底回复。
+
 ### 0.4 文档层接口契约
 1. 输出通道契约：`text | interactive_card`
 2. 权限决策契约：`allow | summary_only | deny`
@@ -68,6 +76,10 @@
 | B-18 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion -> requesting-code-review` |
 | B-19 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion -> requesting-code-review` |
 | B-20 | `brainstorming -> writing-plans -> verification-before-completion -> requesting-code-review` |
+| LLM-01 | `brainstorming -> writing-plans -> verification-before-completion` |
+| LLM-02 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion -> requesting-code-review` |
+| LLM-03 | `brainstorming -> writing-plans -> test-driven-development -> verification-before-completion -> requesting-code-review` |
+| LLM-04 | `brainstorming -> writing-plans -> verification-before-completion -> requesting-code-review` |
 
 ### 0.7 技能追溯门禁升级检查点（GOV-SKILL-02）
 为避免在里程碑后段遗忘升级，设定以下强制门禁：
@@ -246,3 +258,35 @@
 ## 5. 里程碑 C（后置，不纳入当前交付）
 二期扩展能力（如请假智能辅助增强、招聘筛选辅助）保留为后续规划。
 当前版本不进入实现、不纳入 MVP 验收。
+
+---
+
+## 6. LLM 补充里程碑（必须完成）
+说明：该里程碑用于修正“当前运行时仍以规则编排为主、尚未真实接入 Qwen”的实现偏差，属于 MVP 目标对齐必做项。
+
+### LLM-01 现状校准与边界锁定
+- 输入：PRD 的 LLM 定位、当前代码实现、配置项清单
+- 输出：现状差异清单（已配置未接入、规则替代点位、降级边界）
+- 验证方式：代码检索 + 架构评审
+- 通过阈值：差异项覆盖率 `100%`，风险分级与改造优先级明确
+
+### LLM-02 Qwen 推理接入（意图识别 + 答案生成）
+- 输入：`QWEN_API_KEY`、模型名配置、现有 `single_chat` 编排入口
+- 输出：
+  - 统一 LLM 客户端（provider 适配层）
+  - 意图识别支持模型判定（并保留规则回退）
+  - 知识答案生成支持模型重写/归纳（并保留无命中不编造约束）
+- 验证方式：单元测试 + 集成测试 + 人工对话抽样
+- 通过阈值：主链路模型调用成功率 `>=99%`，模型超时/失败回退成功率 `100%`
+
+### LLM-03 检索增强与可追溯一致性
+- 输入：RAG 检索结果、来源引用、权限决策结果
+- 输出：模型回答在“结论/来源/下一步”模板下的稳定输出，且保持 `source_ids`、`permission_decision`、`knowledge_version` 可追溯
+- 验证方式：离线评测 + 端到端回归
+- 通过阈值：引用有效率 `>=95%`，越权泄露 `0`，无来源编造 `0`
+
+### LLM-04 DingTalk 人工验收闭环
+- 输入：钉钉真实单聊场景（知识问答、文件申请、审批回执）
+- 输出：LLM 版本验收报告（命中质量、降级表现、失败样例）
+- 验证方式：DingTalkManual 实测 + 回归报告
+- 通过阈值：关键场景通过率 `100%`，阻断缺陷 `0`

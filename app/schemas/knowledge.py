@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from app.schemas.dingtalk_chat import IntentType, PermissionDecision
 
@@ -98,6 +98,7 @@ class KnowledgeAnswer:
     knowledge_version: str
     answered_at: str
     citations: tuple[KnowledgeCitation, ...]
+    llm_trace: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def not_found(
@@ -106,6 +107,7 @@ class KnowledgeAnswer:
         text: str,
         knowledge_version: str,
         permission_decision: PermissionDecision = "allow",
+        llm_trace: dict[str, Any] | None = None,
     ) -> "KnowledgeAnswer":
         return cls(
             found=False,
@@ -115,6 +117,7 @@ class KnowledgeAnswer:
             knowledge_version=knowledge_version,
             answered_at=utc_now_iso(),
             citations=(),
+            llm_trace=llm_trace or {},
         )
 
     @classmethod
@@ -125,6 +128,7 @@ class KnowledgeAnswer:
         knowledge_version: str,
         permission_decision: PermissionDecision,
         source_ids: tuple[str, ...],
+        llm_trace: dict[str, Any] | None = None,
     ) -> "KnowledgeAnswer":
         return cls(
             found=False,
@@ -134,4 +138,5 @@ class KnowledgeAnswer:
             knowledge_version=knowledge_version,
             answered_at=utc_now_iso(),
             citations=(),
+            llm_trace=llm_trace or {},
         )

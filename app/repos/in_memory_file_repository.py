@@ -8,25 +8,32 @@ from app.schemas.file_asset import FileAsset, FileSearchResult, FileVariant
 from app.schemas.user_context import UserContext
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]{2,}")
-_STOP_TOKENS = {
-    "帮我",
+_STOP_TOKENS = (
     "请帮我",
-    "一下",
-    "找",
-    "查",
-    "查下",
-    "查找",
-    "检索",
+    "帮我",
+    "我想要",
+    "想要",
     "我要",
     "我想",
     "需要",
     "给我",
     "发我",
+    "一下",
+    "查下",
+    "查找",
+    "检索",
+    "找",
+    "查",
     "扫描版",
     "纸质版",
     "扫描件",
     "纸质件",
-}
+    "文件",
+    "文档",
+    "资料",
+    "的",
+)
+_STOP_TOKEN_SET = set(_STOP_TOKENS)
 
 
 def _normalize(text: str) -> str:
@@ -35,12 +42,20 @@ def _normalize(text: str) -> str:
 
 def _extract_tokens(text: str) -> tuple[str, ...]:
     normalized = _normalize(text)
-    tokens = [item for item in _TOKEN_RE.findall(normalized) if item and item not in _STOP_TOKENS]
+    tokens = [item for item in _TOKEN_RE.findall(normalized) if item and item not in _STOP_TOKEN_SET]
     return tuple(dict.fromkeys(tokens))
+
+
+def _strip_stop_tokens(text: str) -> str:
+    normalized = _normalize(text)
+    for token in _STOP_TOKENS:
+        normalized = normalized.replace(_normalize(token), "")
+    return normalized
 
 
 def _score_asset(*, query_text: str, asset: FileAsset) -> int:
     normalized_query = _normalize(query_text)
+    condensed_query = _strip_stop_tokens(query_text)
     title = _normalize(asset.title)
     contract_key = _normalize(asset.contract_key)
     tags = tuple(_normalize(tag) for tag in asset.tags)
@@ -50,6 +65,11 @@ def _score_asset(*, query_text: str, asset: FileAsset) -> int:
         score += 120
     if normalized_query and normalized_query in contract_key:
         score += 120
+
+    if condensed_query and condensed_query in title:
+        score += 90
+    if condensed_query and condensed_query in contract_key:
+        score += 90
 
     for token in _extract_tokens(query_text):
         if token in title:

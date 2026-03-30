@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 ConversationType = Literal["single", "group", "unknown"]
 OutputChannel = Literal["text", "interactive_card"]
-IntentType = Literal["policy_process", "document_request", "reimbursement", "leave", "fixed_quote", "other"]
+IntentType = Literal["policy_process", "document_request", "file_request", "reimbursement", "leave", "fixed_quote", "other"]
 PermissionDecision = Literal["allow", "summary_only", "deny"]
 
 
@@ -47,11 +47,16 @@ class ChatHandleResult:
     reason: str
     intent: IntentType
     reply: AgentReply
+    followup_replies: tuple[AgentReply, ...] = ()
     source_ids: tuple[str, ...] = ()
     permission_decision: PermissionDecision = "allow"
     knowledge_version: str = ""
     answered_at: str = ""
     citations: tuple[dict[str, str], ...] = ()
+    llm_trace: dict[str, Any] = field(default_factory=dict)
+
+    def all_replies(self) -> tuple[AgentReply, ...]:
+        return (self.reply, *self.followup_replies)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,9 +64,11 @@ class ChatHandleResult:
             "reason": self.reason,
             "intent": self.intent,
             "reply": self.reply.to_dict(),
+            "followup_replies": [item.to_dict() for item in self.followup_replies],
             "source_ids": list(self.source_ids),
             "permission_decision": self.permission_decision,
             "knowledge_version": self.knowledge_version,
             "answered_at": self.answered_at,
             "citations": [dict(item) for item in self.citations],
+            "llm_trace": dict(self.llm_trace),
         }

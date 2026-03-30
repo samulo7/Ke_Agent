@@ -56,6 +56,18 @@ def load_sample_entries() -> tuple[KnowledgeEntry, ...]:
             intents=("policy_process", "reimbursement", "other"),
         ),
         KnowledgeEntry(
+            source_id="doc-process-procurement-contract-2026-03",
+            source_type="document",
+            title="流程说明：采购合同申请与归档指引（2026-03）",
+            summary="采购合同需先完成需求确认、法务审阅和审批签署。",
+            applicability="适用于采购合同拟定、会签和归档场景。",
+            next_step="进入钉钉“采购合同审批”流程，上传合同草案并发起会签。",
+            source_uri="钉盘/流程说明/采购合同申请与归档指引-2026-03",
+            updated_at="2026-03-22",
+            keywords=("采购合同", "采购", "合同", "流程", "法务", "会签", "审批", "归档"),
+            intents=("policy_process", "other"),
+        ),
+        KnowledgeEntry(
             source_id="doc-policy-access-2026-03",
             source_type="document",
             title="行政制度：门禁与访客管理规范（2026-03）",

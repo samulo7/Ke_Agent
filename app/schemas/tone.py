@@ -10,6 +10,7 @@ _ALLOWED_TONES: set[str] = {"formal", "neutral", "conversational"}
 _ALLOWED_INTENTS: set[str] = {
     "policy_process",
     "document_request",
+    "file_request",
     "reimbursement",
     "leave",
     "fixed_quote",
@@ -39,7 +40,7 @@ def parse_intent_tone_overrides(value: str) -> dict[IntentType, ToneProfile]:
         intent = intent_raw.strip().lower()
         if intent not in _ALLOWED_INTENTS:
             raise ValueError(
-                "intent must be one of: document_request, fixed_quote, leave, other, policy_process, reimbursement"
+                "intent must be one of: document_request, file_request, fixed_quote, leave, other, policy_process, reimbursement"
             )
         tone = parse_tone_profile(tone_raw)
         result[intent] = tone  # type: ignore[index]

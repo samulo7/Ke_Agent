@@ -68,6 +68,13 @@ class KnowledgeAnswerServiceTests(unittest.TestCase):
         self.assertFalse(no_hit.found)
         self.assertIn("当前未检索到对应固定报价", no_hit.text)
 
+    def test_procurement_contract_query_keeps_high_relevance_sources_only(self) -> None:
+        answer = self.service.answer(question="采购合同流程是什么", intent="policy_process")
+        self.assertTrue(answer.found)
+        self.assertIn("doc-process-procurement-contract-2026-03", answer.source_ids)
+        self.assertNotIn("doc-process-leave-2026-01", answer.source_ids)
+        self.assertNotIn("doc-process-reimbursement-2026-02", answer.source_ids)
+
 
 class KnowledgeAnswerServicePermissionTests(unittest.TestCase):
     def setUp(self) -> None:

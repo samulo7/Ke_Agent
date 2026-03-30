@@ -43,7 +43,11 @@ def build_unified_answer_template(
     intent: IntentType,
     tone_profile: ToneProfile,
 ) -> UnifiedAnswerTemplate:
-    primary = evidences[0].entry
+    selected_evidences, selected_citations = _select_display_evidences_and_citations(
+        evidences=evidences,
+        citations=citations,
+    )
+    primary = selected_evidences[0].entry
     steps = [_build_applicability_step(applicability=primary.applicability, tone_profile=tone_profile)]
 
     if intent == "fixed_quote":
@@ -53,16 +57,51 @@ def build_unified_answer_template(
     else:
         steps.append(_build_generic_step(tone_profile=tone_profile))
 
-    related_titles = [item.entry.title for item in evidences[1:3] if item.entry.source_id != primary.source_id]
+    related_titles = [
+        item.entry.title
+        for item in selected_evidences[1:3]
+        if item.entry.source_id != primary.source_id
+    ]
     if related_titles:
         steps.append(_build_related_step(related_titles=related_titles, tone_profile=tone_profile))
 
     return UnifiedAnswerTemplate(
         conclusion=primary.summary,
         steps=tuple(steps),
-        sources=citations,
+        sources=selected_citations,
         next_step=primary.next_step,
     )
+
+
+def _select_display_evidences_and_citations(
+    *,
+    evidences: tuple[RetrievedEvidence, ...],
+    citations: tuple[KnowledgeCitation, ...],
+) -> tuple[tuple[RetrievedEvidence, ...], tuple[KnowledgeCitation, ...]]:
+    primary = evidences[0]
+    threshold = _supporting_score_threshold(primary_score=primary.score)
+    selected_evidences: list[RetrievedEvidence] = [primary]
+    for item in evidences[1:]:
+        if item.score >= threshold:
+            selected_evidences.append(item)
+        if len(selected_evidences) >= 3:
+            break
+
+    citation_map = {item.source_id: item for item in citations}
+    selected_citations = tuple(
+        citation_map[item.entry.source_id]
+        for item in selected_evidences
+        if item.entry.source_id in citation_map
+    )
+    return tuple(selected_evidences), selected_citations
+
+
+def _supporting_score_threshold(*, primary_score: int) -> int:
+    if primary_score >= 30:
+        return max(15, int(primary_score * 0.6))
+    if primary_score >= 20:
+        return 12
+    return 10
 
 
 def _build_applicability_step(*, applicability: str, tone_profile: ToneProfile) -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -266,6 +267,9 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertTrue(body["knowledge_version"])
         self.assertTrue(body["answered_at"])
         self.assertGreaterEqual(len(body["citations"]), 1)
+        self.assertIn("intent", body["llm_trace"])
+        self.assertIn("content", body["llm_trace"])
+        self.assertIn("orchestrator_shadow", body["llm_trace"])
 
     def test_system_failure_returns_text_fallback_instead_of_500(self) -> None:
         app = create_app(
@@ -420,33 +424,283 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         )
         self.assertEqual(200, first.status_code)
         body_first = first.json()
-        self.assertEqual("file_lookup_collecting", body_first["reason"])
+        self.assertEqual("file_lookup_confirm_required", body_first["reason"])
         self.assertEqual("file_request", body_first["intent"])
+        self.assertFalse(body_first["handled"])
         self.assertEqual(1, len(body_first["replies"]))
         self.assertEqual(body_first["reply"], body_first["replies"][0])
         self.assertEqual(1, len(body_first["dingtalk_payloads"]))
         self.assertEqual(body_first["dingtalk_payload"], body_first["dingtalk_payloads"][0])
+        self.assertEqual("interactive_card", body_first["replies"][0]["channel"])
+        card = body_first["replies"][0]["interactive_card"]
+        self.assertEqual("file_request_confirmation", card["card_type"])
+        request_id = card["request_id"]
+        self.assertTrue(str(request_id).startswith("file-req-"))
+
+        second = client.post(
+            "/dingtalk/stream/events",
+            json={
+                "request_id": request_id,
+                "approval_action": "确认申请",
+                "approver_user_id": "user-file-api-1",
+            },
+        )
+        self.assertEqual(200, second.status_code)
+        body_second = second.json()
+        self.assertTrue(body_second["handled"])
+        self.assertEqual("file_lookup_pending_approval", body_second["reason"])
+        self.assertEqual("pending", body_second["approval_status"])
+        self.assertEqual(1, len(body_second["replies"]))
+        self.assertIn("申请已提交", body_second["replies"][0]["text"])
+        self.assertNotIn("请求编号", body_second["replies"][0]["text"])
+
+        third = client.post(
+            "/dingtalk/stream/events",
+            json={
+                "request_id": request_id,
+                "approval_action": "同意",
+                "approver_user_id": "人事行政",
+            },
+        )
+        self.assertEqual(200, third.status_code)
+        body_third = third.json()
+        self.assertTrue(body_third["handled"])
+        self.assertEqual("file_approval_approved", body_third["reason"])
+        self.assertEqual("file_request", body_third["intent"])
+        self.assertEqual(3, len(body_third["replies"]))
+        self.assertEqual(body_third["reply"], body_third["replies"][0])
+        self.assertEqual(3, len(body_third["dingtalk_payloads"]))
+        self.assertEqual(body_third["dingtalk_payload"], body_third["dingtalk_payloads"][0])
+        self.assertIn("优先为您提供扫描件", body_third["replies"][0]["text"])
+        self.assertIn("点击下载：[下载文件](", body_third["replies"][1]["text"])
+        self.assertIn("复制链接：https://example.local/files/dingyingqi-contract-2024-scan", body_third["replies"][1]["text"])
+        self.assertIn("文件已发送，请查收", body_third["replies"][2]["text"])
+
+    def test_file_request_progress_query_returns_structured_status(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要采购合同文件",
+                sender_id="user-file-api-status-1",
+                conversation_id="conv-file-api-status-1",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+        request_id = first.json()["reply"]["interactive_card"]["request_id"]
 
         second = client.post(
             "/dingtalk/stream/events",
             json=make_stream_payload(
-                text="扫描版",
-                sender_id="user-file-api-1",
-                conversation_id="conv-file-api-1",
+                text="审批进度",
+                sender_id="user-file-api-status-1",
+                conversation_id="conv-file-api-status-1",
+            ),
+        )
+        self.assertEqual(200, second.status_code)
+        body_second = second.json()
+        self.assertEqual("file_lookup_confirm_required", body_second["reason"])
+        self.assertIn("尚未提交审批", body_second["reply"]["text"])
+        self.assertNotIn(request_id, body_second["reply"]["text"])
+        self.assertNotIn("请求编号", body_second["reply"]["text"])
+
+        client.post(
+            "/dingtalk/stream/events",
+            json={
+                "request_id": request_id,
+                "approval_action": "确认申请",
+                "approver_user_id": "user-file-api-status-1",
+            },
+        )
+        third = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="通过了吗",
+                sender_id="user-file-api-status-1",
+                conversation_id="conv-file-api-status-1",
+            ),
+        )
+        self.assertEqual(200, third.status_code)
+        body_third = third.json()
+        self.assertEqual("file_lookup_pending_approval", body_third["reason"])
+        self.assertIn("当前审批状态：待审批", body_third["reply"]["text"])
+        self.assertNotIn(request_id, body_third["reply"]["text"])
+        self.assertNotIn("请求编号", body_third["reply"]["text"])
+
+    def test_file_request_button_id_callback_can_confirm_request(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要采购合同文件",
+                sender_id="user-file-api-button-1",
+                conversation_id="conv-file-api-button-1",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+        request_id = first.json()["reply"]["interactive_card"]["request_id"]
+
+        second = client.post(
+            "/dingtalk/stream/events",
+            json={
+                "buttonId": f"confirm_request::{request_id}",
+                "sender_id": "user-file-api-button-1",
+            },
+        )
+        self.assertEqual(200, second.status_code)
+        body_second = second.json()
+        self.assertTrue(body_second["handled"])
+        self.assertEqual("file_lookup_pending_approval", body_second["reason"])
+        self.assertEqual("pending", body_second["approval_status"])
+
+    def test_file_request_action_only_callback_can_confirm_request_by_session(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要采购合同文件",
+                sender_id="user-file-api-action-only-1",
+                conversation_id="conv-file-api-action-only-1",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+        self.assertEqual("file_lookup_confirm_required", first.json()["reason"])
+
+        second = client.post(
+            "/dingtalk/stream/events",
+            json={
+                "approval_action": "确认申请",
+                "sender_id": "user-file-api-action-only-1",
+                "conversation_id": "conv-file-api-action-only-1",
+                "conversation_type": "single",
+            },
+        )
+        self.assertEqual(200, second.status_code)
+        body_second = second.json()
+        self.assertTrue(body_second["handled"])
+        self.assertEqual("file_lookup_pending_approval", body_second["reason"])
+        self.assertEqual("pending", body_second["approval_status"])
+
+    def test_file_request_plain_text_confirm_can_confirm_request_by_session(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要采购合同文件",
+                sender_id="user-file-api-text-confirm-1",
+                conversation_id="conv-file-api-text-confirm-1",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+        self.assertEqual("file_lookup_confirm_required", first.json()["reason"])
+
+        second = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="确认申请",
+                sender_id="user-file-api-text-confirm-1",
+                conversation_id="conv-file-api-text-confirm-1",
             ),
         )
         self.assertEqual(200, second.status_code)
         body_second = second.json()
         self.assertTrue(body_second["handled"])
-        self.assertEqual("file_lookup_sent", body_second["reason"])
-        self.assertEqual("file_request", body_second["intent"])
-        self.assertEqual(3, len(body_second["replies"]))
-        self.assertEqual(body_second["reply"], body_second["replies"][0])
-        self.assertEqual(3, len(body_second["dingtalk_payloads"]))
-        self.assertEqual(body_second["dingtalk_payload"], body_second["dingtalk_payloads"][0])
-        self.assertIn("优先为您提供扫描版", body_second["replies"][0]["text"])
-        self.assertIn("已在文件库找到匹配文件", body_second["replies"][1]["text"])
-        self.assertIn("文件已发送，请查收", body_second["replies"][2]["text"])
+        self.assertEqual("file_lookup_pending_approval", body_second["reason"])
+        self.assertEqual("pending", body_second["approval_status"])
+
+    def test_file_request_card_callback_shape_can_confirm_request_by_session(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要采购合同文件",
+                sender_id="user-file-api-card-1",
+                conversation_id="conv-file-api-card-1",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+        self.assertEqual("file_lookup_confirm_required", first.json()["reason"])
+
+        second = client.post(
+            "/dingtalk/stream/events",
+            json={
+                "data": {
+                    "type": "actionCallback",
+                    "userId": "user-file-api-card-1",
+                    "extension": "{\"openConversationId\":\"conv-file-api-card-1\"}",
+                    "content": "{\"componentType\":\"button\",\"componentId\":\"confirm_request\"}",
+                }
+            },
+        )
+        self.assertEqual(200, second.status_code)
+        body_second = second.json()
+        self.assertTrue(body_second["handled"])
+        self.assertEqual("file_lookup_pending_approval", body_second["reason"])
+        self.assertEqual("pending", body_second["approval_status"])
+
+    def test_file_request_official_action_ids_callback_shape_can_confirm_request(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要采购合同文件",
+                sender_id="user-file-api-official-1",
+                conversation_id="conv-file-api-official-1",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+        self.assertEqual("file_lookup_confirm_required", first.json()["reason"])
+
+        second = client.post(
+            "/dingtalk/stream/events",
+            json={
+                "data": {
+                    "corpId": "ding-corp",
+                    "type": "actionCallback",
+                    "userId": "user-file-api-official-1",
+                    "content": "{\"cardPrivateData\":{\"actionIds\":[\"confirm_request\"],\"params\":{\"local_input\":\"submit\"}}}",
+                    "outTrackId": "track-official-1",
+                }
+            },
+        )
+        self.assertEqual(200, second.status_code)
+        body_second = second.json()
+        self.assertTrue(body_second["handled"])
+        self.assertEqual("file_lookup_pending_approval", body_second["reason"])
+        self.assertEqual("pending", body_second["approval_status"])
+
+    def test_file_request_not_found_callback_returns_user_facing_hint(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post(
+            "/dingtalk/stream/events",
+            json={
+                "data": {
+                    "type": "actionCallback",
+                    "userId": "unknown-user",
+                    "extension": "{\"openConversationId\":\"unknown-conv\"}",
+                    "content": "{\"componentType\":\"button\",\"componentId\":\"confirm_request\"}",
+                }
+            },
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertFalse(body["handled"])
+        self.assertEqual("file_approval_not_found", body["reason"])
+        self.assertIn("未定位到待处理申请", body["reply"]["text"])
 
     def test_document_request_timeout_returns_fallback_reason(self) -> None:
         clock = _FakeClock()

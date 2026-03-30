@@ -25,6 +25,7 @@ class JsonObservabilityFormatter(logging.Formatter):
             "permission_decision": obs.get("permission_decision"),
             "knowledge_version": obs.get("knowledge_version"),
             "answered_at": obs.get("answered_at"),
+            "llm_trace": obs.get("llm_trace", {}),
             "event": obs.get("event", record.getMessage()),
             "path": obs.get("path"),
             "method": obs.get("method"),

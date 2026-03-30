@@ -7,8 +7,11 @@ from datetime import datetime, timedelta, timezone
 from app.rag.knowledge_retriever import KnowledgeRetriever
 from app.repos.sql_knowledge_repository import SQLKnowledgeRepository, bootstrap_sqlite_schema
 from app.schemas.dingtalk_chat import AgentReply, ChatHandleResult, IncomingChatMessage
+from app.schemas.file_asset import FileAsset, FileSearchResult
+from app.schemas.llm import IntentInferenceResult, OrchestratorShadowResult
 from app.schemas.user_context import UserContext
 from app.services.document_request_draft import DocumentRequestDraftOrchestrator
+from app.services.file_request import FileRequestService
 from app.services.intent_classifier import IntentClassification
 from app.services.knowledge_answering import KnowledgeAnswerService
 from app.services.single_chat import SingleChatService
@@ -49,6 +52,63 @@ class _StubFileRequestService:
             reason="file_lookup_collecting",
             intent="file_request",
             reply=AgentReply(channel="text", text="请问您需要纸质版还是扫描版？"),
+        )
+
+
+class _AlwaysHitFileRepository:
+    def __init__(self) -> None:
+        self._scan_asset = FileAsset(
+            file_id="file-dingyingqi-contract-2024-scan",
+            contract_key="dingyingqi_contract",
+            title="定影器采购合同-2024版",
+            variant="scan",
+            file_url="https://example.local/files/dingyingqi-contract-2024-scan",
+            tags=("采购", "合同", "定影器", "2024"),
+            status="active",
+            updated_at="2026-03-27",
+        )
+        self._paper_asset = FileAsset(
+            file_id="file-dingyingqi-contract-2024-paper",
+            contract_key="dingyingqi_contract",
+            title="定影器采购合同-2024版",
+            variant="paper",
+            file_url="https://example.local/files/dingyingqi-contract-2024-paper",
+            tags=("采购", "合同", "定影器", "2024"),
+            status="active",
+            updated_at="2026-03-27",
+        )
+
+    def search(self, *, query_text: str, variant: str, requester_context=None):  # type: ignore[no-untyped-def]
+        asset = self._scan_asset if variant == "scan" else self._paper_asset
+        return FileSearchResult(matched=True, match_score=0.99, asset=asset)
+
+
+class _StubLLMIntentService:
+    def __init__(self, *, intent: str, confidence: float = 0.95, reason: str = "stub") -> None:
+        self._intent = intent
+        self._confidence = confidence
+        self._reason = reason
+
+    def infer(self, *, text: str, conversation_id: str, sender_id: str) -> IntentInferenceResult:
+        return IntentInferenceResult(
+            intent=self._intent,  # type: ignore[arg-type]
+            confidence=self._confidence,
+            reason=self._reason,
+            model="qwen-plus",
+            fallback_used=False,
+            validation_passed=True,
+        )
+
+
+class _StubShadowService:
+    def suggest(self, *, question: str, intent: str, rule_action: str, conversation_id: str, sender_id: str):  # type: ignore[no-untyped-def]
+        return OrchestratorShadowResult(
+            suggested_action=rule_action,  # type: ignore[arg-type]
+            rule_action=rule_action,  # type: ignore[arg-type]
+            reason="shadow-ok",
+            model="qwen-plus",
+            fallback_used=False,
+            validation_passed=True,
         )
 
 
@@ -219,6 +279,69 @@ class SingleChatServiceTests(unittest.TestCase):
         self.assertEqual(1, file_service.calls)
         self.assertEqual(0, knowledge_service.calls)
 
+    def test_pending_file_request_does_not_hijack_unrelated_policy_question(self) -> None:
+        service = SingleChatService(file_request_service=FileRequestService(file_repository=_AlwaysHitFileRepository()))
+        first = service.handle(
+            make_message(
+                text="我想要定影器采购合同",
+                conversation_id="conv-pending-route-1",
+                sender_id="user-pending-route-1",
+            )
+        )
+        self.assertEqual("file_lookup_confirm_required", first.reason)
+
+        second = service.handle(
+            make_message(
+                text="采购合同流程是什么",
+                conversation_id="conv-pending-route-1",
+                sender_id="user-pending-route-1",
+            )
+        )
+        self.assertEqual("policy_process", second.intent)
+        self.assertEqual("knowledge_answer", second.reason)
+
+    def test_pending_file_request_keeps_progress_followup_in_file_flow(self) -> None:
+        service = SingleChatService(file_request_service=FileRequestService(file_repository=_AlwaysHitFileRepository()))
+        first = service.handle(
+            make_message(
+                text="我想要定影器采购合同",
+                conversation_id="conv-pending-route-2",
+                sender_id="user-pending-route-2",
+            )
+        )
+        self.assertEqual("file_lookup_confirm_required", first.reason)
+
+        second = service.handle(
+            make_message(
+                text="审批进度",
+                conversation_id="conv-pending-route-2",
+                sender_id="user-pending-route-2",
+            )
+        )
+        self.assertEqual("file_request", second.intent)
+        self.assertEqual("file_lookup_confirm_required", second.reason)
+
+    def test_pending_file_request_followup_file_query_still_returns_pending_status(self) -> None:
+        service = SingleChatService(file_request_service=FileRequestService(file_repository=_AlwaysHitFileRepository()))
+        first = service.handle(
+            make_message(
+                text="我想要定影器采购合同",
+                conversation_id="conv-pending-route-3",
+                sender_id="user-pending-route-3",
+            )
+        )
+        self.assertEqual("file_lookup_confirm_required", first.reason)
+
+        second = service.handle(
+            make_message(
+                text="定影器采购合同在哪里下载",
+                conversation_id="conv-pending-route-3",
+                sender_id="user-pending-route-3",
+            )
+        )
+        self.assertEqual("file_request", second.intent)
+        self.assertEqual("file_lookup_confirm_required", second.reason)
+
     def test_returns_knowledge_text_answer_for_policy_question(self) -> None:
         service = SingleChatService()
         result = service.handle(make_message(text="宴请标准是什么"))
@@ -231,6 +354,19 @@ class SingleChatServiceTests(unittest.TestCase):
         self.assertTrue(result.knowledge_version)
         self.assertTrue(result.answered_at)
         self.assertGreaterEqual(len(result.citations), 1)
+
+    def test_result_contains_llm_trace_contract_fields(self) -> None:
+        service = SingleChatService(
+            llm_intent_service=_StubLLMIntentService(intent="policy_process"),  # type: ignore[arg-type]
+            orchestrator_shadow_service=_StubShadowService(),  # type: ignore[arg-type]
+        )
+        result = service.handle(make_message(text="宴请标准是什么"))
+        self.assertIn("intent", result.llm_trace)
+        self.assertIn("content", result.llm_trace)
+        self.assertIn("orchestrator_shadow", result.llm_trace)
+        self.assertIn("fallback_used", result.llm_trace["intent"])
+        self.assertIn("validation_passed", result.llm_trace["content"])
+        self.assertIn("suggested_action", result.llm_trace["orchestrator_shadow"])
 
     def test_returns_no_hit_when_knowledge_is_missing(self) -> None:
         service = SingleChatService()

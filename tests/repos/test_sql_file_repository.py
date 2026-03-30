@@ -74,6 +74,14 @@ class SQLFileRepositoryTests(unittest.TestCase):
         self.assertEqual("file-scan-1", result.asset.file_id)
         self.assertEqual("scan", result.asset.variant)
 
+    def test_search_hits_when_query_uses_want_and_file_words(self) -> None:
+        result = self.repository.search(query_text="我想要定影器采购合同文件", variant="scan")
+
+        self.assertTrue(result.matched)
+        self.assertIsNotNone(result.asset)
+        self.assertEqual("file-scan-1", result.asset.file_id)
+        self.assertEqual("scan", result.asset.variant)
+
     def test_search_returns_correct_variant_for_same_contract_key(self) -> None:
         result = self.repository.search(query_text="定影器采购合同", variant="paper")
 

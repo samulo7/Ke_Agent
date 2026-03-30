@@ -31,6 +31,16 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def apply_env_defaults(values: dict[str, str]) -> None:
+    """
+    Inject env-file values into process environment without overriding explicit
+    process env vars. This keeps "process env > env file" precedence while
+    making `.env` values visible to runtime services that read `os.getenv(...)`.
+    """
+    for key, value in values.items():
+        os.environ.setdefault(key, value)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run DingTalk Stream long-connection client for A-05.")
     parser.add_argument(
@@ -42,8 +52,12 @@ def main() -> int:
     args = parser.parse_args()
 
     merged: dict[str, str] = {}
+    file_values: dict[str, str] = {}
     if args.env_file is not None and args.env_file.exists():
-        merged.update(parse_env_file(args.env_file))
+        file_values = parse_env_file(args.env_file)
+        merged.update(file_values)
+
+    apply_env_defaults(file_values)
     merged.update({k: v for k, v in os.environ.items()})
 
     try:

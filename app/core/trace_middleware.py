@@ -43,6 +43,7 @@ class TraceMiddleware(BaseHTTPMiddleware):
         request.state.permission_decision = getattr(request.state, "permission_decision", "allow")
         request.state.knowledge_version = getattr(request.state, "knowledge_version", "")
         request.state.answered_at = getattr(request.state, "answered_at", "")
+        request.state.llm_trace = getattr(request.state, "llm_trace", {})
 
         started = perf_counter()
         try:
@@ -65,6 +66,7 @@ class TraceMiddleware(BaseHTTPMiddleware):
                         "permission_decision": getattr(request.state, "permission_decision", "allow"),
                         "knowledge_version": getattr(request.state, "knowledge_version", ""),
                         "answered_at": getattr(request.state, "answered_at", ""),
+                        "llm_trace": dict(getattr(request.state, "llm_trace", {})),
                         "event": "request_exception",
                         "path": str(request.url.path),
                         "method": request.method,
@@ -96,6 +98,7 @@ class TraceMiddleware(BaseHTTPMiddleware):
                     "permission_decision": getattr(request.state, "permission_decision", "allow"),
                     "knowledge_version": getattr(request.state, "knowledge_version", ""),
                     "answered_at": getattr(request.state, "answered_at", ""),
+                    "llm_trace": dict(getattr(request.state, "llm_trace", {})),
                     "event": "request_completed",
                     "path": str(request.url.path),
                     "method": request.method,

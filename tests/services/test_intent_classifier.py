@@ -18,6 +18,7 @@ LABELED_SAMPLES: list[tuple[str, IntentType]] = [
     ("OA流程办理入口在哪", "policy_process"),
     ("固定资产借用规范", "policy_process"),
     ("人事制度更新要求", "policy_process"),
+    ("采购合同内容是什么", "policy_process"),
     ("我要申请采购制度文件", "document_request"),
     ("需要查看员工手册文档", "document_request"),
     ("请帮我开通合同资料权限", "document_request"),
@@ -38,6 +39,7 @@ LABELED_SAMPLES: list[tuple[str, IntentType]] = [
     ("需要找合同附件", "file_request"),
     ("合同文件在哪，我要扫描版", "file_request"),
     ("帮我从文件库找合同", "file_request"),
+    ("定影器采购合同在哪里下载", "file_request"),
     ("出差报销怎么弄", "reimbursement"),
     ("报销流程是什么", "reimbursement"),
     ("发票报销要准备什么", "reimbursement"),
@@ -89,6 +91,8 @@ class IntentClassifierTests(unittest.TestCase):
         self.assertEqual("document_request", self.classifier.classify("我要申请报销制度文件").intent)
         self.assertEqual("file_request", self.classifier.classify("帮我找一下定影器的采购合同").intent)
         self.assertEqual("file_request", self.classifier.classify("请帮我找采购合同扫描件").intent)
+        self.assertEqual("file_request", self.classifier.classify("定影器采购合同在哪里下载").intent)
+        self.assertEqual("policy_process", self.classifier.classify("采购合同内容是什么").intent)
         self.assertEqual("reimbursement", self.classifier.classify("报销流程怎么走").intent)
         self.assertEqual("leave", self.classifier.classify("请假流程怎么走").intent)
         self.assertEqual("fixed_quote", self.classifier.classify("定影器报价流程").intent)

@@ -1,6 +1,13 @@
 ## Architecture Notes
 
-Last Updated: 2026-03-27
+Last Updated: 2026-03-29
+
+## Runtime Reality (2026-03-27)
+
+1. 当前主链路已支持可配置的 LLM 调用：`意图识别`、`内容生成`、`草稿抽取/润色` 可按开关与灰度百分比启用；默认仍是安全保守配置（开关默认关闭）。
+2. Qwen 运行时调用链已落地（`app/integrations/qwen/client.py` + 各服务接入），并统一执行“每次调用最多重试 2 次，失败规则兜底”。
+3. 决策/编排层本轮仍保持“规则驱动主链路”，`LLMOrchestrator` 只做 shadow 推断与一致率观测，不驱动真实动作。
+4. 非 LLM 强约束不变：权限校验、审批状态流转、数据库读写、敏感操作兜底仍由代码规则硬控制。
 
 ## File Responsibilities
 
@@ -16,9 +23,22 @@ Last Updated: 2026-03-27
 | infra/scripts/setup-git-hooks.ps1 | One-time script to configure Git `core.hooksPath` to `.githooks` |
 | app/repos/sql_knowledge_repository.py | A-10 SQL split-table repository and JOIN-based permission filtering boundary implementation |
 | tests/repos/test_sql_knowledge_repository.py | A-10 verification suite for split-table schema boundary and SQL permission filtering accuracy |
-| app/services/single_chat.py | A-11 fallback/handoff orchestrator for ambiguous input, low-confidence routing, and runtime-error degradation in single-chat path |
+| app/services/single_chat.py | A-11 + FILE-SEP-01 chat orchestration entrypoint: intent routing, document-request draft sessions, file-request approval flow bridging, and knowledge/fallback handling |
+| app/services/llm_intent.py | LLM intent inference service with output validation, confidence threshold, rollout gating, and deterministic rule fallback |
+| app/services/llm_content_generation.py | LLM content generation service for allow/summary_only/deny/no-hit wording with output safety validation and template fallback |
+| app/services/llm_draft_generation.py | LLM extraction/polish helper for document-request draft fields, scoped to text processing without state transition authority |
+| app/services/llm_orchestrator_shadow.py | Shadow-only LLM action suggestion layer used for consistency metrics, not for driving runtime actions |
+| app/integrations/qwen/client.py | Qwen OpenAI-compatible HTTP adapter with bounded retry, timeout handling, and strict JSON payload extraction |
+| app/schemas/llm.py | Unified LLM result contracts (`IntentInferenceResult`, `ContentGenerationResult`, `OrchestratorShadowResult`) for trace and validation |
+| app/services/document_request_draft.py | B-14/B14-HF2 request-draft session orchestrator (`conversation_id + sender_id`, timeout/cancel/incomplete/ready transitions) |
+| app/services/file_request.py | FILE-SEP-01 file retrieval + fixed-approver approval workflow (default scan lookup, scan->paper fallback, pending approval tracking, approval decision fan-out replies) |
+| app/repos/sql_file_repository.py + app/repos/in_memory_file_repository.py | FILE-SEP-01 file-asset retrieval repositories with active-status filtering and stopword-normalized scoring for natural-language file queries |
+| app/api/dingtalk.py + app/integrations/dingtalk/stream_runtime.py | FILE-SEP-01 multi-reply serialization/dispatch and approval-action callback handling in HTTP and Stream channels |
+| infra/scripts/run-dingtalk-card-streaming-demo.js | Standalone Node.js demo for DingTalk AI card typewriter streaming (`createAndDeliver -> streaming updates -> finalize/error`) with env-driven runtime parameters. |
+| docs/dingtalk-card-streaming-demo.md | Operator runbook for local Node streaming demo setup, required envs, success/failure test commands, and troubleshooting. |
 | tests/services/test_single_chat_service.py | A-11 service-level fallback coverage for ambiguous/low-confidence/system-error scenarios |
-| tests/api/test_dingtalk_single_chat.py + tests/integrations/test_stream_runtime.py | A-11 channel-level regression coverage ensuring API/Stream return executable fallback responses instead of blank/error crashes |
+| tests/services/test_file_request_service.py | FILE-SEP-01 service-level regression for default-scan pending approval, approve/reject branches, scan-miss paper fallback, and timeout reminder behavior |
+| tests/api/test_dingtalk_single_chat.py + tests/integrations/test_stream_runtime.py | A-11 + FILE-SEP-01 channel-level regression coverage for fallback behavior, file-request reply sequences, and approval callback dispatch |
 | docs/a12-regression-freeze-report-2026-03-27.md | A-12 regression and freeze evidence report with pass rates, defect grading, and blocker summary |
 
 ## A-01 Architecture Insights
@@ -177,5 +197,291 @@ Last Updated: 2026-03-27
 | app/services/single_chat.py | Accepts optional `user_context`, maps it to `KnowledgeAccessContext`, and emits stable `reason=permission_restricted` when permission decision is `summary_only` or `deny`. | Called by API/Stream single-chat handlers after identity resolution. | Upstream: message intent + resolved identity context. Downstream: channel-safe reply and consistent audit reason/decision propagation. |
 | app/api/dingtalk.py + app/integrations/dingtalk/stream_runtime.py | Pass resolved `user_context` into `SingleChatService` in both HTTP callback and Stream runtime paths to keep permission behavior aligned across channels. | Used on every single-chat event after resolver output is available. | Upstream: identity resolver context (`user_id/dept_id`). Downstream: channel-consistent `permission_decision` and `reason` fields for response/log auditing. |
 | tests/services/test_knowledge_answering.py + tests/services/test_single_chat_service.py + tests/repos/test_sql_knowledge_repository.py + tests/api/test_dingtalk_single_chat.py + tests/api/test_identity_context.py + tests/integrations/test_stream_runtime.py | Adds B-13 acceptance and regression coverage for same-question cross-permission outcomes, restricted reason stability, SQL restricted probing consistency, and API/Stream log-field alignment. | Executed in B-13 targeted regression and full-suite regression gates. | Upstream: implemented permission decision matrix and context propagation chain. Downstream: evidence for thresholds (`正文越权泄露=0`, policy hit accuracy) before pausing for user verification. |
+
+## FILE-SEP-01 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/file_request.py | Implements simplified file-delivery mainline: default scan retrieval, scan-miss paper fallback, fixed approver (`人事行政`) approval creation, pending-state reminder, and approval outcome delivery sequence (`3` text messages on approve). | Called from `SingleChatService` for `file_request` intent and follow-up status queries; called from API/Stream approval callback path for approve/reject actions. | Upstream: user file-request utterances + `FileRepository` retrieval result + approval action payload. Downstream: `ChatHandleResult` and approval-action reply batches for channel adapters. |
+| app/services/single_chat.py + app/services/document_request_draft.py | Keeps dual-track conversation behavior decision-complete: `document_request` stays sessionized draft flow, while `file_request` becomes approval-gated file-delivery flow without extra version question by default. | Executed per incoming single-chat message in HTTP and Stream channels. | Upstream: parsed `IncomingChatMessage`, classifier result, and optional `UserContext`. Downstream: stable reason/intent contracts (`application_draft_*`, `file_lookup_pending_approval`, `file_approval_*`, `knowledge_*`). |
+| app/api/dingtalk.py | Adds multi-reply contract output (`replies`, `dingtalk_payloads`) and supports approval-action callbacks (`request_id + approval_action`) in the same endpoint while preserving `reply/dingtalk_payload` backward compatibility. | Used on `/dingtalk/stream/events` for both normal chat messages and approval callback payloads. | Upstream: parsed callback payload and `SingleChatService` outputs. Downstream: callback consumer evidence for ordered message dispatch and approval decision traces. |
+| app/integrations/dingtalk/stream_runtime.py | Sends reply sequences in order for both normal chat outcomes and approval-action callbacks; card-to-text extraction now uses Chinese field labels and status markers for operator readability. | Used during active DingTalk Stream callback runtime and integration tests. | Upstream: service outcomes with potentially multiple replies and card payload metadata. Downstream: ordered sender dispatch calls and consistent runtime observability fields. |
+| tests/services/test_file_request_service.py + tests/api/test_dingtalk_single_chat.py + tests/integrations/test_stream_runtime.py + tests/services/test_intent_classifier.py | Validates FILE-SEP-01 routing and behavior boundaries: file vs knowledge intent split (`我想要XX文件` / `XX文件在哪里下载`), pending approval default path, approve/reject handling, timeout reminder semantics, and ordered reply sequence contract across service/API/Stream layers. | Executed in targeted FILE-SEP-01 regression and full-suite regression gates. | Upstream: updated service/repository/channel implementations. Downstream: objective pass/fail evidence for simplified file flow acceptance and non-regression. |
+
+## FILE-SEP-01-HF1 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Adds `_SdkLoggerAdapter` to sanitize malformed third-party logging signatures and preserve real exception visibility during Stream reconnect loops. | Wrapped around SDK logger in `build_stream_client` before passing into `DingTalkStreamClient`. | Upstream: DingTalk SDK internal logger calls (including malformed `exception(msg, exc)` usage). Downstream: stable runtime diagnostics without `logging` formatter secondary failures. |
+| tests/integrations/test_stream_runtime.py | Adds hotfix regression coverage for logger adapter behavior on both standard `%s` formatting and malformed exception-args patterns. | Executed in stream runtime integration regression and full-suite runs. | Upstream: `_SdkLoggerAdapter` log-message coercion rules. Downstream: prevents reintroduction of noisy `TypeError: not all arguments converted during string formatting` masking true network errors. |
+
+## FILE-SEP-01-HF2 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/repos/in_memory_file_repository.py + app/repos/sql_file_repository.py | Hardens file-query normalization for natural-language retrieval by switching stop-token stripping from unordered `set` to ordered phrase sequence and expanding stop terms (`我想要/想要/文件/文档/资料`). | Applied before score computation on every `file_request` search call in both local and SQL-backed repositories. | Upstream: employee natural queries such as `我想要定影器采购合同文件`. Downstream: stable hit scoring (no hash-order randomness), improved recall, and consistent file-request behavior across runtime backends. |
+| tests/repos/test_in_memory_file_repository.py + tests/repos/test_sql_file_repository.py | Adds explicit recall regression tests for `我想要...文件` query shape and unchanged no-hit behavior for unrelated requests. | Executed in repository-level and full-suite regression runs. | Upstream: repository normalization and scoring logic. Downstream: prevents recurrence of DingTalk-side “should hit but no-hit” regressions in common employee phrasing. |
+
+## FILE-SEP-01-HF3 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/single_chat.py | Refines pending-file session routing: when a pending file approval exists, only file/progress-context follow-ups stay in `file_request`; unrelated queries (e.g., policy/process questions) are released back to normal intent routing + knowledge flow. | Executed on every single-chat turn where a sender has `pending` file request state. | Upstream: pending session state + current user utterance. Downstream: avoids conversation hijack by repetitive “审批中” reply while preserving explicit progress checks. |
+| tests/services/test_single_chat_service.py | Adds regression coverage for both sides of the boundary: pending state does **not** hijack unrelated policy questions, and “审批进度” still stays in file pending flow. | Executed in service-layer regression and full-suite checks. | Upstream: `SingleChatService` pending routing logic. Downstream: prevents recurrence of DingTalk-side cross-intent lock-in after file request submission. |
+
+## FILE-SEP-01-HF4 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/single_chat.py | Narrows pending follow-up hint words to approval-progress semantics only; removes broad words like `合同/文件` from pending short-circuit path. | Applied before pending file-request short-circuit in single-chat handling. | Upstream: in-flight employee utterance during pending approval state. Downstream: policy/process questions containing “合同” no longer get misrouted to pending reminder text. |
+| tests/services/test_single_chat_service.py | Strengthens regression sample to real DingTalk phrase (`采购合同流程是什么`) to ensure pending state does not hijack this high-confusion utterance. | Executed in service regression and full-suite validation. | Upstream: pending-route keyword logic. Downstream: guards against reintroducing lexical false-positive interception in future hotfixes. |
+
+## FILE-SEP-01-HF5 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/single_chat.py | Keeps pending short-circuit scoped to approval-progress utterances; non-progress follow-ups now continue into normal intent chain so LLM intent/content stages remain in play for subsequent turns. | Triggered when session has pending file approval and receives a new message. | Upstream: pending session state and current utterance. Downstream: avoids bypassing LLM intent path for non-progress follow-ups while preserving approval-state guardrail behavior. |
+| app/rag/sample_corpus.py + tests/rag/test_retrieval_evaluation.py | Adds procurement-contract process knowledge sample and retrieval regression (`采购合同流程是什么`) to prevent fallback to unrelated leave/reimbursement documents. | Used in local in-memory retrieval/answer path and regression suite. | Upstream: user policy/process query on procurement contracts. Downstream: top hit shifts to procurement contract process source, reducing cross-domain wrong answers in DingTalk manual tests. |
+
+## FILE-SEP-01-HF6 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/answer_template.py + app/services/knowledge_answering.py | Adds high-relevance source filtering for display/output contracts: supporting citations and “相关细则” step now keep only evidence close to primary score, reducing noisy cross-domain sources while preserving structured template format. | Applied when knowledge hit branch builds unified answer text (`结论/步骤/来源/下一步`) in policy/fixed-quote flows. | Upstream: ranked evidence list from retriever (score-bearing). Downstream: cleaner user-facing sources, aligned `source_ids/citations`, and lower confusion in DingTalk manual reads. |
+| tests/services/test_knowledge_answering.py | Adds regression assertion that `采购合同流程是什么` keeps procurement-contract source and excludes unrelated leave/reimbursement sources. | Executed in service-level regression and full suite checks. | Upstream: template source-selection logic. Downstream: prevents regression back to noisy mixed-source output in high-confusion policy queries. |
+
+## FILE-SEP-01-HF7 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| infra/scripts/run-dingtalk-stream.py | Applies `.env` defaults into process env (`os.environ.setdefault`) before runtime startup, preserving precedence `process env > env file` while making LLM configs visible to services that use `os.getenv`. | Used on every Stream runtime start via `python infra/scripts/run-dingtalk-stream.py --env-file .env`. | Upstream: parsed `.env` key-values and optional shell overrides. Downstream: prevents false `llm_disabled` in Stream mode when only `--env-file` is provided. |
+
+## FILE-SEP-01-HF8 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Adds optional DingTalk AI card typewriter delivery for long text replies using `AICardReplier.async_create_and_deliver_card` + `async_streaming`, with incremental full-content pushes and explicit `finished/failed` terminal states. Keeps plain text fallback when stream card creation/update fails. | Applied in Stream callback runtime when `DINGTALK_AI_CARD_STREAMING_ENABLED=true` and text length passes threshold. | Upstream: `SingleChatService` text replies + streaming card env config (`template_id`, `content_key`, chunk/interval/min length). Downstream: user-visible streamed card animation in DingTalk client, plus safe degradation to normal text reply. |
+| app/schemas/config_catalog.py + app/services/config_validation.py + .env.example + docs/configuration-baseline.md | Introduces configurable stream-card knobs and validation gate: when streaming is enabled, template id/content key must be configured to avoid silent misconfiguration. | Used during env validation and runtime startup configuration. | Upstream: operator-provided env values. Downstream: deterministic enable/disable behavior for typewriter effect without impacting non-stream card/text paths. |
+| tests/integrations/test_stream_runtime.py + tests/services/test_config_validation.py | Adds regression tests for stream-card config parsing, chunking behavior, async streaming success path (`finished=true`), and failure path (`failed=true` + text fallback). | Executed in integration/config regression and full suite checks. | Upstream: stream runtime sender logic and config validation contracts. Downstream: prevents regressions in streaming card update loop and misconfiguration safety checks. |
+
+## FILE-SEP-01-HF9 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/file_request.py | Upgrades file-request flow to two-phase state machine: `awaiting_requester_confirmation -> pending approval -> delivered/rejected/cancelled`, adds requester confirmation card (`确认申请/取消`) before notifying approver, and returns state-aware progress texts (`待确认/待审批/已通过/已拒绝/已取消`) with request id/time context. Confirmation/approval cards now expose both `actions` and template-oriented `btns` payloads for button-group binding compatibility. | Applied on file retrieval hit, requester follow-up, approval callback action, and progress query turns. | Upstream: file repository match result + user follow-up utterance + callback action payload. Downstream: prevents auto-submit without requester consent and exposes real status instead of fixed pending copy. |
+| app/services/single_chat.py + app/api/dingtalk.py + app/integrations/dingtalk/stream_runtime.py | Extends file-followup routing hints to include confirmation/cancel commands; adds callback parsing fallback for `buttonId/id` pattern (`action::request_id`) and stream card line rendering support for `actions`/`btns` labels. | Used when user has existing file request and sends follow-up (`确认申请/取消/审批进度`) or when card-button callback payload omits direct `request_id`/`approval_action` fields. | Upstream: in-session request record and card action metadata. Downstream: stable cross-channel interaction loop for confirm-first submission and better template-binding compatibility. |
+| tests/services/test_file_request_service.py + tests/services/test_single_chat_service.py + tests/api/test_dingtalk_single_chat.py + tests/integrations/test_stream_runtime.py | Adds regression coverage for confirm-before-submit contract, callback-driven confirm->approve sequence, and stateful progress query behavior. | Executed in targeted file-flow regression and full-suite runs. | Upstream: updated file-request state machine and routing logic. Downstream: guards against reintroducing “direct submit” and “static progress copy” regressions. |
+
+## FILE-SEP-01-HF10 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Upgrades Stream interactive-card send path from plain multi-text fallback to StandardCard `action` module generation when reply payload includes `actions/btns`; emits request buttons with `actionType=request` and deterministic `button id` (`action::request_id`) so DingTalk can render clickable confirm/cancel controls and callback payloads can be parsed by existing action router. Keeps multi-text-line builder path for cards without buttons. | Applied in `_SdkReplySender.send_interactive_card` for file-request confirmation/approval cards and any future card payload carrying button metadata. | Upstream: service-level card payload (`title/summary/draft_fields/actions|btns`). Downstream: DingTalk renders real clickable buttons instead of text-only “可操作” hints; callback id maps back to `handle_file_approval_action`. |
+| tests/integrations/test_stream_runtime.py | Adds regression assertion that Stream card dispatch with `actions` emits card JSON containing an `action` component and request buttons (`actionType=request`, callback `id`), preventing fallback-only regressions where buttons disappear in chat UI. | Executed in stream runtime integration regression and full-suite runs. | Upstream: `_SdkReplySender.send_interactive_card` output contract. Downstream: protects confirm-before-submit UX from future card rendering regressions. |
+
+## FILE-SEP-01-HF11 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Hardens approval callback parsing for real DingTalk button events: recursively inspects nested payload mappings/JSON strings, normalizes action aliases (`确认申请/取消/同意/拒绝`), extracts `request_id` by key or regex, and supports action-only callbacks by routing through session fallback when `request_id` is missing. Also switches Stream handler input from `ChatbotMessage.to_dict()` to raw `callback_message.data` to avoid losing callback metadata fields. | Applied on every Stream callback before regular message parsing. | Upstream: heterogeneous DingTalk callback payloads for interactive card buttons. Downstream: button clicks continue to trigger approval workflow even when payload shape omits explicit `request_id` field. |
+| app/services/file_request.py + app/services/single_chat.py | Adds session-level request-id resolver (`conversation_id + sender_id`) and approval-action-by-session entrypoint so callback actions can map to the active pending request without requiring explicit request-id transport in payload. | Used by Stream/API callback paths when only action semantics are available. | Upstream: callback action + session identifiers. Downstream: stable `file_lookup_pending_approval` transition on confirm/cancel clicks and reduced “click no response” failures. |
+| app/api/dingtalk.py | Aligns HTTP callback behavior with Stream runtime by applying the same robust action parsing and session fallback logic for action-only approval callbacks. | Used on `/dingtalk/stream/events` approval callback handling. | Upstream: callback payload with partial action metadata. Downstream: HTTP test route remains behaviorally consistent with Stream runtime. |
+| tests/integrations/test_stream_runtime.py + tests/api/test_dingtalk_single_chat.py | Adds regression coverage for “action-only callback without request_id” path in both Stream and API channels (`确认申请` + session identifiers) and verifies workflow still enters pending approval state. | Executed in channel-level regression and full-suite runs. | Upstream: callback parsing + session fallback implementation. Downstream: prevents recurrence of clickable button but no state transition/no response behavior. |
+
+## FILE-SEP-01-HF12 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/file_request.py | Simplifies requester confirmation card copy to user-facing intent only: `已找到《...》（扫描件/纸质版）` + `确认发起申请吗？`; removes internal/explanatory fields (`draft_fields`, `note`) and disables action-hint rendering in card payload. | Applied on first-turn file hit and scan->paper fallback confirmation generation before approval submission. | Upstream: file retrieval result and variant/fallback state. Downstream: cleaner DingTalk card UX that avoids exposing backend data structure semantics. |
+| app/integrations/dingtalk/stream_runtime.py | Registers both Stream callback topics for runtime handling: chat message topic and card instance callback topic (`/v1.0/card/instances/callback`), with compatibility fallback when SDK lacks `CallbackHandler` constant. | Applied during stream client bootstrap (`build_stream_client`) before `start_forever()`. | Upstream: DingTalk SDK constants (when available) and fixed fallback topic string. Downstream: button-click callbacks can reach approval-action parser reliably, reducing “click has no response” in real chat. |
+| tests/services/test_file_request_service.py + tests/integrations/test_stream_runtime.py | Updates regression assertions to lock minimal confirmation-card copy and dual-topic registration behavior under both full SDK and lightweight mocked SDK shapes. | Executed in targeted hotfix tests and full-suite regression runs. | Upstream: updated card payload and stream bootstrap logic. Downstream: prevents regression to verbose internal-field cards or missing card-callback topic wiring. |
+
+## FILE-SEP-01-HF13 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py + app/api/dingtalk.py | Hardens interactive-card callback parsing for real DingTalk `actionCallback` payloads: supports `componentId` action source, identity/session fields (`userId`, `openConversationId`) extracted from nested `content/extension` JSON strings, and JSON-string list/object expansion during recursive candidate scan. | Applied whenever callback topic delivers card-button events that are not plain `buttonId/request_id` shape. | Upstream: DingTalk callback payload variants (`data.content`, `data.extension`, nested JSON strings). Downstream: confirm/cancel actions can resolve to active request reliably, reducing “按钮点击无反应” caused by field-shape mismatch. |
+| app/integrations/dingtalk/stream_runtime.py + app/api/dingtalk.py | Adds no-silent fallback reply when callback action is recognized but active request cannot be mapped (`reason=file_approval_not_found`): returns an executable user hint to re-initiate request. | Applied in approval-action callback branch after action dispatch returns empty replies. | Upstream: action callback with missing/stale session mapping. Downstream: user always receives visible feedback instead of silent no-op in chat. |
+| tests/integrations/test_stream_runtime.py + tests/api/test_dingtalk_single_chat.py | Adds regression coverage for card callback real-shape compatibility (`data.content.componentId=confirm_request`, `data.extension.openConversationId`, `data.userId`) and explicit no-silent fallback response when request mapping fails. | Executed in stream/api regression and full-suite runs. | Upstream: parser and callback-dispatch enhancements. Downstream: prevents regression back to “button visible but click no response” behavior under real DingTalk callback fields. |
+
+## FILE-SEP-01-HF14 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py + app/api/dingtalk.py | Aligns callback parser with DingTalk official event shape (`content.cardPrivateData.actionIds`): action extraction now supports `actionIds` + `params` from card private data, including nested JSON-string payload fields in Stream and HTTP channels. | Applied when callback payload uses official `actionCallback` body with `content` JSON string instead of explicit `buttonId/approval_action` fields. | Upstream: DingTalk event callback contract (`actionIds`, `params`, `userId`, `outTrackId`). Downstream: button click actions are recognized under official payload shape without requiring template-specific alias fields. |
+| app/services/file_request.py + app/services/single_chat.py | Adds sender-only active-request fallback (`resolve_active_request_id_by_sender`) for cases where callback lacks `conversation_id/openConversationId`; action router can still map requester’s latest active file request by `sender_id/userId`. | Applied in session fallback path after conversation-level request-id resolution fails. | Upstream: callback events containing only user identity and action data. Downstream: confirm/cancel click flow remains executable under incomplete session identifiers. |
+| tests/integrations/test_stream_runtime.py + tests/api/test_dingtalk_single_chat.py | Adds regression for official callback sample shape (`cardPrivateData.actionIds=["confirm_request"]`, no conversation id) to verify confirm action transitions to pending approval in both Stream/API routes. | Executed in stream/api regression and full suite. | Upstream: official callback payload parser enhancements and sender-only fallback resolver. Downstream: prevents recurrence of “official actionIds callback clicks are ignored” regressions. |
+
+## FILE-SEP-01-HF15 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Ensures interactive cards containing request buttons are delivered with explicit `callbackType="STREAM"` in `reply_card` invocation, matching DingTalk official callback contract for stream-mode card interactions. | Applied when sending confirmation/approval cards with actionable buttons (`actionType=request`). | Upstream: card payload includes actions/buttons; stream runtime channel selected. Downstream: increases probability that button clicks are routed back to stream callback topic instead of silent client-side only interaction. |
+| tests/integrations/test_stream_runtime.py | Adds assertion that request-button cards call SDK `reply_card` with `callbackType=STREAM` and keeps action button payload assertions unchanged. | Executed in stream runtime regression and full suite. | Upstream: `_SdkReplySender.send_interactive_card` behavior. Downstream: prevents regression where cards render but callbacks are not subscribed due to missing callback type declaration. |
+
+## FILE-SEP-01-HF16 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Adds switchable diagnostic logs for card callback path (`DINGTALK_CARD_CALLBACK_DEBUG=true`): logs callback `topic + payload` at Stream handler entry and logs payload snapshot again at `_extract_approval_action_payload` entry. | Used during live DingTalk debugging to quickly decide whether failures are “callback not delivered” vs “delivered but parse mismatch”. | Upstream: raw `callback_message.data` and topic metadata from DingTalk Stream SDK. Downstream: faster root-cause isolation without changing runtime approval/file-request business decisions. |
+
+## FILE-SEP-01-HF17 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Adds send-path diagnostics for actionable interactive cards under `DINGTALK_CARD_CALLBACK_DEBUG=true`: emits logs for action-button count before send, `reply_card` returned `card_biz_id`, and explicit markdown fallback when card send fails. | Used when debugging “button visible/click无响应” to confirm whether card was sent via request-callback mode before checking callback delivery. | Upstream: service-generated `interactive_card` payload and SDK `reply_card` return value. Downstream: separates send-stage failures from callback-stage failures and shortens live issue triage loops. |
+
+## FILE-SEP-01-HF18 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Moves all `CARD_DEBUG` output to `keagent.observability` logger so diagnostics remain visible with structured-logging-only runtime setup (even when `keagent.dingtalk.stream` has no terminal handler). | Applied whenever `DINGTALK_CARD_CALLBACK_DEBUG=true` is enabled for live callback troubleshooting. | Upstream: debug events from callback entry, approval-action parsing entry, and card send path. Downstream: deterministic on-screen diagnostics for field debugging and reduced false negatives from logger-handler mismatch. |
+
+## FILE-SEP-01-HF19 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py + app/api/dingtalk.py | Expands approval-action phrase extraction to include plain text field `content`, enabling session-level approval actions from normal text messages (`确认申请` / `取消`) in addition to card callback payloads. | Applied when card callback events are missing but user continues the flow through plain text in the same conversation. | Upstream: user text messages carrying explicit approval intent + existing pending request context (`conversation_id + sender_id`). Downstream: approval flow can transition to `file_lookup_pending_approval` without relying exclusively on button callback delivery. |
+| tests/integrations/test_stream_runtime.py + tests/api/test_dingtalk_single_chat.py | Adds regressions for plain-text confirmation path after `file_lookup_confirm_required` to verify session fallback remains executable in Stream and HTTP callback routes. | Executed in API/Stream callback regression runs. | Upstream: parser key expansion (`content`) and session action router. Downstream: prevents regressions where button callback delivery issues fully block user confirmation. |
+
+## FILE-SEP-01-HF20 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Splits Stream callback handling into dedicated chat-topic handler and card-callback handler, reuses a shared approval-action resolver, and adds official card callback response builder (`cardUpdateOptions + cardData/userPrivateData`) for `/v1.0/card/instances/callback`. | Applied when users click card action buttons and when Stream runtime receives mixed callback topics in one connection. | Upstream: DingTalk callback topic (`/v1.0/im/bot/messages/get` vs `/v1.0/card/instances/callback`) and parsed approval actions. Downstream: card actions can complete with standards-compliant callback response payload while preserving existing chat message handling path. |
+| app/integrations/dingtalk/stream_runtime.py | Adds `createAndDeliver` send branch for action-button cards (`callbackType=STREAM`) using template-driven `cardParamMap` payload; keeps `reply_card` and markdown fallback when card API delivery fails. | Applied inside `_SdkReplySender.send_interactive_card` when outgoing card payload contains actionable buttons. | Upstream: service-generated interactive card payload and env template config (`DINGTALK_CARD_TEMPLATE_ID`). Downstream: button cards can enter card-callback contract path while avoiding total send failure if template/scope is not ready. |
+| tests/integrations/test_stream_runtime.py | Adds regressions for (1) action-card createAndDeliver preferred path and (2) card callback handler response payload shape compliance. | Executed in stream runtime hotfix regression and full callback contract checks. | Upstream: `_SdkReplySender` createAndDeliver branch and `CardCallbackHandler.process` return payload. Downstream: prevents regression to single-handler callback routing and non-compliant card callback responses. |
+
+## FILE-SEP-01-HF21 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Hardens action-card fallback semantics: when action-button `createAndDeliver` is unavailable, runtime now degrades to explicit text confirmation guidance (`确认申请/取消`) instead of sending legacy request-button card that may render but not callback. | Applied in `_SdkReplySender.send_interactive_card` for file-request confirmation cards when no valid action-card template path exists. | Upstream: service-generated confirmation card payload and createAndDeliver availability. Downstream: avoids “dead clickable buttons” UX and keeps requester confirmation path executable via text fallback. |
+| app/integrations/dingtalk/stream_runtime.py | Aligns single-chat `createAndDeliver` payload with SDK official shape by removing `imRobotOpenDeliverModel.robotCode` injection and keeping `spaceType=IM_ROBOT` + `openSpaceId` routing only. | Applied when delivering action cards via `/v1.0/card/instances/createAndDeliver` in single-chat stream mode. | Upstream: stream client credential/access token and sender staff id. Downstream: reduces callback routing mismatch risk caused by stale/misaligned robot code config. |
+| tests/integrations/test_stream_runtime.py | Updates regression contract to assert (1) missing-template action cards fall back to text confirmation guidance and (2) createAndDeliver payload no longer contains `imRobotOpenDeliverModel.robotCode`. | Executed in stream runtime hotfix regression and full API+Stream callback test runs. | Upstream: `_SdkReplySender` fallback and createAndDeliver payload builder changes. Downstream: prevents regression to dead-button fallback and non-SDK-aligned delivery payloads. |
+
+## LLM-ALIGN-01 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/intent_classifier.py + app/services/knowledge_answering.py + app/rag/knowledge_retriever.py | Current runtime AI behavior is deterministic and rule-driven (no external model invocation), providing stable fallback but limited semantic generalization. | Executed on every text question in current MVP runtime. | Upstream: normalized question text + repository data. Downstream: predictable routing/answer behavior and strict non-fabrication boundaries. |
+| app/schemas/config_catalog.py + docs/configuration-baseline.md | Declares `QWEN_*` config keys and now explicitly documents “validation exists but runtime Qwen integration pending”. | Used during env validation, deployment checks, and implementation planning. | Upstream: operator env values. Downstream: prevents false assumption that model capability is already in effect. |
+| memory-bank/IMPLEMENTATION_PLAN.md | Adds mandatory supplemental `LLM-01~LLM-04` milestones to close PRD-vs-runtime gap for real Qwen integration. | Used before any upcoming LLM implementation work. | Upstream: PRD requirement “LLM 辅助 Agent”. Downstream: concrete execution/verification gates for converting rule-first runtime into LLM-powered runtime. |
+
+## LLM-02-V2 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/qwen/client.py | Provides provider adapter for Qwen chat completion with timeout/retry (`max_retries<=2`) and strict JSON extraction contract. | Used by intent/content/draft/orchestrator services whenever corresponding feature toggle and rollout are active. | Upstream: `QWEN_API_KEY` + endpoint/model config. Downstream: structured JSON payloads consumed by LLM services with fallback safety. |
+| app/services/llm_env.py | Centralizes LLM runtime env parsing (`bool/int/float`) and deterministic rollout bucketing by `conversation_id + sender_id + salt`. | Used by all LLM service builders for consistent feature-gate behavior. | Upstream: environment variables. Downstream: per-layer rollout control and safe defaults. |
+| app/services/llm_intent.py + app/services/single_chat.py | Implements Phase-1 intent LLMization: validated JSON intent output, confidence thresholding, high-confidence mismatch guard, and rule fallback trace. | Called before main routing in single-chat handling. | Upstream: user input text and fallback classifier. Downstream: stable intent result + `llm_trace.intent.*` for API/log observability. |
+| app/services/llm_content_generation.py + app/services/knowledge_answering.py | Implements Phase-2 content LLMization: retrieval/permission first, LLM language generation second, output validation failure fallback to deterministic template. | Called after retrieval and permission decision in knowledge answering. | Upstream: retrieved evidence and rule-based permission decision. Downstream: response text + `llm_trace.content.*` without changing permission state. |
+| app/services/llm_constants.py | Hard-codes LLM boundary constraints: `SUMMARY_ONLY_ALLOWLIST` and `NON_LLM_GUARDRAILS`. | Referenced by content generation and answer composition paths. | Upstream: security boundary decisions. Downstream: prevents LLM from expanding restricted rewrite fields or crossing non-LLM guardrails. |
+| app/services/llm_draft_generation.py + app/services/document_request_draft.py | Implements Phase-3 draft LLMization limited to field extraction/polish while keeping state machine, timeout, follow-up caps, and cancellation logic in deterministic code. | Called during draft session start/follow-up when draft LLM feature gate is active. | Upstream: employee draft messages. Downstream: improved field extraction quality without altering approval workflow semantics. |
+| app/services/llm_orchestrator_shadow.py + app/services/single_chat.py | Implements Phase-4 shadow-only orchestrator suggestion and mismatch risk tagging, explicitly not controlling action execution. | Called after intent resolution to compare LLM suggestion vs rule action. | Upstream: question + resolved intent + rule action. Downstream: `llm_trace.orchestrator_shadow.*` metrics for future go-live decision. |
+| app/api/dingtalk.py + app/integrations/dingtalk/stream_runtime.py + app/core/trace_middleware.py + app/core/structured_logging.py | Extends callback/runtime observability payloads with `llm_trace` to keep HTTP/Stream/log traces aligned. | Used on every callback completion path (including degraded/system fallback). | Upstream: service-level llm_trace output. Downstream: auditable rollout diagnostics and post-mortem evidence. |
+| tests/services/test_llm_intent_service.py + tests/services/test_llm_content_generation.py + tests/services/test_llm_orchestrator_shadow.py + tests/services/test_document_request_draft_llm.py | Adds dedicated regression suites for LLM contract validation, fallback behavior, high-confusion intent set (`20` samples), summary/deny safety checks, and shadow mismatch tagging. | Executed in targeted LLM regression and full suite runs. | Upstream: LLM services and integration wiring. Downstream: release gate evidence for serial rollout without violating non-LLM boundaries. |
+
 Operational Note (A-06):
 - Local API startup must load runtime credentials (`uvicorn app.api.main:app --env-file .env` or equivalent exported env vars). If `DINGTALK_CLIENT_ID` / `DINGTALK_CLIENT_SECRET` are absent at process start, resolver cannot create OpenAPI client and will intentionally degrade to `identity_source=event_fallback`.
+
+## CARD-STREAM-DEMO-01 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| infra/scripts/run-dingtalk-card-streaming-demo.js | Implements standalone Node demo flow for printer AI card streaming: create card by SDK, push full-content streaming updates by HTTP `PUT /v1.0/card/streaming`, finalize with `isFinalize=true`, and fail-close with `isError=true`; uses `crypto.randomUUID()` for request-level `guid`. | Used for DingTalk backend/manual validation of typewriter effect outside Python runtime mainline. | Upstream: operator-provided token/robot/template/user identifiers and mock markdown content. Downstream: card instance receives incremental content updates with deterministic success/failure closure behavior. |
+| docs/dingtalk-card-streaming-demo.md + .env.example | Documents and exposes runnable env/CLI contract (`DINGTALK_ACCESS_TOKEN`, `DINGTALK_ROBOT_CODE`, `DINGTALK_CARD_TEMPLATE_ID`, `DINGTALK_USER_ID`, chunk/interval/simulate-error knobs) for one-command local execution and troubleshooting. | Used before and during demo script execution. | Upstream: local environment setup and template variable binding (`content`). Downstream: consistent operator workflow and faster issue isolation for streaming-card integration. |
+
+## CARD-STREAM-DEMO-02 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| infra/scripts/run-dingtalk-card-streaming-demo.js | Removes hard dependency on fixed `DINGTALK_USER_ID`; adds runtime user-id resolver that supports dynamic extraction from DingTalk callback payload (`DINGTALK_STREAM_EVENT_JSON` / `DINGTALK_STREAM_EVENT_FILE`) with field priority `senderStaffId -> senderId/userid`. | Used when operators run streaming demo for different employees without editing env per-user. | Upstream: callback payload or manual override env. Downstream: `createAndDeliver` targets the correct current sender and keeps `openSpaceId` aligned with resolved user id. |
+| docs/dingtalk-card-streaming-demo.md + .env.example | Updates operator contract to document optional `DINGTALK_USER_ID`, callback-payload-based dynamic user id, and new env keys (`DINGTALK_STREAM_EVENT_JSON`, `DINGTALK_STREAM_EVENT_FILE`). | Used during local setup and manual DingTalk backend validation. | Upstream: operator-provided callback payload sample. Downstream: lower operational friction and reduced risk of sending cards to wrong fixed user. |
+
+## CARD-STREAM-DEMO-03 Architecture Insights
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Adds optional stream-callback payload dump hook controlled by env `DINGTALK_STREAM_EVENT_DUMP_DIR`; each callback can be persisted as `event-<trace_id>.json` without affecting main chat handling flow. | Used during DingTalk manual debugging and when operators need real callback payloads for downstream scripts (for example dynamic user-id extraction in Node streaming demo). | Upstream: raw `callback_message.data` from DingTalk Stream SDK. Downstream: reproducible local `event.json` artifacts for troubleshooting and demo replay. |
+| docs/dingtalk-card-streaming-demo.md + .env.example | Documents callback-capture workflow and exposes `DINGTALK_STREAM_EVENT_DUMP_DIR` in env baseline. | Used before manual test sessions that require real payload capture. | Upstream: operator-run stream client session. Downstream: faster event capture with lower manual code-edit overhead. |
+
+## FILE-SEP-01-HF22 Architecture Insights (2026-03-28)
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/file_request.py | Converts requester confirmation card payload to fixed-template mode: keep only `card_type/request_id/title/summary/render_action_hint`, remove dynamic `actions/btns` button definitions from backend response. | Applied on first-turn `file_request` hit before user confirms. | Upstream: file retrieval result and variant fallback state. Downstream: frontend template owns button rendering and callback action ids; backend no longer leaks internal button schema to user-visible payload. |
+| app/integrations/dingtalk/stream_runtime.py | Adds template-driven action-card branch for `file_request_confirmation`: even without dynamic action list, send via `/v1.0/card/instances/createAndDeliver` and keep `callbackType=STREAM`; `cardParamMap` reduced to template-required fields (`summary`, optional `title`). | Applied in `_SdkReplySender.send_interactive_card` and createAndDeliver payload build path. | Upstream: service-generated confirmation card summary/title and configured interactive template id. Downstream: aligns with DingTalk fixed-button template callback contract and keeps text fallback path when template delivery is unavailable. |
+| app/schemas/config_catalog.py + app/services/config_validation.py + docs/configuration-baseline.md + .env.example | Formalizes card configuration separation for Gate 0联调: introduces/records `DINGTALK_OPENAPI_ENDPOINT`, `DINGTALK_CARD_TEMPLATE_ID`, `DINGTALK_CARD_CALLBACK_DEBUG`, and adds validation conflict when interactive template id equals AI streaming template id. | Applied during env validation and operator setup before stream runtime startup. | Upstream: operator `.env` values. Downstream: avoids template-id reuse between interactive confirm card and AI streaming card, and ensures callback debug gate can be enabled deterministically. |
+| tests/integrations/test_stream_runtime.py + tests/services/test_file_request_service.py + tests/services/test_config_validation.py | Adds regression assertions for fixed-template contract: requester confirmation payload contains no dynamic buttons, createAndDeliver sends minimal `cardParamMap`, and config validator rejects template-id reuse. | Executed in targeted hotfix regression and wider API/service regression runs. | Upstream: runtime/service/config behavior updates above. Downstream: prevents regression to dynamic-button payload leakage or misconfigured shared template ids. |
+
+## FILE-SEP-01-HF23 Architecture Insights (2026-03-28)
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Extends card callback response payload by writing `summary` back into `cardData/userPrivateData.cardParamMap` using approval feedback text (and request id when available). | Applied in `/v1.0/card/instances/callback` action processing after `confirm_request/cancel_request` state transition. | Upstream: approval action outcome (`pending/cancelled/delivered/rejected`) and feedback resolver text. Downstream: card UI receives visible summary update immediately after click, reducing “按钮点击后无变化” perception. |
+| tests/integrations/test_stream_runtime.py | Adds regression assertion that official callback response includes `summary` and pending-state wording after requester clicks confirm. | Executed in stream runtime callback regression suite. | Upstream: callback response builder behavior. Downstream: prevents regressions where status fields update silently but no user-visible card text changes. |
+
+## FILE-SEP-01-HF24 Architecture Insights (2026-03-28)
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Adds deterministic first-delivery state keys for confirmation card template variables (`actions_locked=false`, `approval_status=awaiting_requester_confirmation`, `submitted=false`) into `createAndDeliver.cardParamMap`. | Applied when delivering `file_request_confirmation` card before user clicks confirm/cancel. | Upstream: service-generated confirmation summary/title. Downstream: template conditional rendering (`按钮隐藏/提示显示`) no longer depends on platform-specific handling of missing variables. |
+| tests/integrations/test_stream_runtime.py | Updates createAndDeliver payload regression expectation to include the initial lock/status fields. | Executed in stream runtime integration regression suite. | Upstream: card param map builder changes. Downstream: prevents recurrence of missing initial-state keys that can cause wrong button/text visibility at first render. |
+
+## FILE-SEP-01-HF25 Architecture Insights (2026-03-29)
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/file_request.py | Removes requester-facing `request_id` exposure from confirmation/pending/terminal status texts while keeping internal request id state for routing, idempotency, and logging. | Applied on requester confirm reply, pending progress query, and terminal status query responses. | Upstream: file approval state machine transitions and elapsed-time calculation. Downstream: user-visible text is friendlier (no internal technical id leakage) while backend correlation remains unchanged. |
+| app/integrations/dingtalk/stream_runtime.py | Simplifies card callback response payload for requester card updates: `summary` now uses feedback text directly (no appended request id), and callback feedback for pending state is normalized to user wording (`申请已提交，审批通过后将自动发送文件。`). | Applied in `/v1.0/card/instances/callback` response builder after `confirm_request/cancel_request` actions. | Upstream: approval callback reason mapping and action outcome status. Downstream: post-click card content remains informative without exposing internal ids; template hide logic continues to rely on `actions_locked=true`. |
+| tests/services/test_file_request_service.py + tests/api/test_dingtalk_single_chat.py + tests/integrations/test_stream_runtime.py | Updates regression assertions to enforce “no request id in user-facing copy/card summary” and new pending feedback phrase while preserving existing state-transition behavior. | Executed in service/API/stream regression runs for file-request flows. | Upstream: wording and callback summary-contract updates. Downstream: prevents regression back to internal-id leakage in requester UX. |
+
+## FILE-SEP-01-HF26 Architecture Insights (2026-03-29)
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/file_request.py | Introduces explicit approval-notification result contract (`FileApprovalNotifyResult`) and strict approver authorization gate for `approve/reject`. `confirm_request` now transitions to `pending` only after notifier success; notifier failure returns `file_approval_notify_failed` and keeps state at `awaiting_requester_confirmation`. | Applied during requester confirm action, approver decision callbacks, and in-session follow-up handling. | Upstream: notifier delivery outcome + callback actor identity. Downstream: deterministic state transitions (no false pending), executable retry guidance, and unauthorized approval rejection (`file_approval_forbidden`). |
+| app/integrations/dingtalk/stream_runtime.py | Adds Stream-side HR approval card notifier (`_StreamHRApprovalNotifier`) with DingTalk OpenAPI token retrieval + `createAndDeliver` delivery (`callbackType=STREAM`), and default runtime injection path in `build_stream_client` that wires `FileRequestService(approval_notifier=...)` when `DINGTALK_HR_APPROVER_USER_ID` + `DINGTALK_HR_CARD_TEMPLATE_ID` are configured. | Applied only in Stream runtime default service bootstrap (`run-dingtalk-stream.py` path); API local callback mode remains test-friendly and non-delivery by default. | Upstream: stream credentials + HR env config + approval request payload. Downstream: real HR-side approval-card push, notifier success/failure observability, and unchanged callback compatibility for existing requester confirmation flow. |
+| app/schemas/config_catalog.py + app/services/config_validation.py + docs/configuration-baseline.md + .env.example | Adds HR approval delivery configuration contract (`DINGTALK_HR_APPROVER_USER_ID`, `DINGTALK_HR_CARD_TEMPLATE_ID`) and validation gates: both keys must be configured together; HR template id must be distinct from requester/AI card template ids. | Applied during config parse/validation and operator env setup before Stream runtime startup. | Upstream: operator-provided env values. Downstream: prevents partial HR-notifier config and template-id reuse collisions across requester/HR/AI card channels. |
+| tests/services/test_file_request_service.py + tests/services/test_config_validation.py + tests/integrations/test_stream_runtime.py + tests/api/test_dingtalk_single_chat.py | Adds regression coverage for notify-failure retry behavior, strict non-approver rejection, HR config pair/conflict validation, Stream HR notifier `createAndDeliver` payload contract, and default-approver callback alignment in API/Stream approval tests. | Executed in targeted module runs and full-suite regression. | Upstream: new notifier/authorization/config logic. Downstream: guards against regressions in pending-state transition correctness, approval authorization safety, and HR delivery wiring. |
+
+## FILE-SEP-01-HF27 Architecture Insights (2026-03-29)
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/dingtalk/stream_runtime.py | Adds requester result-card notifier (`_RequesterResultCardNotifier`) that pushes terminal approval outcome to requester via OpenAPI `POST /v1.0/card/instances/createAndDeliver` (template=`DINGTALK_CARD_TEMPLATE_ID`, `callbackType=STREAM`, compact `cardParamMap`: `summary/approval_status/actions_locked/submitted/request_id`). In card callback flow, terminal `approve/reject` actions now trigger this push after state transition, plus actor-mapping observability logs (`request_id/action/callback_user_id/requester_user_id/outTrackId/spaceId`) and optional debug payload logging for identity confirmation. | Applied in `/v1.0/card/instances/callback` processing after `FileRequestService.handle_file_approval_action` returns handled terminal result (`delivered/rejected`). | Upstream: callback actor (`approval_action.approver_user_id`) + persisted requester identity (`approval_outcome.requester_sender_id`) + terminal status/result text. Downstream: requester receives explicit result card in single-chat, and push failures are non-blocking (warn-only, callback ACK remains `200`). |
+| tests/integrations/test_stream_runtime.py | Adds callback-path regressions for requester result-card push on `approve` and `reject`, including assertion that `createAndDeliver.userId` targets requester (not approver), and guards that failure to push does not break callback ACK/HR card update path. Also adds non-terminal guard (`forbidden`) to ensure no requester push is attempted. | Executed in Stream integration regression and full test discovery. | Upstream: updated callback handler logic and notifier payload contract. Downstream: prevents regressions where terminal approvals fail to notify requester or where non-terminal/forbidden actions accidentally trigger result push. |
+
+## FILE-SEP-01-HF28 Architecture Insights (2026-03-29)
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/file_request.py | Refines approved-delivery second message to dual-format link output for DingTalk rich-text limitations: adds markdown clickable link (`点击下载：[下载文件](url)`) and raw copy-friendly URL line (`复制链接：url`) in the same reply. | Applied when approval action transitions to `delivered` and requester receives final file-delivery reply sequence. | Upstream: approved file asset URL from repository record. Downstream: requester can either tap link directly or copy full URL text when client cannot select hyperlink text alone. |
+| tests/services/test_file_request_service.py + tests/api/test_dingtalk_single_chat.py + tests/integrations/test_stream_runtime.py | Updates regression assertions to lock the new dual-format link contract across service/API/stream channels. | Executed in targeted post-approval delivery regressions. | Upstream: updated `_build_delivery_replies` message template. Downstream: prevents regression back to single-format link text that is harder to copy in DingTalk card UX. |
+
+## FILE-SEP-01-HF29 Architecture Insights (2026-03-29)
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/file_request.py | Extends approval action result contract with optional file metadata (`file_title`, `file_url`) so callback-side result-card generation can use deterministic terminal context instead of replaying verbose process text replies. | Applied when approval callbacks execute `approve/reject` and build `FileApprovalActionResult`. | Upstream: approved/rejected request record + matched asset metadata. Downstream: stream runtime can build concise terminal result-card text and button variables without parsing plain-text replies. |
+| app/integrations/dingtalk/stream_runtime.py | Refactors requester result-card payload composition to terminal-status mode: summary now uses fixed concise copy (`《文件名》已审批通过` / `《文件名》审批未通过`), and `cardParamMap` adds `file_title`, `download_url`, `show_download_button` (`\"true\"/\"false\"`) for template-side `openUrl` button gating. | Applied in `/v1.0/card/instances/callback` terminal `approve/reject` branch before calling requester `createAndDeliver`. | Upstream: `FileApprovalActionResult` metadata + terminal status. Downstream: requester result card no longer exposes process chatter or raw-link fallback text in `summary`; template can use a single stable boolean-like string variable for button visibility. |
+| tests/integrations/test_stream_runtime.py | Strengthens requester-result delivery assertions for new params and wording constraints (`summary` concise, includes no `优先为您提供/正在发送/复制链接`). | Executed in stream callback regression suite. | Upstream: updated result-card payload builder. Downstream: prevents regression to verbose summary concatenation and ensures template-required visibility variables are always present. |
+
+## LLM-02-V2-HF2 Architecture Insights (2026-03-29)
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/integrations/qwen/client.py | Adds OpenAI endpoint normalization and token-cap injection for third-party OpenAI-compatible gateways: endpoint ending with `/v1` is auto-expanded to `/v1/chat/completions`, and request payload now includes `max_tokens` when `QWEN_MAX_TOKENS` or `MAX_TOKENS` is set. | Applied whenever intent/content/draft/shadow LLM services instantiate `HttpQwenChatClient` and send completion calls. | Upstream: operator runtime config (`QWEN_BASE_URL`, `QWEN_MAX_TOKENS`/`MAX_TOKENS`). Downstream: avoids misrouting to base `/v1` path and constrains output length for latency/cost control without changing service-layer contracts. |
+| .env | Switches active model provider for runtime trial to Gemini-compatible gateway (`QWEN_BASE_URL=https://gemini.samulo.top:8888/v1`, `QWEN_CHAT_MODEL/QWEN_INTENT_MODEL=gemini-3-flash-preview`, `MAX_TOKENS=8192`). | Applied when running `run-dingtalk-stream.py --env-file .env` for real Stream callback sessions. | Upstream: user-provided provider endpoint/key/model. Downstream: single-chat intent/content flows use new gateway path while existing fallback behavior (`llm_error -> rule/template fallback`) remains intact. |
+
+## LLM-CONFIG-ALIAS-01 Architecture Insights (2026-03-29)
+
+| File | Role | When Used | Upstream/Downstream |
+| --- | --- | --- | --- |
+| app/services/llm_env.py | Adds shared alias-aware env readers (`env_str`, `env_int_alias`, `env_bool_alias`) so services can resolve primary and legacy config keys consistently. | Applied by LLM service builders when loading endpoint/model/timeout/retry settings from environment. | Upstream: operator env (`LLM_*` preferred, `QWEN_*` legacy). Downstream: stable runtime config behavior during namespace migration without per-service ad-hoc alias logic. |
+| app/services/llm_intent.py + app/services/llm_content_generation.py + app/services/llm_draft_generation.py + app/services/llm_orchestrator_shadow.py | Switches builder config loading to primary `LLM_*` namespace with fallback to `QWEN_*` aliases (`API_KEY/BASE_URL/CHAT_MODEL/INTENT_MODEL/TIMEOUT/MAX_RETRIES`). | Applied on service bootstrap in API/Stream runtime startup. | Upstream: `.env` model settings. Downstream: model provider can be switched with neutral naming, while legacy deployments using `QWEN_*` remain runnable. |
+| app/integrations/qwen/client.py | Extends token-cap env precedence to include `LLM_MAX_TOKENS` (fallback `QWEN_MAX_TOKENS`/`MAX_TOKENS`) and neutralizes empty-key error copy (`LLM_API_KEY is empty`). | Applied for every OpenAI-compatible completion request. | Upstream: max-token and key settings from env. Downstream: unified naming for output cap control across different providers. |
+| app/schemas/config_catalog.py + app/services/config_validation.py | Introduces `LLM_*` config contracts as primary keys, keeps `QWEN_*` as compatibility aliases, and changes key-presence gate to “`LLM_API_KEY` or `QWEN_API_KEY` at least one is required”. | Applied during config validation (`validate-config.py` and runtime prechecks). | Upstream: `.env` content under either new or old namespace. Downstream: validation no longer forces legacy key name and supports gradual migration. |
+| .env + .env.example + docs/configuration-baseline.md | Migrates examples and active runtime config to `LLM_*` naming, explicitly documents legacy `QWEN_*` as optional fallback aliases. | Used during local setup and deployment configuration updates. | Upstream: operator-facing configuration instructions. Downstream: reduces naming confusion when model provider is not Qwen while preserving backward compatibility. |
+| tests/services/test_llm_env.py + tests/services/test_config_validation.py | Adds regressions for alias precedence/fallback and validation behavior (`LLM_API_KEY` primary, `QWEN_API_KEY` fallback, both missing -> error). | Executed in config and LLM unit regression runs. | Upstream: alias and validation logic updates. Downstream: prevents regression where namespace migration breaks old envs or allows empty-key runtime. |

@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@alicloud/dingtalk": "^2.2.38",
+    "@alicloud/openapi-client": "^0.4.15",
+    "@alicloud/tea-typescript": "^1.8.0",
+    "@alicloud/tea-util": "^1.4.11"
+  }
+}

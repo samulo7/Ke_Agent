@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from app.rag.knowledge_retriever import KnowledgeRetriever
 from app.repos.in_memory_knowledge_repository import InMemoryKnowledgeRepository
 from app.repos.knowledge_repository import KnowledgeRepository
@@ -14,11 +16,16 @@ from app.schemas.knowledge import (
 )
 from app.schemas.tone import ToneProfile
 from app.services.answer_template import build_unified_answer_template
+from app.services.llm_constants import NON_LLM_GUARDRAILS, SUMMARY_ONLY_ALLOWLIST
+from app.services.llm_content_generation import (
+    LLMContentGenerationService,
+    build_default_llm_content_generation_service,
+)
 from app.services.tone_resolver import ToneResolver, build_tone_resolver_from_env
 
 
 class KnowledgeAnswerService:
-    """Compose deterministic A-08/A-09/B-13 answers from retrieved knowledge evidence."""
+    """Compose A-08/A-09/B-13 answers with LLM language generation + deterministic fallback."""
 
     def __init__(
         self,
@@ -26,10 +33,12 @@ class KnowledgeAnswerService:
         retriever: KnowledgeRetriever,
         repository: KnowledgeRepository,
         tone_resolver: ToneResolver | None = None,
+        content_generation_service: LLMContentGenerationService | None = None,
     ) -> None:
         self._retriever = retriever
         self._repository = repository
         self._tone_resolver = tone_resolver or build_tone_resolver_from_env()
+        self._content_generation_service = content_generation_service or build_default_llm_content_generation_service()
 
     def answer(
         self,
@@ -37,6 +46,8 @@ class KnowledgeAnswerService:
         question: str,
         intent: IntentType,
         access_context: KnowledgeAccessContext | None = None,
+        conversation_id: str = "",
+        sender_id: str = "",
     ) -> KnowledgeAnswer:
         evidences = self._retriever.retrieve(
             question=question,
@@ -47,22 +58,33 @@ class KnowledgeAnswerService:
         tone_profile = self._tone_resolver.resolve(intent=intent)
 
         if evidences:
-            citations = tuple(self._build_citation(item) for item in evidences)
+            all_citations = tuple(self._build_citation(item) for item in evidences)
             template = build_unified_answer_template(
                 evidences=evidences,
-                citations=citations,
+                citations=all_citations,
                 intent=intent,
                 tone_profile=tone_profile,
+            )
+            citations = template.sources
+            deterministic_text = template.to_text()
+            generated = self._content_generation_service.generate(
+                mode="allow",
+                question=question,
+                prompt_fields=self._build_allow_fields(evidences=evidences, citations=citations),
+                fallback_text=deterministic_text,
+                conversation_id=conversation_id,
+                sender_id=sender_id,
             )
             source_ids = tuple(citation.source_id for citation in citations)
             return KnowledgeAnswer(
                 found=True,
-                text=template.to_text(),
+                text=generated.text,
                 source_ids=source_ids,
                 permission_decision="allow",
                 knowledge_version=knowledge_version,
                 answered_at=utc_now_iso(),
                 citations=citations,
+                llm_trace=generated.to_trace(),
             )
 
         restricted_evidences = self._retriever.retrieve_restricted(
@@ -72,23 +94,66 @@ class KnowledgeAnswerService:
         )
         if restricted_evidences:
             top_hit = restricted_evidences[0].entry
+            contact = self._resolve_contact(top_hit)
             if top_hit.permission_scope == "sensitive":
+                deterministic_text = self._build_deny_text(top_hit, contact=contact)
+                generated = self._content_generation_service.generate(
+                    mode="deny",
+                    question=question,
+                    prompt_fields={
+                        "next_step": top_hit.next_step,
+                        "contact": contact,
+                    },
+                    fallback_text=deterministic_text,
+                    conversation_id=conversation_id,
+                    sender_id=sender_id,
+                    disallowed_values=(top_hit.summary,),
+                )
                 return KnowledgeAnswer.restricted(
-                    text=self._build_deny_text(top_hit),
+                    text=generated.text,
                     knowledge_version=knowledge_version,
                     permission_decision="deny",
                     source_ids=(top_hit.source_id,),
+                    llm_trace=generated.to_trace(),
                 )
+
+            deterministic_text = self._build_summary_only_text(top_hit, contact=contact)
+            generated = self._content_generation_service.generate(
+                mode="summary_only",
+                question=question,
+                prompt_fields={
+                    "summary": top_hit.summary,
+                    "next_step": top_hit.next_step,
+                    "contact": contact,
+                },
+                fallback_text=deterministic_text,
+                conversation_id=conversation_id,
+                sender_id=sender_id,
+            )
             return KnowledgeAnswer.restricted(
-                text=self._build_summary_only_text(top_hit),
+                text=generated.text,
                 knowledge_version=knowledge_version,
                 permission_decision="summary_only",
                 source_ids=(top_hit.source_id,),
+                llm_trace=generated.to_trace(),
             )
 
+        deterministic_text = self._build_no_hit_text(intent=intent, tone_profile=tone_profile)
+        generated = self._content_generation_service.generate(
+            mode="no_hit",
+            question=question,
+            prompt_fields={
+                "intent": intent,
+                "fallback_text": deterministic_text,
+            },
+            fallback_text=deterministic_text,
+            conversation_id=conversation_id,
+            sender_id=sender_id,
+        )
         return KnowledgeAnswer.not_found(
-            text=self._build_no_hit_text(intent=intent, tone_profile=tone_profile),
+            text=generated.text,
             knowledge_version=knowledge_version,
+            llm_trace=generated.to_trace(),
         )
 
     @staticmethod
@@ -106,8 +171,23 @@ class KnowledgeAnswerService:
         owner = (entry.owner or "").strip()
         return owner if owner else "人事/财务/商务"
 
-    def _build_summary_only_text(self, entry: RestrictedKnowledgeEntry) -> str:
-        contact = self._resolve_contact(entry)
+    @staticmethod
+    def _build_allow_fields(
+        *,
+        evidences: tuple[RetrievedEvidence, ...],
+        citations: tuple[KnowledgeCitation, ...],
+    ) -> dict[str, str]:
+        top = evidences[0].entry
+        source_lines = [f"{item.title}({item.source_id})" for item in citations]
+        return {
+            "summary": top.summary,
+            "applicability": top.applicability,
+            "next_step": top.next_step,
+            "sources": "; ".join(source_lines),
+            "guardrails": ", ".join(sorted(NON_LLM_GUARDRAILS)),
+        }
+
+    def _build_summary_only_text(self, entry: RestrictedKnowledgeEntry, *, contact: str) -> str:
         return (
             "该资料属于受控内容，当前不可直接查看正文。\n"
             f"脱敏摘要：{entry.summary}\n"
@@ -116,8 +196,7 @@ class KnowledgeAnswerService:
             "如需我继续协助，可直接回复“帮我生成申请草稿”。"
         )
 
-    def _build_deny_text(self, entry: RestrictedKnowledgeEntry) -> str:
-        contact = self._resolve_contact(entry)
+    def _build_deny_text(self, entry: RestrictedKnowledgeEntry, *, contact: str) -> str:
         return (
             "该资料属于敏感受控内容，当前权限下不可查看，且无法提供摘要。\n"
             f"申请路径：{entry.next_step}\n"
@@ -158,8 +237,17 @@ class KnowledgeAnswerService:
         )
 
 
+assert SUMMARY_ONLY_ALLOWLIST == {"summary", "next_step", "contact"}
+
+
 def build_default_knowledge_answer_service() -> KnowledgeAnswerService:
     repository = InMemoryKnowledgeRepository()
     retriever = KnowledgeRetriever(repository=repository)
     tone_resolver = build_tone_resolver_from_env()
-    return KnowledgeAnswerService(retriever=retriever, repository=repository, tone_resolver=tone_resolver)
+    content_generation_service = build_default_llm_content_generation_service()
+    return KnowledgeAnswerService(
+        retriever=retriever,
+        repository=repository,
+        tone_resolver=tone_resolver,
+        content_generation_service=content_generation_service,
+    )

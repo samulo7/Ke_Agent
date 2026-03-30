@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import logging
 from typing import Any
 
 from app.schemas.dingtalk_chat import AgentReply, ChatHandleResult, IncomingChatMessage
 from app.schemas.knowledge import KnowledgeAccessContext
+from app.schemas.llm import OrchestratorAction
 from app.schemas.user_context import UserContext
+from app.services.document_request_draft import DocumentRequestDraftOrchestrator
+from app.services.file_request import FileApprovalActionResult, FileRequestService
 from app.services.intent_classifier import IntentClassifier
 from app.services.knowledge_answering import KnowledgeAnswerService, build_default_knowledge_answer_service
+from app.services.llm_intent import LLMIntentService, build_default_llm_intent_service
+from app.services.llm_orchestrator_shadow import LLMOrchestratorShadowService, build_default_orchestrator_shadow_service
 
 LOW_CONFIDENCE_THRESHOLD = 0.6
 AMBIGUOUS_PHRASES = {
@@ -27,19 +33,44 @@ LOW_CONFIDENCE_EXCLUSIONS = {
     "在吗",
     "谢谢",
 }
+PENDING_FILE_CONTEXT_HINTS = {
+    "审批",
+    "进度",
+    "通过",
+    "驳回",
+    "拒绝",
+    "确认",
+    "取消",
+    "提交申请",
+    "发起申请",
+    "什么时候",
+    "处理好",
+    "好了没",
+    "状态",
+}
 
 
 class SingleChatService:
-    """MVP single-chat responder with text/card output channels."""
+    """Single-chat orchestrator for knowledge QA, draft guidance, and file delivery."""
 
     def __init__(
         self,
         *,
         intent_classifier: IntentClassifier | None = None,
         knowledge_answer_service: KnowledgeAnswerService | None = None,
+        document_request_orchestrator: DocumentRequestDraftOrchestrator | None = None,
+        file_request_service: FileRequestService | None = None,
+        llm_intent_service: LLMIntentService | None = None,
+        orchestrator_shadow_service: LLMOrchestratorShadowService | None = None,
     ) -> None:
         self._intent_classifier = intent_classifier or IntentClassifier()
         self._knowledge_answer_service = knowledge_answer_service or build_default_knowledge_answer_service()
+        self._document_request_orchestrator = document_request_orchestrator or DocumentRequestDraftOrchestrator()
+        self._file_request_service = file_request_service or FileRequestService()
+        self._llm_intent_service = llm_intent_service or build_default_llm_intent_service(
+            fallback_classifier=self._intent_classifier
+        )
+        self._orchestrator_shadow_service = orchestrator_shadow_service or build_default_orchestrator_shadow_service()
         self._logger = logging.getLogger("keagent.observability")
 
     def handle(
@@ -48,6 +79,11 @@ class SingleChatService:
         *,
         user_context: UserContext | None = None,
     ) -> ChatHandleResult:
+        llm_trace: dict[str, Any] = {
+            "intent": {},
+            "content": {},
+            "orchestrator_shadow": {},
+        }
         if message.conversation_type != "single":
             return ChatHandleResult(
                 handled=False,
@@ -66,7 +102,7 @@ class SingleChatService:
                 intent="other",
                 reply=AgentReply(
                     channel="text",
-                    text="MVP A-05 supports text input only. Please send a text message.",
+                    text="MVP currently supports text input only. Please send a text message.",
                 ),
             )
 
@@ -81,6 +117,34 @@ class SingleChatService:
                     text="I received an empty input. Please send your question in text.",
                 ),
             )
+
+        draft_continuation = self._document_request_orchestrator.handle(
+            conversation_id=message.conversation_id,
+            sender_id=message.sender_id,
+            text=question,
+            user_context=user_context,
+            force_start=False,
+        )
+        if draft_continuation is not None:
+            return draft_continuation
+
+        has_pending_request = getattr(self._file_request_service, "has_pending_request", None)
+        if callable(has_pending_request):
+            if has_pending_request(conversation_id=message.conversation_id, sender_id=message.sender_id):
+                if self._should_route_to_pending_file_request(question):
+                    result = self._file_request_service.handle(
+                        message=message,
+                        query_text=question,
+                        user_context=user_context,
+                    )
+                    llm_trace["orchestrator_shadow"] = self._orchestrator_shadow_service.suggest(
+                        question=question,
+                        intent="file_request",
+                        rule_action="file_request",
+                        conversation_id=message.conversation_id,
+                        sender_id=message.sender_id,
+                    ).to_trace()
+                    return self._apply_llm_trace(result=result, llm_trace=llm_trace)
 
         if self._is_ambiguous_question(question):
             return ChatHandleResult(
@@ -97,7 +161,12 @@ class SingleChatService:
                 ),
             )
 
-        intent_result = self._intent_classifier.classify(question)
+        intent_result = self._llm_intent_service.infer(
+            text=question,
+            conversation_id=message.conversation_id,
+            sender_id=message.sender_id,
+        )
+        llm_trace["intent"] = intent_result.to_trace()
         intent = intent_result.intent
 
         if (
@@ -105,6 +174,13 @@ class SingleChatService:
             and intent_result.confidence < LOW_CONFIDENCE_THRESHOLD
             and self._should_use_low_confidence_fallback(question)
         ):
+            llm_trace["orchestrator_shadow"] = self._orchestrator_shadow_service.suggest(
+                question=question,
+                intent=intent,
+                rule_action="fallback",
+                conversation_id=message.conversation_id,
+                sender_id=message.sender_id,
+            ).to_trace()
             return ChatHandleResult(
                 handled=False,
                 reason="low_confidence_fallback",
@@ -113,22 +189,44 @@ class SingleChatService:
                     channel="text",
                     text=(
                         "我暂时无法准确判断你的问题属于哪一类场景。\n"
-                        "你可以直接说明目标（制度查询 / 文档申请 / 报销 / 请假 / 固定报价），"
+                        "你可以直接说明目标（制度查询 / 文件申请 / 报销 / 请假 / 固定报价），"
                         "我会按对应流程给出下一步；也可以直接联系相关岗位处理。"
                     ),
                 ),
+                llm_trace=llm_trace,
             )
 
-        if intent == "document_request":
-            return ChatHandleResult(
-                handled=True,
-                reason="application_draft_card",
-                intent=intent,
-                reply=AgentReply(
-                    channel="interactive_card",
-                    interactive_card=self._build_application_draft_card(question),
-                ),
+        rule_action = self._rule_action_for_intent(intent)
+        llm_trace["orchestrator_shadow"] = self._orchestrator_shadow_service.suggest(
+            question=question,
+            intent=intent,
+            rule_action=rule_action,
+            conversation_id=message.conversation_id,
+            sender_id=message.sender_id,
+        ).to_trace()
+
+        if intent == "file_request":
+            result = self._file_request_service.handle(
+                message=message,
+                query_text=question,
+                user_context=user_context,
             )
+            return self._apply_llm_trace(result=result, llm_trace=llm_trace)
+
+        if intent == "document_request":
+            result = self._document_request_orchestrator.handle(
+                conversation_id=message.conversation_id,
+                sender_id=message.sender_id,
+                text=question,
+                user_context=user_context,
+                force_start=True,
+            ) or ChatHandleResult(
+                handled=False,
+                reason="application_draft_incomplete",
+                intent="document_request",
+                reply=AgentReply(channel="text", text="申请信息暂未收集成功，请重试。"),
+            )
+            return self._apply_llm_trace(result=result, llm_trace=llm_trace)
 
         if intent in {"reimbursement", "leave"}:
             return ChatHandleResult(
@@ -139,6 +237,7 @@ class SingleChatService:
                     channel="interactive_card",
                     interactive_card=self._build_flow_guidance_card(question),
                 ),
+                llm_trace=llm_trace,
             )
 
         try:
@@ -146,6 +245,8 @@ class SingleChatService:
                 question=question,
                 intent=intent,
                 access_context=self._to_access_context(user_context),
+                conversation_id=message.conversation_id,
+                sender_id=message.sender_id,
             )
         except Exception:
             self._logger.exception("single_chat.answer_failed")
@@ -157,8 +258,10 @@ class SingleChatService:
                     channel="text",
                     text="系统当前处理异常，请稍后再试；如需紧急处理，请直接联系对应岗位。",
                 ),
+                llm_trace=llm_trace,
             )
 
+        llm_trace["content"] = dict(knowledge_answer.llm_trace)
         reason = "knowledge_answer" if knowledge_answer.found else "knowledge_no_hit"
         handled = knowledge_answer.found
         if knowledge_answer.permission_decision in {"summary_only", "deny"}:
@@ -178,6 +281,57 @@ class SingleChatService:
             knowledge_version=knowledge_answer.knowledge_version,
             answered_at=knowledge_answer.answered_at,
             citations=tuple(citation.to_dict() for citation in knowledge_answer.citations),
+            llm_trace=llm_trace,
+        )
+
+    def handle_file_approval_action(
+        self,
+        *,
+        request_id: str,
+        action: str,
+        approver_user_id: str,
+    ) -> FileApprovalActionResult:
+        return self._file_request_service.handle_approval_action(
+            request_id=request_id,
+            action=action,
+            approver_user_id=approver_user_id,
+        )
+
+    def handle_file_approval_action_by_session(
+        self,
+        *,
+        action: str,
+        approver_user_id: str,
+        conversation_id: str,
+        sender_id: str,
+    ) -> FileApprovalActionResult:
+        resolver = getattr(self._file_request_service, "resolve_active_request_id", None)
+        request_id = ""
+        if callable(resolver):
+            request_id = str(
+                resolver(
+                    conversation_id=conversation_id,
+                    sender_id=sender_id,
+                )
+            ).strip()
+
+        if not request_id:
+            sender_only_resolver = getattr(self._file_request_service, "resolve_active_request_id_by_sender", None)
+            if callable(sender_only_resolver):
+                request_id = str(sender_only_resolver(sender_id=sender_id)).strip()
+
+        if request_id:
+            return self._file_request_service.handle_approval_action(
+                request_id=request_id,
+                action=action,
+                approver_user_id=approver_user_id,
+            )
+        return FileApprovalActionResult(
+            handled=False,
+            reason="file_approval_not_found",
+            request_id="",
+            action=None,
+            status=None,
         )
 
     @staticmethod
@@ -205,22 +359,6 @@ class SingleChatService:
         }
 
     @staticmethod
-    def _build_application_draft_card(question: str) -> dict[str, Any]:
-        return {
-            "card_type": "application_draft",
-            "title": "Document Request Draft",
-            "requested_item": question,
-            "draft_fields": {
-                "applicant_name": "<to be filled>",
-                "department": "<to be filled>",
-                "request_purpose": "<required>",
-                "expected_use_time": "<required>",
-                "suggested_approver": "HR/Document Owner",
-            },
-            "note": "A-05 provides draft guidance only; auto-submit is out of scope.",
-        }
-
-    @staticmethod
     def _normalize(text: str) -> str:
         return "".join(text.strip().lower().split())
 
@@ -234,6 +372,10 @@ class SingleChatService:
             return True
         return False
 
+    def _should_route_to_pending_file_request(self, question: str) -> bool:
+        normalized = self._normalize(question)
+        return any(token in normalized for token in PENDING_FILE_CONTEXT_HINTS)
+
     def _should_use_low_confidence_fallback(self, question: str) -> bool:
         normalized = self._normalize(question)
         if normalized in LOW_CONFIDENCE_EXCLUSIONS:
@@ -243,3 +385,19 @@ class SingleChatService:
     @staticmethod
     def _contains_cjk(text: str) -> bool:
         return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+    @staticmethod
+    def _rule_action_for_intent(intent: str) -> OrchestratorAction:
+        if intent == "file_request":
+            return "file_request"
+        if intent == "document_request":
+            return "document_request"
+        if intent in {"reimbursement", "leave"}:
+            return "flow_guidance"
+        if intent in {"policy_process", "fixed_quote", "other"}:
+            return "knowledge_answer"
+        return "fallback"
+
+    @staticmethod
+    def _apply_llm_trace(*, result: ChatHandleResult, llm_trace: dict[str, Any]) -> ChatHandleResult:
+        return replace(result, llm_trace=llm_trace)

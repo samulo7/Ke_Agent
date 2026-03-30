@@ -82,7 +82,104 @@ def validate_config(raw_env: Mapping[str, str]) -> ValidationResult:
                 )
             )
 
+    llm_api_key = str(result.resolved.get("LLM_API_KEY") or "").strip()
+    legacy_llm_api_key = str(result.resolved.get("QWEN_API_KEY") or "").strip()
+    if not llm_api_key and not legacy_llm_api_key:
+        result.errors.append(
+            ConfigIssue(
+                key="LLM_API_KEY",
+                code="MISSING_REQUIRED",
+                message="LLM_API_KEY is required (or set legacy QWEN_API_KEY for compatibility).",
+                remediation="Set LLM_API_KEY for your active model gateway, or set QWEN_API_KEY as legacy fallback.",
+            )
+        )
+
     runtime_env = str(result.resolved.get("APP_ENV", "dev")).lower()
+    interactive_template_id = str(result.resolved.get("DINGTALK_CARD_TEMPLATE_ID", "") or "").strip()
+    hr_approver_user_id = str(result.resolved.get("DINGTALK_HR_APPROVER_USER_ID", "") or "").strip()
+    hr_template_id = str(result.resolved.get("DINGTALK_HR_CARD_TEMPLATE_ID", "") or "").strip()
+    ai_streaming_enabled = bool(result.resolved.get("DINGTALK_AI_CARD_STREAMING_ENABLED", False))
+    ai_streaming_template_id = str(result.resolved.get("DINGTALK_AI_CARD_TEMPLATE_ID", "") or "").strip()
+    ai_streaming_content_key = str(result.resolved.get("DINGTALK_AI_CARD_CONTENT_KEY", "") or "").strip()
+    if ai_streaming_enabled and not ai_streaming_template_id:
+        result.errors.append(
+            ConfigIssue(
+                key="DINGTALK_AI_CARD_TEMPLATE_ID",
+                code="MISSING_REQUIRED_WHEN_ENABLED",
+                message=(
+                    "DINGTALK_AI_CARD_TEMPLATE_ID is required when "
+                    "DINGTALK_AI_CARD_STREAMING_ENABLED=true."
+                ),
+                remediation=(
+                    "Set DINGTALK_AI_CARD_TEMPLATE_ID to your streaming-enabled card template id."
+                ),
+            )
+        )
+    if ai_streaming_enabled and not ai_streaming_content_key:
+        result.errors.append(
+            ConfigIssue(
+                key="DINGTALK_AI_CARD_CONTENT_KEY",
+                code="MISSING_REQUIRED_WHEN_ENABLED",
+                message=(
+                    "DINGTALK_AI_CARD_CONTENT_KEY is required when "
+                    "DINGTALK_AI_CARD_STREAMING_ENABLED=true."
+                ),
+                remediation="Set DINGTALK_AI_CARD_CONTENT_KEY to the template markdown variable key.",
+            )
+        )
+    if interactive_template_id and ai_streaming_template_id and interactive_template_id == ai_streaming_template_id:
+        result.errors.append(
+            ConfigIssue(
+                key="DINGTALK_CARD_TEMPLATE_ID",
+                code="TEMPLATE_ID_CONFLICT",
+                message=(
+                    "DINGTALK_CARD_TEMPLATE_ID and DINGTALK_AI_CARD_TEMPLATE_ID must be different. "
+                    "Interactive request-confirm card and AI streaming card cannot reuse one template."
+                ),
+                remediation=(
+                    "Use two template ids: set DINGTALK_CARD_TEMPLATE_ID to interactive request button template, "
+                    "and DINGTALK_AI_CARD_TEMPLATE_ID to AI streaming template."
+                ),
+            )
+        )
+    if bool(hr_approver_user_id) != bool(hr_template_id):
+        missing_key = "DINGTALK_HR_CARD_TEMPLATE_ID" if hr_approver_user_id else "DINGTALK_HR_APPROVER_USER_ID"
+        result.errors.append(
+            ConfigIssue(
+                key=missing_key,
+                code="MISSING_REQUIRED_WHEN_ENABLED",
+                message=(
+                    "DINGTALK_HR_APPROVER_USER_ID and DINGTALK_HR_CARD_TEMPLATE_ID must be configured together "
+                    "for HR approval card delivery."
+                ),
+                remediation=(
+                    "Set both DINGTALK_HR_APPROVER_USER_ID and DINGTALK_HR_CARD_TEMPLATE_ID, "
+                    "or leave both empty to disable HR approval card delivery."
+                ),
+            )
+        )
+    if hr_template_id:
+        conflict_pairs = (
+            ("DINGTALK_CARD_TEMPLATE_ID", interactive_template_id),
+            ("DINGTALK_AI_CARD_TEMPLATE_ID", ai_streaming_template_id),
+        )
+        for conflict_key, conflict_value in conflict_pairs:
+            if conflict_value and conflict_value == hr_template_id:
+                result.errors.append(
+                    ConfigIssue(
+                        key="DINGTALK_HR_CARD_TEMPLATE_ID",
+                        code="TEMPLATE_ID_CONFLICT",
+                        message=(
+                            "DINGTALK_HR_CARD_TEMPLATE_ID must be different from "
+                            f"{conflict_key}."
+                        ),
+                        remediation=(
+                            "Use separate template ids for requester confirmation, HR approval, "
+                            "and AI streaming cards."
+                        ),
+                    )
+                )
+
     if runtime_env == "prod":
         for rule in CONFIG_RULES:
             if not rule.production_forbidden:
