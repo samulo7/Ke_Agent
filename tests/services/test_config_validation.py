@@ -184,6 +184,43 @@ class ConfigValidationTests(unittest.TestCase):
         result = validate_config(env)
         self.assertTrue(result.ok)
 
+    def test_leave_approval_enabled_requires_process_code_and_required_fields(self) -> None:
+        env = make_valid_env()
+        env["DINGTALK_LEAVE_APPROVAL_ENABLED"] = "true"
+        result = validate_config(env)
+        self.assertFalse(result.ok)
+        matches = {
+            (err.key, err.code)
+            for err in result.errors
+            if err.code == "MISSING_REQUIRED_WHEN_ENABLED"
+        }
+        self.assertIn(("DINGTALK_LEAVE_APPROVAL_PROCESS_CODE", "MISSING_REQUIRED_WHEN_ENABLED"), matches)
+        self.assertIn(("DINGTALK_LEAVE_APPROVAL_TYPE_FIELD", "MISSING_REQUIRED_WHEN_ENABLED"), matches)
+        self.assertIn(("DINGTALK_LEAVE_APPROVAL_START_TIME_FIELD", "MISSING_REQUIRED_WHEN_ENABLED"), matches)
+        self.assertIn(("DINGTALK_LEAVE_APPROVAL_END_TIME_FIELD", "MISSING_REQUIRED_WHEN_ENABLED"), matches)
+
+    def test_leave_approval_valid_combination_passes(self) -> None:
+        env = make_valid_env()
+        env["DINGTALK_LEAVE_APPROVAL_ENABLED"] = "true"
+        env["DINGTALK_LEAVE_APPROVAL_PROCESS_CODE"] = "PROC-LEAVE"
+        env["DINGTALK_LEAVE_APPROVAL_TYPE_FIELD"] = "请假类型"
+        env["DINGTALK_LEAVE_APPROVAL_START_TIME_FIELD"] = "开始时间"
+        env["DINGTALK_LEAVE_APPROVAL_END_TIME_FIELD"] = "结束时间"
+        result = validate_config(env)
+        self.assertTrue(result.ok)
+
+    def test_leave_approval_disabled_with_partial_config_warns_only(self) -> None:
+        env = make_valid_env()
+        env["DINGTALK_LEAVE_APPROVAL_PROCESS_CODE"] = "PROC-LEAVE"
+        result = validate_config(env)
+        self.assertTrue(result.ok)
+        matches = [
+            warning
+            for warning in result.warnings
+            if warning.key == "DINGTALK_LEAVE_APPROVAL_ENABLED" and warning.code == "DISABLED_FEATURE_CONFIG_PRESENT"
+        ]
+        self.assertEqual(1, len(matches))
+
 
 if __name__ == "__main__":
     unittest.main()

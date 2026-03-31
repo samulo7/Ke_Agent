@@ -134,7 +134,7 @@ class LLMIntentServiceTests(unittest.TestCase):
             ("给我发采购合同文件链接", "file_request"),
             ("定影器采购合同内容是什么", "policy_process"),
             ("采购合同制度流程是什么", "policy_process"),
-            ("我要申请采购制度文件权限", "document_request"),
+            ("我要申请采购制度文件", "file_request"),
             ("请帮我申请合同正文查看权限", "document_request"),
             ("报销流程入口在哪", "reimbursement"),
             ("出差报销要哪些材料", "reimbursement"),
@@ -178,4 +178,3 @@ class LLMIntentServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

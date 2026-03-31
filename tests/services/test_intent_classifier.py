@@ -19,16 +19,16 @@ LABELED_SAMPLES: list[tuple[str, IntentType]] = [
     ("固定资产借用规范", "policy_process"),
     ("人事制度更新要求", "policy_process"),
     ("采购合同内容是什么", "policy_process"),
-    ("我要申请采购制度文件", "document_request"),
-    ("需要查看员工手册文档", "document_request"),
+    ("我要申请采购制度文件权限", "document_request"),
+    ("需要开通员工手册访问权限", "document_request"),
     ("请帮我开通合同资料权限", "document_request"),
-    ("我想调阅财务模板文件", "document_request"),
-    ("我要获取报销制度文档原文", "document_request"),
-    ("帮我申请人事资料", "document_request"),
-    ("需要访问内部制度文档", "document_request"),
-    ("我想查看请假制度文件", "document_request"),
-    ("请申请项目流程手册", "document_request"),
-    ("我要获取行政管理模板", "document_request"),
+    ("我想申请财务模板查看权限", "document_request"),
+    ("我要申请报销制度文档阅读权限", "document_request"),
+    ("帮我申请人事资料调阅权限", "document_request"),
+    ("需要访问内部制度文档权限", "document_request"),
+    ("我想查看请假制度文件权限", "document_request"),
+    ("请申请项目流程手册访问权限", "document_request"),
+    ("我要申请行政管理模板授权", "document_request"),
     ("帮我找一下定影器的采购合同", "file_request"),
     ("我要找采购合同扫描件", "file_request"),
     ("找一下劳动合同纸质版", "file_request"),
@@ -88,7 +88,8 @@ class IntentClassifierTests(unittest.TestCase):
         self.classifier = IntentClassifier()
 
     def test_priority_rules_for_overlapping_keywords(self) -> None:
-        self.assertEqual("document_request", self.classifier.classify("我要申请报销制度文件").intent)
+        self.assertEqual("file_request", self.classifier.classify("我要申请报销制度文件").intent)
+        self.assertEqual("document_request", self.classifier.classify("我要申请报销制度文件权限").intent)
         self.assertEqual("file_request", self.classifier.classify("帮我找一下定影器的采购合同").intent)
         self.assertEqual("file_request", self.classifier.classify("请帮我找采购合同扫描件").intent)
         self.assertEqual("file_request", self.classifier.classify("定影器采购合同在哪里下载").intent)

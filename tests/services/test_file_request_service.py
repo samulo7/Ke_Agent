@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from app.schemas.dingtalk_chat import IncomingChatMessage
-from app.schemas.file_asset import FileAsset, FileSearchResult
+from app.schemas.file_asset import FileAsset, FileSearchCandidate, FileSearchResult
 from app.services.file_request import FileApprovalNotifyResult, FileRequestService
 
 
@@ -88,6 +88,32 @@ def _paper_asset() -> FileAsset:
     )
 
 
+def _printer_scan_asset() -> FileAsset:
+    return FileAsset(
+        file_id="file-scan-2",
+        contract_key="printer_contract",
+        title="打印机采购合同-2023版",
+        variant="scan",
+        file_url="https://example.local/files/printer-2023-scan",
+        tags=("采购", "合同", "打印机"),
+        status="active",
+        updated_at="2026-03-27",
+    )
+
+
+def _copier_scan_asset() -> FileAsset:
+    return FileAsset(
+        file_id="file-scan-3",
+        contract_key="copier_contract",
+        title="复印机采购合同-2024版",
+        variant="scan",
+        file_url="https://example.local/files/copier-2024-scan",
+        tags=("采购", "合同", "复印机"),
+        status="active",
+        updated_at="2026-03-27",
+    )
+
+
 class FileRequestServiceTests(unittest.TestCase):
     def test_first_turn_returns_confirmation_card_before_submitting_approval(self) -> None:
         notifier = _CapturingApprovalNotifier()
@@ -157,6 +183,140 @@ class FileRequestServiceTests(unittest.TestCase):
         self.assertIn("补充关键词", result.reply.text or "")
         self.assertIn("人事行政", result.reply.text or "")
 
+    def test_multi_match_returns_selection_prompt_without_confirmation_card(self) -> None:
+        service = FileRequestService(
+            file_repository=_VariantAwareRepository(
+                scan_result=FileSearchResult(
+                    matched=True,
+                    match_score=0.92,
+                    asset=_scan_asset(),
+                    candidates=(
+                        FileSearchCandidate(asset=_scan_asset(), match_score=0.92),
+                        FileSearchCandidate(asset=_printer_scan_asset(), match_score=0.88),
+                        FileSearchCandidate(asset=_copier_scan_asset(), match_score=0.87),
+                    ),
+                )
+            )
+        )
+
+        result = service.handle(
+            message=make_message(text="我要采购合同", conversation_id="conv-multi-1", sender_id="user-multi-1"),
+            query_text="我要采购合同",
+        )
+
+        self.assertFalse(result.handled)
+        self.assertEqual("file_lookup_multiple_matches", result.reason)
+        self.assertEqual("text", result.reply.channel)
+        self.assertIn("找到多个匹配文件", result.reply.text or "")
+        self.assertIn("1. 定影器采购合同-2024版", result.reply.text or "")
+        self.assertIn("2. 打印机采购合同-2023版", result.reply.text or "")
+        self.assertIn("3. 复印机采购合同-2024版", result.reply.text or "")
+        self.assertNotIn("确认文件申请", result.reply.text or "")
+
+    def test_multi_match_selection_by_index_enters_confirmation_card(self) -> None:
+        service = FileRequestService(
+            file_repository=_VariantAwareRepository(
+                scan_result=FileSearchResult(
+                    matched=True,
+                    match_score=0.92,
+                    asset=_scan_asset(),
+                    candidates=(
+                        FileSearchCandidate(asset=_scan_asset(), match_score=0.92),
+                        FileSearchCandidate(asset=_printer_scan_asset(), match_score=0.88),
+                        FileSearchCandidate(asset=_copier_scan_asset(), match_score=0.87),
+                    ),
+                )
+            )
+        )
+
+        first = service.handle(
+            message=make_message(text="我要采购合同", conversation_id="conv-multi-2", sender_id="user-multi-2"),
+            query_text="我要采购合同",
+        )
+        self.assertEqual("file_lookup_multiple_matches", first.reason)
+
+        second = service.handle(
+            message=make_message(text="2", conversation_id="conv-multi-2", sender_id="user-multi-2"),
+            query_text="2",
+        )
+        self.assertEqual("file_lookup_confirm_required", second.reason)
+        self.assertEqual("interactive_card", second.reply.channel)
+        card = second.reply.interactive_card or {}
+        self.assertEqual("file_request_confirmation", card.get("card_type"))
+        self.assertIn("打印机采购合同-2023版", card.get("summary", ""))
+
+    def test_multi_match_selection_by_file_name_enters_confirmation_card(self) -> None:
+        service = FileRequestService(
+            file_repository=_VariantAwareRepository(
+                scan_result=FileSearchResult(
+                    matched=True,
+                    match_score=0.92,
+                    asset=_scan_asset(),
+                    candidates=(
+                        FileSearchCandidate(asset=_scan_asset(), match_score=0.92),
+                        FileSearchCandidate(asset=_printer_scan_asset(), match_score=0.88),
+                        FileSearchCandidate(asset=_copier_scan_asset(), match_score=0.87),
+                    ),
+                )
+            )
+        )
+        service.handle(
+            message=make_message(text="我要采购合同", conversation_id="conv-multi-2b", sender_id="user-multi-2b"),
+            query_text="我要采购合同",
+        )
+
+        second = service.handle(
+            message=make_message(
+                text="复印机采购合同-2024版",
+                conversation_id="conv-multi-2b",
+                sender_id="user-multi-2b",
+            ),
+            query_text="复印机采购合同-2024版",
+        )
+        self.assertEqual("file_lookup_confirm_required", second.reason)
+        self.assertEqual("interactive_card", second.reply.channel)
+        card = second.reply.interactive_card or {}
+        self.assertIn("复印机采购合同-2024版", card.get("summary", ""))
+
+    def test_multi_match_state_expires_lazily(self) -> None:
+        class _FirstHitThenNoHitRepository:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def search(self, *, query_text: str, variant: str, requester_context=None):  # type: ignore[no-untyped-def]
+                del query_text, variant, requester_context
+                self.calls += 1
+                if self.calls == 1:
+                    return FileSearchResult(
+                        matched=True,
+                        match_score=0.92,
+                        asset=_scan_asset(),
+                        candidates=(
+                            FileSearchCandidate(asset=_scan_asset(), match_score=0.92),
+                            FileSearchCandidate(asset=_printer_scan_asset(), match_score=0.88),
+                            FileSearchCandidate(asset=_copier_scan_asset(), match_score=0.87),
+                        ),
+                    )
+                return FileSearchResult.no_hit()
+
+        clock = _FakeClock()
+        service = FileRequestService(
+            file_repository=_FirstHitThenNoHitRepository(),
+            now_provider=clock.now,
+        )
+        service.handle(
+            message=make_message(text="我要采购合同", conversation_id="conv-multi-3", sender_id="user-multi-3"),
+            query_text="我要采购合同",
+        )
+        clock.advance(seconds=601)
+        self.assertFalse(service.has_pending_selection(conversation_id="conv-multi-3", sender_id="user-multi-3"))
+
+        second = service.handle(
+            message=make_message(text="2", conversation_id="conv-multi-3", sender_id="user-multi-3"),
+            query_text="2",
+        )
+        self.assertEqual("file_lookup_no_hit", second.reason)
+
     def test_confirm_then_approval_approve_returns_three_delivery_replies(self) -> None:
         notifier = _CapturingApprovalNotifier()
         service = FileRequestService(
@@ -212,6 +372,42 @@ class FileRequestServiceTests(unittest.TestCase):
         self.assertFalse(duplicate.handled)
         self.assertEqual("file_approval_already_processed", duplicate.reason)
         self.assertEqual(0, len(duplicate.replies))
+
+    def test_terminal_status_time_uses_asia_shanghai_timezone(self) -> None:
+        clock = _FakeClock()
+        notifier = _CapturingApprovalNotifier()
+        service = FileRequestService(
+            file_repository=_VariantAwareRepository(
+                scan_result=FileSearchResult(matched=True, match_score=0.98, asset=_scan_asset())
+            ),
+            approval_notifier=notifier,
+            now_provider=clock.now,
+        )
+        first = service.handle(
+            message=make_message(text="我想要定影器采购合同", conversation_id="conv-file-tz", sender_id="user-file-tz"),
+            query_text="我想要定影器采购合同",
+        )
+        request_id = str((first.reply.interactive_card or {}).get("request_id", ""))
+        self.assertTrue(request_id.startswith("file-req-"))
+
+        service.handle_approval_action(
+            request_id=request_id,
+            action="确认申请",
+            approver_user_id="user-file-tz",
+        )
+        service.handle_approval_action(
+            request_id=request_id,
+            action="同意",
+            approver_user_id="人事行政",
+        )
+
+        result = service.handle(
+            message=make_message(text="审批进度", conversation_id="conv-file-tz", sender_id="user-file-tz"),
+            query_text="审批进度",
+        )
+        self.assertEqual("file_approval_approved", result.reason)
+        self.assertIn("处理时间：2026-03-27 08:00:00 Asia/Shanghai。", result.reply.text or "")
+        self.assertNotIn("UTC", result.reply.text or "")
 
     def test_confirm_request_notify_failure_keeps_waiting_confirmation(self) -> None:
         notifier = _CapturingApprovalNotifier(failure_reason="dingtalk_delivery_failed")

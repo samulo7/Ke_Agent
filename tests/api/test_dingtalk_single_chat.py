@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import unittest
@@ -11,9 +12,12 @@ from fastapi.testclient import TestClient
 from app.api.main import create_app
 from app.rag.knowledge_retriever import KnowledgeRetriever
 from app.repos.sql_knowledge_repository import SQLKnowledgeRepository, bootstrap_sqlite_schema
+from app.schemas.file_asset import FileAsset, FileSearchCandidate, FileSearchResult
 from app.schemas.user_context import UserContext
 from app.services.document_request_draft import DocumentRequestDraftOrchestrator
+from app.services.file_request import FileRequestService
 from app.services.knowledge_answering import KnowledgeAnswerService
+from app.services.leave_request import LeaveApprovalResult, LeaveRequestOrchestrator
 from app.services.single_chat import SingleChatService
 from app.services.tone_resolver import ToneResolver
 
@@ -21,6 +25,15 @@ from app.services.tone_resolver import ToneResolver
 class _RaisingKnowledgeAnswerService:
     def answer(self, *, question: str, intent: str):  # type: ignore[no-untyped-def]
         raise RuntimeError("simulated downstream failure")
+
+
+class _StubLeaveApprovalCreator:
+    def __init__(self, result: LeaveApprovalResult) -> None:
+        self._result = result
+
+    def submit(self, submission):  # type: ignore[no-untyped-def]
+        self.submission = submission
+        return self._result
 
 
 class _PermissionResolver:
@@ -56,6 +69,58 @@ class _FakeClock:
 
     def advance(self, *, seconds: int) -> None:
         self._current = self._current + timedelta(seconds=seconds)
+
+
+class _MultiHitFileRepository:
+    def __init__(self) -> None:
+        self._assets = (
+            FileAsset(
+                file_id="file-1",
+                contract_key="dingyingqi_contract",
+                title="定影器采购合同-2024版",
+                variant="scan",
+                file_url="https://example.local/files/dingyingqi-contract-2024-scan",
+                tags=("采购", "合同", "定影器", "2024"),
+                status="active",
+                updated_at="2026-03-30",
+            ),
+            FileAsset(
+                file_id="file-2",
+                contract_key="printer_contract",
+                title="打印机采购合同-2023版",
+                variant="scan",
+                file_url="https://example.local/files/printer-contract-2023-scan",
+                tags=("采购", "合同", "打印机", "2023"),
+                status="active",
+                updated_at="2026-03-30",
+            ),
+            FileAsset(
+                file_id="file-3",
+                contract_key="copier_contract",
+                title="复印机采购合同-2024版",
+                variant="scan",
+                file_url="https://example.local/files/copier-contract-2024-scan",
+                tags=("采购", "合同", "复印机", "2024"),
+                status="active",
+                updated_at="2026-03-30",
+            ),
+        )
+
+    def search(self, *, query_text: str, variant: str, requester_context=None):  # type: ignore[no-untyped-def]
+        del requester_context
+        if variant != "scan":
+            return FileSearchResult.no_hit()
+        if "采购合同" not in query_text:
+            return FileSearchResult.no_hit()
+        return FileSearchResult(
+            matched=True,
+            match_score=0.91,
+            asset=self._assets[0],
+            candidates=tuple(
+                FileSearchCandidate(asset=asset, match_score=0.9 - index * 0.01)
+                for index, asset in enumerate(self._assets)
+            ),
+        )
 
 
 def build_permission_single_chat_service() -> tuple[SingleChatService, sqlite3.Connection]:
@@ -182,6 +247,25 @@ def make_stream_payload(
         "sender_id": sender_id,
         "message_type": message_type,
         "text": text,
+    }
+
+
+def make_leave_button_callback_payload(
+    *,
+    action_id: str,
+    sender_id: str,
+    conversation_id: str,
+) -> dict[str, object]:
+    return {
+        "data": {
+            "type": "actionCallback",
+            "userId": sender_id,
+            "extension": json.dumps({"openConversationId": conversation_id}, ensure_ascii=False),
+            "content": json.dumps(
+                {"componentType": "button", "componentId": action_id},
+                ensure_ascii=False,
+            ),
+        }
     }
 
 
@@ -315,15 +399,62 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertEqual("reimbursement", body["intent"])
         self.assertEqual("interactive_card", body["reply"]["channel"])
         self.assertEqual("flow_guidance", body["reply"]["interactive_card"]["card_type"])
+        self.assertEqual("报销办理指引", body["reply"]["interactive_card"]["title"])
+        self.assertEqual("钉钉 > 工作台 > 审批 > 报销", body["reply"]["interactive_card"]["entry_point"])
+        self.assertIn("报销模板", body["reply"]["interactive_card"]["primary_action"])
         self.assertEqual("interactive_card", body["dingtalk_payload"]["msgtype"])
         self.assertEqual([], body["source_ids"])
         self.assertEqual("allow", body["permission_decision"])
 
-    def test_document_request_returns_application_draft_card(self) -> None:
+    def test_leave_info_query_returns_flow_guidance_text(self) -> None:
         app = create_app(log_stream=StringIO())
         client = TestClient(app)
 
-        response = client.post("/dingtalk/stream/events", json=make_stream_payload(text="我要申请采购制度文件"))
+        response = client.post("/dingtalk/stream/events", json=make_stream_payload(text="请假流程入口在哪"))
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+
+        self.assertTrue(body["handled"])
+        self.assertEqual("flow_guidance_text", body["reason"])
+        self.assertEqual("leave", body["intent"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("OA审批", body["reply"]["text"])
+        self.assertIn("我要请假", body["reply"]["text"])
+        self.assertEqual("text", body["dingtalk_payload"]["msgtype"])
+
+    def test_plain_leave_word_starts_leave_workflow(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post("/dingtalk/stream/events", json=make_stream_payload(text="请假"))
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+
+        self.assertEqual("leave", body["intent"])
+        self.assertEqual("leave_workflow_collecting", body["reason"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("开始和结束时间", body["reply"]["text"])
+        self.assertEqual("text", body["dingtalk_payload"]["msgtype"])
+
+    def test_natural_leave_phrase_with_duration_starts_leave_workflow(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post("/dingtalk/stream/events", json=make_stream_payload(text="我要请一天的假，4月7号"))
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+
+        self.assertEqual("leave", body["intent"])
+        self.assertEqual("leave_workflow_collecting", body["reason"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("请假类型", body["reply"]["text"])
+        self.assertEqual("text", body["dingtalk_payload"]["msgtype"])
+
+    def test_document_request_returns_application_draft_collecting(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post("/dingtalk/stream/events", json=make_stream_payload(text="我要申请采购制度文件权限"))
         self.assertEqual(200, response.status_code)
         body = response.json()
 
@@ -342,7 +473,7 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         first = client.post(
             "/dingtalk/stream/events",
             json=make_stream_payload(
-                text="我要申请采购制度文件",
+                text="我要申请采购制度文件权限",
                 sender_id="finance-user",
                 conversation_id="conv-b14-api-1",
             ),
@@ -377,7 +508,7 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         first = client.post(
             "/dingtalk/stream/events",
             json=make_stream_payload(
-                text="我要申请采购制度文件",
+                text="我要申请采购制度文件权限",
                 sender_id="finance-user",
                 conversation_id="conv-b14-api-confirm-1",
             ),
@@ -476,6 +607,435 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertIn("复制链接：https://example.local/files/dingyingqi-contract-2024-scan", body_third["replies"][1]["text"])
         self.assertIn("文件已发送，请查收", body_third["replies"][2]["text"])
 
+    def test_file_request_apply_language_still_hits_confirmation_card(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要申请定影器采购合同",
+                sender_id="user-file-api-apply-1",
+                conversation_id="conv-file-api-apply-1",
+            ),
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("file_request", body["intent"])
+        self.assertEqual("file_lookup_confirm_required", body["reason"])
+        self.assertEqual("interactive_card", body["reply"]["channel"])
+        self.assertEqual("file_request_confirmation", body["reply"]["interactive_card"]["card_type"])
+
+    def test_file_request_multi_match_uses_default_repository_data(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要采购合同",
+                sender_id="user-file-api-default-multi-1",
+                conversation_id="conv-file-api-default-multi-1",
+            ),
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertFalse(body["handled"])
+        self.assertEqual("file_lookup_multiple_matches", body["reason"])
+        self.assertEqual("file_request", body["intent"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("找到多个匹配文件", body["reply"]["text"])
+        self.assertIn("定影器采购合同-2024版", body["reply"]["text"])
+        self.assertIn("打印机采购合同-2023版", body["reply"]["text"])
+        self.assertIn("复印机采购合同-2024版", body["reply"]["text"])
+        self.assertIsNone(body["reply"]["interactive_card"])
+
+    def test_file_request_multi_match_returns_text_selection_without_confirmation_card(self) -> None:
+        service = SingleChatService(file_request_service=FileRequestService(file_repository=_MultiHitFileRepository()))
+        app = create_app(log_stream=StringIO(), single_chat_service=service)
+        client = TestClient(app)
+
+        response = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要采购合同",
+                sender_id="user-file-api-multi-1",
+                conversation_id="conv-file-api-multi-1",
+            ),
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertFalse(body["handled"])
+        self.assertEqual("file_lookup_multiple_matches", body["reason"])
+        self.assertEqual("file_request", body["intent"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("找到多个匹配文件", body["reply"]["text"])
+        self.assertIsNone(body["reply"]["interactive_card"])
+
+    def test_file_request_multi_match_selection_timeout_then_leave_routes_normally(self) -> None:
+        clock = _FakeClock()
+        service = SingleChatService(
+            file_request_service=FileRequestService(
+                file_repository=_MultiHitFileRepository(),
+                now_provider=clock.now,
+            )
+        )
+        app = create_app(log_stream=StringIO(), single_chat_service=service)
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要采购合同",
+                sender_id="user-file-api-multi-2",
+                conversation_id="conv-file-api-multi-2",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+        self.assertEqual("file_lookup_multiple_matches", first.json()["reason"])
+
+        clock.advance(seconds=601)
+        second = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要请假",
+                sender_id="user-file-api-multi-2",
+                conversation_id="conv-file-api-multi-2",
+            ),
+        )
+        self.assertEqual(200, second.status_code)
+        body = second.json()
+        self.assertEqual("leave", body["intent"])
+        self.assertEqual("leave_workflow_collecting", body["reason"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("开始和结束时间", body["reply"]["text"])
+
+    def test_leave_workflow_ready_card_requires_button_confirmation(self) -> None:
+        app = create_app(log_stream=StringIO(), user_context_resolver=_PermissionResolver())
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要请假",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-1",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+        body_first = first.json()
+        self.assertEqual("leave_workflow_collecting", body_first["reason"])
+        self.assertEqual("text", body_first["reply"]["channel"])
+        self.assertIn("开始和结束时间", body_first["reply"]["text"])
+        self.assertEqual("text", body_first["dingtalk_payload"]["msgtype"])
+
+        second = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="年假 2026-04-01 到 2026-04-02",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-1",
+            ),
+        )
+        self.assertEqual(200, second.status_code)
+        body_second = second.json()
+        self.assertEqual("leave_workflow_ready", body_second["reason"])
+        self.assertEqual("leave", body_second["intent"])
+        self.assertEqual("leave_request_ready", body_second["reply"]["interactive_card"]["card_type"])
+        self.assertNotIn("draft_fields", body_second["reply"]["interactive_card"])
+        self.assertEqual("leave_confirm_submit", body_second["reply"]["interactive_card"]["actions"][0]["action"])
+        self.assertEqual("leave_cancel_submit", body_second["reply"]["interactive_card"]["actions"][1]["action"])
+
+        third = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="确认",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-1",
+            ),
+        )
+        self.assertEqual(200, third.status_code)
+        body_third = third.json()
+        self.assertEqual("leave_workflow_waiting_button_action", body_third["reason"])
+        self.assertEqual("text", body_third["reply"]["channel"])
+        self.assertEqual("text", body_third["dingtalk_payload"]["msgtype"])
+        self.assertIn("点击卡片按钮", body_third["reply"]["text"])
+
+    def test_leave_workflow_button_callback_submits_when_creator_succeeds(self) -> None:
+        creator = _StubLeaveApprovalCreator(
+            LeaveApprovalResult(success=True, reason="submitted", process_instance_id="proc-1")
+        )
+        service = SingleChatService(
+            leave_request_orchestrator=LeaveRequestOrchestrator(approval_creator=creator),
+        )
+        app = create_app(
+            log_stream=StringIO(),
+            single_chat_service=service,
+            user_context_resolver=_PermissionResolver(),
+        )
+        client = TestClient(app)
+
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要请假",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-submit-1",
+            ),
+        )
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="年假 2026-04-01 到 2026-04-02",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-submit-1",
+            ),
+        )
+        third = client.post(
+            "/dingtalk/stream/events",
+            json=make_leave_button_callback_payload(
+                action_id="leave_confirm_submit",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-submit-1",
+            ),
+        )
+
+        self.assertEqual(200, third.status_code)
+        body = third.json()
+        self.assertEqual("leave_workflow_submitted", body["reason"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertEqual("text", body["dingtalk_payload"]["msgtype"])
+        self.assertIn("已帮你发起", body["reply"]["text"])
+        self.assertEqual("finance-user", creator.submission.originator_user_id)
+
+    def test_leave_workflow_button_callback_accepts_confirm_request_alias_with_leave_outtrackid(self) -> None:
+        creator = _StubLeaveApprovalCreator(
+            LeaveApprovalResult(success=True, reason="submitted", process_instance_id="proc-alias-1")
+        )
+        service = SingleChatService(
+            leave_request_orchestrator=LeaveRequestOrchestrator(approval_creator=creator),
+        )
+        app = create_app(
+            log_stream=StringIO(),
+            single_chat_service=service,
+            user_context_resolver=_PermissionResolver(),
+        )
+        client = TestClient(app)
+
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要请假",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-alias-1",
+            ),
+        )
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="年假 2026-04-01 到 2026-04-02",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-alias-1",
+            ),
+        )
+        third = client.post(
+            "/dingtalk/stream/events",
+            json={
+                "data": {
+                    "type": "actionCallback",
+                    "userId": "finance-user",
+                    "extension": "{\"openConversationId\":\"conv-leave-api-alias-1\"}",
+                    "content": "{\"cardPrivateData\":{\"actionIds\":[\"confirm_request\"],\"params\":{\"local_input\":\"submit\"}}}",
+                    "outTrackId": "leave-confirm-alias-1",
+                }
+            },
+        )
+
+        self.assertEqual(200, third.status_code)
+        body = third.json()
+        self.assertEqual("leave_workflow_submitted", body["reason"])
+        self.assertEqual("leave_confirm_submit", body["leave_action"])
+        self.assertEqual("submitted", body["leave_status"])
+        self.assertIn("已帮你发起", body["reply"]["text"])
+
+    def test_leave_workflow_button_callback_uses_space_id_when_open_conversation_id_missing(self) -> None:
+        creator = _StubLeaveApprovalCreator(
+            LeaveApprovalResult(success=True, reason="submitted", process_instance_id="proc-space-id-1")
+        )
+        service = SingleChatService(
+            leave_request_orchestrator=LeaveRequestOrchestrator(approval_creator=creator),
+        )
+        app = create_app(
+            log_stream=StringIO(),
+            single_chat_service=service,
+            user_context_resolver=_PermissionResolver(),
+        )
+        client = TestClient(app)
+
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要请假",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-spaceid-1",
+            ),
+        )
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="明天后天年假",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-spaceid-1",
+            ),
+        )
+        third = client.post(
+            "/dingtalk/stream/events",
+            json={
+                "data": {
+                    "type": "actionCallback",
+                    "userId": "finance-user",
+                    "extension": "{}",
+                    "content": "{\"cardPrivateData\":{\"actionIds\":[\"confirm_request\"],\"params\":{}}}",
+                    "spaceId": "conv-leave-api-spaceid-1",
+                    "outTrackId": "leave-confirm-spaceid-1",
+                    "value": "{\"cardPrivateData\":{\"actionIds\":[\"confirm_request\"],\"params\":{}}}",
+                }
+            },
+        )
+
+        self.assertEqual(200, third.status_code)
+        body = third.json()
+        self.assertEqual("leave_workflow_submitted", body["reason"])
+        self.assertEqual("leave_confirm_submit", body["leave_action"])
+        self.assertEqual("submitted", body["leave_status"])
+        self.assertIn("已帮你发起", body["reply"]["text"])
+
+    def test_leave_workflow_button_callback_can_cancel(self) -> None:
+        app = create_app(log_stream=StringIO(), user_context_resolver=_PermissionResolver())
+        client = TestClient(app)
+
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要请假",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-cancel-1",
+            ),
+        )
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="年假 2026-04-01 到 2026-04-02",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-cancel-1",
+            ),
+        )
+        response = client.post(
+            "/dingtalk/stream/events",
+            json=make_leave_button_callback_payload(
+                action_id="leave_cancel_submit",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-cancel-1",
+            ),
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("leave_workflow_cancelled", body["reason"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("已取消", body["reply"]["text"])
+
+    def test_leave_workflow_button_callback_expired_requires_restart(self) -> None:
+        clock = _FakeClock()
+        creator = _StubLeaveApprovalCreator(
+            LeaveApprovalResult(success=True, reason="submitted", process_instance_id="proc-confirm-1")
+        )
+        service = SingleChatService(
+            leave_request_orchestrator=LeaveRequestOrchestrator(approval_creator=creator, now_provider=clock.now),
+        )
+        app = create_app(
+            log_stream=StringIO(),
+            single_chat_service=service,
+            user_context_resolver=_PermissionResolver(),
+        )
+        client = TestClient(app)
+
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要请假",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-confirm-1",
+            ),
+        )
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="明天年假",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-confirm-1",
+            ),
+        )
+        clock.advance(seconds=301)
+        third = client.post(
+            "/dingtalk/stream/events",
+            json=make_leave_button_callback_payload(
+                action_id="leave_confirm_submit",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-confirm-1",
+            ),
+        )
+
+        self.assertEqual(200, third.status_code)
+        body = third.json()
+        self.assertEqual("leave_workflow_confirmation_expired", body["reason"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertEqual("text", body["dingtalk_payload"]["msgtype"])
+        self.assertIn("重新发送“我要请假”", body["reply"]["text"])
+
+    def test_leave_workflow_button_callback_returns_fallback_when_creator_fails(self) -> None:
+        creator = _StubLeaveApprovalCreator(LeaveApprovalResult(success=False, reason="api_error"))
+        service = SingleChatService(
+            leave_request_orchestrator=LeaveRequestOrchestrator(approval_creator=creator),
+        )
+        app = create_app(
+            log_stream=StringIO(),
+            single_chat_service=service,
+            user_context_resolver=_PermissionResolver(),
+        )
+        client = TestClient(app)
+
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要请假",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-submit-2",
+            ),
+        )
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="年假 2026-04-01 到 2026-04-02",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-submit-2",
+            ),
+        )
+        third = client.post(
+            "/dingtalk/stream/events",
+            json=make_leave_button_callback_payload(
+                action_id="leave_confirm_submit",
+                sender_id="finance-user",
+                conversation_id="conv-leave-api-submit-2",
+            ),
+        )
+
+        self.assertEqual(200, third.status_code)
+        body = third.json()
+        self.assertEqual("leave_workflow_handoff_fallback", body["reason"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("暂时没能直接帮你发起钉钉审批", body["reply"]["text"])
+        self.assertIn("OA审批", body["reply"]["text"])
+
     def test_file_request_progress_query_returns_structured_status(self) -> None:
         app = create_app(log_stream=StringIO())
         client = TestClient(app)
@@ -483,7 +1043,7 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         first = client.post(
             "/dingtalk/stream/events",
             json=make_stream_payload(
-                text="我要采购合同文件",
+                text="我要定影器采购合同文件",
                 sender_id="user-file-api-status-1",
                 conversation_id="conv-file-api-status-1",
             ),
@@ -536,7 +1096,7 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         first = client.post(
             "/dingtalk/stream/events",
             json=make_stream_payload(
-                text="我要采购合同文件",
+                text="我要定影器采购合同文件",
                 sender_id="user-file-api-button-1",
                 conversation_id="conv-file-api-button-1",
             ),
@@ -564,7 +1124,7 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         first = client.post(
             "/dingtalk/stream/events",
             json=make_stream_payload(
-                text="我要采购合同文件",
+                text="我要定影器采购合同文件",
                 sender_id="user-file-api-action-only-1",
                 conversation_id="conv-file-api-action-only-1",
             ),
@@ -594,7 +1154,7 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         first = client.post(
             "/dingtalk/stream/events",
             json=make_stream_payload(
-                text="我要采购合同文件",
+                text="我要定影器采购合同文件",
                 sender_id="user-file-api-text-confirm-1",
                 conversation_id="conv-file-api-text-confirm-1",
             ),
@@ -616,6 +1176,43 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertEqual("file_lookup_pending_approval", body_second["reason"])
         self.assertEqual("pending", body_second["approval_status"])
 
+    def test_plain_text_cancel_without_pending_request_is_not_treated_as_callback(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="取消",
+                sender_id="user-file-api-cancel-no-pending-1",
+                conversation_id="conv-file-api-cancel-no-pending-1",
+            ),
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertNotEqual("file_approval_not_found", body["reason"])
+        self.assertNotIn("已收到按钮点击", body["reply"]["text"])
+
+    def test_plain_text_cancel_with_msgtype_without_pending_request_is_not_treated_as_callback(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post(
+            "/dingtalk/stream/events",
+            json={
+                "event_id": "evt-file-api-cancel-msgtype-1",
+                "conversation_id": "conv-file-api-cancel-msgtype-1",
+                "conversation_type": "single",
+                "sender_id": "user-file-api-cancel-msgtype-1",
+                "msgtype": "text",
+                "text": "取消",
+            },
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertNotEqual("file_approval_not_found", body["reason"])
+        self.assertNotIn("已收到按钮点击", body["reply"]["text"])
+
     def test_file_request_card_callback_shape_can_confirm_request_by_session(self) -> None:
         app = create_app(log_stream=StringIO())
         client = TestClient(app)
@@ -623,7 +1220,7 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         first = client.post(
             "/dingtalk/stream/events",
             json=make_stream_payload(
-                text="我要采购合同文件",
+                text="我要定影器采购合同文件",
                 sender_id="user-file-api-card-1",
                 conversation_id="conv-file-api-card-1",
             ),
@@ -655,7 +1252,7 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         first = client.post(
             "/dingtalk/stream/events",
             json=make_stream_payload(
-                text="我要采购合同文件",
+                text="我要定影器采购合同文件",
                 sender_id="user-file-api-official-1",
                 conversation_id="conv-file-api-official-1",
             ),
@@ -711,7 +1308,7 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         first = client.post(
             "/dingtalk/stream/events",
             json=make_stream_payload(
-                text="我要申请采购制度文件",
+                text="我要申请采购制度文件权限",
                 conversation_id="conv-b14-api-2",
                 sender_id="user-b14-api-2",
             ),

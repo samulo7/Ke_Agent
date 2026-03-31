@@ -32,7 +32,14 @@ class FileSearchResult:
     matched: bool
     asset: FileAsset | None = None
     match_score: float = 0.0
+    candidates: tuple["FileSearchCandidate", ...] = ()
 
     @classmethod
     def no_hit(cls) -> "FileSearchResult":
-        return cls(matched=False, asset=None, match_score=0.0)
+        return cls(matched=False, asset=None, match_score=0.0, candidates=())
+
+
+@dataclass(frozen=True)
+class FileSearchCandidate:
+    asset: FileAsset
+    match_score: float

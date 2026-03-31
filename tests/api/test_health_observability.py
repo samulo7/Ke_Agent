@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import unittest
 from io import StringIO
 from uuid import UUID
@@ -8,6 +9,7 @@ from uuid import UUID
 from fastapi.testclient import TestClient
 
 from app.api.main import create_app
+from app.core.structured_logging import configure_structured_logging
 from app.core.trace_context import get_trace_id
 from app.services.health import HealthProbe, HealthService
 
@@ -92,6 +94,32 @@ class HealthObservabilityTests(unittest.TestCase):
         self.assertEqual(503, request_log["status_code"])
         self.assertEqual("dependency_error", request_log["error_category"])
         self.assertEqual(response_body["trace_id"], request_log["trace_id"])
+
+    def test_structured_logging_preserves_extra_obs_fields(self) -> None:
+        log_stream = StringIO()
+        logger = configure_structured_logging(stream=log_stream)
+
+        logger.warning(
+            "leave.approval.api_error",
+            extra={
+                "obs": {
+                    "module": "integrations.dingtalk.leave_approval",
+                    "event": "leave_approval_api_error",
+                    "process_code": "PROC-LEAVE",
+                    "errcode": 40001,
+                    "errmsg": "invalid form value",
+                }
+            },
+        )
+
+        logs = _load_logs(log_stream)
+        self.assertEqual(1, len(logs))
+        event_log = logs[0]
+        self.assertEqual("leave_approval_api_error", event_log["event"])
+        self.assertEqual("integrations.dingtalk.leave_approval", event_log["module"])
+        self.assertEqual("PROC-LEAVE", event_log["process_code"])
+        self.assertEqual(40001, event_log["errcode"])
+        self.assertEqual("invalid form value", event_log["errmsg"])
 
 
 if __name__ == "__main__":

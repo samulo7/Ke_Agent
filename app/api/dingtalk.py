@@ -74,15 +74,15 @@ def _extract_file_approval_action(payload: Mapping[str, Any]) -> dict[str, str] 
                 "actionName",
                 "button_text",
                 "buttonText",
-                "text",
-                "content",
-                "title",
-                "name",
             ),
         )
         normalized_action = _normalize_approval_action_text(action_value)
         if normalized_action:
             action = normalized_action
+        text_action_value = _pick_string(candidate, ("text", "content", "title", "name"))
+        normalized_text_action = _normalize_explicit_text_approval_action(text_action_value)
+        if normalized_text_action:
+            action = normalized_text_action
         request_id = request_id or _pick_string(candidate, ("request_id", "requestId"))
         if not request_id:
             request_id = _find_request_id_in_mapping(candidate)
@@ -110,7 +110,6 @@ def _extract_file_approval_action(payload: Mapping[str, Any]) -> dict[str, str] 
                 break
     if not action:
         return None
-
     approver_user_id = _pick_string_from_candidates(
         candidates,
         ("approver_user_id", "approverUserId", "sender_id", "senderStaffId", "senderId", "userId", "user_id", "userid"),
@@ -121,7 +120,17 @@ def _extract_file_approval_action(payload: Mapping[str, Any]) -> dict[str, str] 
         "approver_user_id": approver_user_id or "unknown",
         "conversation_id": _pick_string_from_candidates(
             candidates,
-            ("conversation_id", "conversationId", "cid", "openConversationId", "open_conversation_id"),
+            (
+                "conversation_id",
+                "conversationId",
+                "cid",
+                "openConversationId",
+                "open_conversation_id",
+                "spaceId",
+                "space_id",
+                "openSpaceId",
+                "open_space_id",
+            ),
         ),
         "sender_id": _pick_string_from_candidates(
             candidates,
@@ -130,6 +139,82 @@ def _extract_file_approval_action(payload: Mapping[str, Any]) -> dict[str, str] 
         or approver_user_id
         or "unknown",
     }
+
+
+def _extract_leave_confirmation_action(payload: Mapping[str, Any]) -> dict[str, str] | None:
+    data = _extract_mapping(payload)
+    candidates = _collect_mapping_candidates(data)
+    leave_callback_context = _is_leave_callback_context(candidates)
+
+    action = ""
+    for candidate in candidates:
+        action_value = _pick_string(
+            candidate,
+            (
+                "leave_action",
+                "leaveAction",
+                "action",
+                "action_name",
+                "actionName",
+                "button_text",
+                "buttonText",
+            ),
+        )
+        normalized_action = _normalize_leave_action_text(action_value, allow_file_alias=leave_callback_context)
+        if normalized_action:
+            action = normalized_action
+            break
+
+        parsed_private_action = _extract_leave_action_from_card_private_data(
+            candidate,
+            allow_file_alias=leave_callback_context,
+        )
+        if parsed_private_action:
+            action = parsed_private_action
+            break
+
+        button_id = _pick_string(
+            candidate,
+            ("button_id", "buttonId", "action_id", "actionId", "id", "componentId", "component_id"),
+        )
+        parsed_action = _parse_leave_action_from_button_id(button_id, allow_file_alias=leave_callback_context)
+        if parsed_action:
+            action = parsed_action
+            break
+
+    if not action:
+        return None
+
+    return {
+        "action": action,
+        "conversation_id": _pick_string_from_candidates(
+            candidates,
+            (
+                "conversation_id",
+                "conversationId",
+                "cid",
+                "openConversationId",
+                "open_conversation_id",
+                "spaceId",
+                "space_id",
+                "openSpaceId",
+                "open_space_id",
+            ),
+        ),
+        "sender_id": _pick_string_from_candidates(
+            candidates,
+            ("sender_id", "senderStaffId", "senderId", "staffId", "userId", "user_id", "userid"),
+        )
+        or "unknown",
+    }
+
+
+def _is_leave_callback_context(candidates: list[Mapping[str, Any]]) -> bool:
+    workflow_type = _pick_string_from_candidates(candidates, ("workflow_type", "workflowType")).strip().lower()
+    if workflow_type == "leave":
+        return True
+    out_track_id = _pick_string_from_candidates(candidates, ("outTrackId", "out_track_id")).strip().lower()
+    return out_track_id.startswith("leave-confirm-")
 
 
 def _normalize_approval_action_text(raw: str) -> str:
@@ -143,6 +228,40 @@ def _normalize_approval_action_text(raw: str) -> str:
     if normalized in {"reject", "rejected", "refuse", "拒绝", "驳回"}:
         return "reject"
     return ""
+
+
+def _normalize_leave_action_text(raw: str, *, allow_file_alias: bool = False) -> str:
+    normalized = "".join((raw or "").strip().lower().split())
+    if normalized in {"leave_confirm_submit", "leaveconfirmsubmit"}:
+        return "leave_confirm_submit"
+    if normalized in {"leave_cancel_submit", "leavecancelsubmit"}:
+        return "leave_cancel_submit"
+    if normalized in {"确认提交请假", "确认请假", "提交请假"}:
+        return "leave_confirm_submit"
+    if normalized in {"取消请假"}:
+        return "leave_cancel_submit"
+    if allow_file_alias and normalized == "confirm_request":
+        return "leave_confirm_submit"
+    if allow_file_alias and normalized == "cancel_request":
+        return "leave_cancel_submit"
+    return ""
+
+
+def _normalize_explicit_text_approval_action(raw: str) -> str:
+    normalized = "".join((raw or "").strip().lower().split())
+    if normalized in {"确认申请", "提交申请", "发起申请"}:
+        return "confirm_request"
+    if normalized in {"cancel_request", "cancel", "取消申请", "不用申请", "放弃申请", "先不申请"}:
+        return "cancel_request"
+    return ""
+
+
+def _parse_leave_action_from_button_id(button_id: str, *, allow_file_alias: bool) -> str:
+    raw = (button_id or "").strip()
+    if not raw:
+        return ""
+    head = raw.split("::", 1)[0]
+    return _normalize_leave_action_text(head, allow_file_alias=allow_file_alias)
 
 
 def _extract_action_from_card_private_data(candidate: Mapping[str, Any]) -> tuple[str, str]:
@@ -177,6 +296,24 @@ def _extract_action_from_card_private_data(candidate: Mapping[str, Any]) -> tupl
     return "", ""
 
 
+def _extract_leave_action_from_card_private_data(candidate: Mapping[str, Any], *, allow_file_alias: bool) -> str:
+    private_data = _extract_card_private_data_mapping(candidate)
+    if private_data is None:
+        return ""
+
+    action_ids = private_data.get("actionIds")
+    if isinstance(action_ids, list):
+        for item in action_ids:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            normalized_action = _parse_leave_action_from_button_id(item, allow_file_alias=allow_file_alias)
+            if normalized_action:
+                return normalized_action
+
+    action_value = _pick_string(private_data, ("action", "action_name", "actionName"))
+    return _normalize_leave_action_text(action_value, allow_file_alias=allow_file_alias)
+
+
 def _extract_card_private_data_mapping(candidate: Mapping[str, Any]) -> Mapping[str, Any] | None:
     direct_private = candidate.get("cardPrivateData")
     if isinstance(direct_private, Mapping):
@@ -200,6 +337,17 @@ def _find_request_id_in_mapping(payload: Mapping[str, Any]) -> str:
         return ""
     match = _REQUEST_ID_PATTERN.search(text)
     return match.group(1) if match else ""
+
+
+def _is_plain_text_single_chat(candidates: list[Mapping[str, Any]]) -> bool:
+    raw_conversation_type = _pick_string_from_candidates(candidates, ("conversation_type", "conversationType")).lower()
+    conversation_type = (
+        "single"
+        if raw_conversation_type in {"single", "single_chat", "1", "1v1", "private"}
+        else raw_conversation_type
+    )
+    message_type = _pick_string_from_candidates(candidates, ("message_type", "messageType", "msgtype")).lower()
+    return conversation_type == "single" and message_type == "text"
 
 
 def _collect_mapping_candidates(root: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -266,6 +414,58 @@ async def receive_dingtalk_stream_event(
     request.state.llm_trace = {}
 
     single_chat_service: SingleChatService = request.app.state.single_chat_service
+    plain_text_single_chat = _is_plain_text_single_chat(_collect_mapping_candidates(_extract_mapping(payload)))
+    leave_action = _extract_leave_confirmation_action(payload)
+    if leave_action is not None:
+        leave_outcome = single_chat_service.handle_leave_confirmation_action_by_session(
+            action=leave_action["action"],
+            conversation_id=leave_action.get("conversation_id", ""),
+            sender_id=leave_action.get("sender_id", ""),
+        )
+        request.state.intent = "leave"
+        replies = list(leave_outcome.all_replies())
+        serialized_replies, dingtalk_payloads = _serialize_replies(replies=replies)
+        primary_reply = (
+            serialized_replies[0] if serialized_replies else {"channel": "text", "text": "", "interactive_card": None}
+        )
+        primary_payload = dingtalk_payloads[0] if dingtalk_payloads else {"msgtype": "text", "text": {"content": ""}}
+        reason = str(leave_outcome.reason or "")
+        if reason == "leave_workflow_submitted":
+            leave_status = "submitted"
+        elif reason == "leave_workflow_cancelled":
+            leave_status = "cancelled"
+        elif reason in {"leave_workflow_not_found", "leave_workflow_confirmation_expired"}:
+            leave_status = "not_found"
+        elif reason == "leave_workflow_handoff_fallback":
+            leave_status = "fallback"
+        elif reason == "leave_workflow_handoff":
+            leave_status = "handoff"
+        else:
+            leave_status = "pending"
+        return JSONResponse(
+            status_code=200,
+            media_type=UTF8_JSON_MEDIA_TYPE,
+            content={
+                "ack": "ok",
+                "trace_id": trace_id,
+                "handled": leave_outcome.handled,
+                "reason": leave_outcome.reason,
+                "intent": "leave",
+                "leave_action": leave_action["action"],
+                "leave_status": leave_status,
+                "reply": primary_reply,
+                "replies": serialized_replies,
+                "dingtalk_payload": primary_payload,
+                "dingtalk_payloads": dingtalk_payloads,
+                "source_ids": [],
+                "permission_decision": "allow",
+                "knowledge_version": "",
+                "answered_at": "",
+                "citations": [],
+                "llm_trace": {},
+            },
+        )
+
     approval_action = _extract_file_approval_action(payload)
     if approval_action is not None:
         request_id = approval_action.get("request_id", "")
@@ -282,42 +482,51 @@ async def receive_dingtalk_stream_event(
                 conversation_id=approval_action.get("conversation_id", ""),
                 sender_id=approval_action.get("sender_id", ""),
             )
-        request.state.intent = "file_request"
-        replies = list(approval_outcome.replies)
-        if not replies and approval_outcome.reason == "file_approval_not_found":
-            replies = [
-                AgentReply(
-                    channel="text",
-                    text="已收到按钮点击，但未定位到待处理申请。请重新发送“我要采购合同文件”后再确认申请。",
-                )
-            ]
-        serialized_replies, dingtalk_payloads = _serialize_replies(replies=replies)
-        primary_reply = serialized_replies[0] if serialized_replies else {"channel": "text", "text": "", "interactive_card": None}
-        primary_payload = dingtalk_payloads[0] if dingtalk_payloads else {"msgtype": "text", "text": {"content": ""}}
-        return JSONResponse(
-            status_code=200,
-            media_type=UTF8_JSON_MEDIA_TYPE,
-            content={
-                "ack": "ok",
-                "trace_id": trace_id,
-                "handled": approval_outcome.handled,
-                "reason": approval_outcome.reason,
-                "intent": "file_request",
-                "request_id": approval_outcome.request_id,
-                "approval_action": approval_outcome.action,
-                "approval_status": approval_outcome.status,
-                "reply": primary_reply,
-                "replies": serialized_replies,
-                "dingtalk_payload": primary_payload,
-                "dingtalk_payloads": dingtalk_payloads,
-                "source_ids": [],
-                "permission_decision": "allow",
-                "knowledge_version": "",
-                "answered_at": "",
-                "citations": [],
-                "llm_trace": {},
-            },
-        )
+        if (
+            not request_id
+            and plain_text_single_chat
+            and approval_outcome.reason == "file_approval_not_found"
+        ):
+            approval_action = None
+        else:
+            request.state.intent = "file_request"
+            replies = list(approval_outcome.replies)
+            if not replies and approval_outcome.reason == "file_approval_not_found":
+                replies = [
+                    AgentReply(
+                        channel="text",
+                        text="已收到按钮点击，但未定位到待处理申请。请重新发送“我要采购合同文件”后再确认申请。",
+                    )
+                ]
+            serialized_replies, dingtalk_payloads = _serialize_replies(replies=replies)
+            primary_reply = (
+                serialized_replies[0] if serialized_replies else {"channel": "text", "text": "", "interactive_card": None}
+            )
+            primary_payload = dingtalk_payloads[0] if dingtalk_payloads else {"msgtype": "text", "text": {"content": ""}}
+            return JSONResponse(
+                status_code=200,
+                media_type=UTF8_JSON_MEDIA_TYPE,
+                content={
+                    "ack": "ok",
+                    "trace_id": trace_id,
+                    "handled": approval_outcome.handled,
+                    "reason": approval_outcome.reason,
+                    "intent": "file_request",
+                    "request_id": approval_outcome.request_id,
+                    "approval_action": approval_outcome.action,
+                    "approval_status": approval_outcome.status,
+                    "reply": primary_reply,
+                    "replies": serialized_replies,
+                    "dingtalk_payload": primary_payload,
+                    "dingtalk_payloads": dingtalk_payloads,
+                    "source_ids": [],
+                    "permission_decision": "allow",
+                    "knowledge_version": "",
+                    "answered_at": "",
+                    "citations": [],
+                    "llm_trace": {},
+                },
+            )
 
     try:
         incoming_message = parse_stream_event(payload)

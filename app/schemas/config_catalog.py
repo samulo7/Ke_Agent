@@ -170,6 +170,15 @@ CONFIG_RULES: tuple[ConfigRule, ...] = (
         remediation="Set DINGTALK_OPENAPI_ENDPOINT to a valid DingTalk OpenAPI base URL.",
     ),
     ConfigRule(
+        key="DINGTALK_LEGACY_OPENAPI_ENDPOINT",
+        category="dingtalk",
+        required=False,
+        default="https://oapi.dingtalk.com",
+        parser=parse_str,
+        description="Legacy DingTalk OpenAPI endpoint for topapi approval creation.",
+        remediation="Set DINGTALK_LEGACY_OPENAPI_ENDPOINT to a valid DingTalk legacy OpenAPI base URL.",
+    ),
+    ConfigRule(
         key="DINGTALK_CARD_TEMPLATE_ID",
         category="dingtalk",
         required=False,
@@ -179,6 +188,18 @@ CONFIG_RULES: tuple[ConfigRule, ...] = (
         remediation=(
             "Set DINGTALK_CARD_TEMPLATE_ID to an interactive card template id with fixed "
             "`confirm_request` / `cancel_request` request buttons."
+        ),
+    ),
+    ConfigRule(
+        key="DINGTALK_LEAVE_CARD_TEMPLATE_ID",
+        category="dingtalk",
+        required=False,
+        default="",
+        parser=parse_str,
+        description="Optional template id for leave confirmation card; falls back to DINGTALK_CARD_TEMPLATE_ID when empty.",
+        remediation=(
+            "Set DINGTALK_LEAVE_CARD_TEMPLATE_ID to a leave-specific interactive card template id "
+            "when leave and file confirmation cards need different visual text/layout."
         ),
     ),
     ConfigRule(
@@ -204,6 +225,78 @@ CONFIG_RULES: tuple[ConfigRule, ...] = (
             "Set DINGTALK_HR_CARD_TEMPLATE_ID to an approval card template id with fixed "
             "`approve` / `reject` callback actions."
         ),
+    ),
+    ConfigRule(
+        key="DINGTALK_LEAVE_APPROVAL_ENABLED",
+        category="dingtalk",
+        required=False,
+        default="false",
+        parser=parse_bool,
+        description="Enable DingTalk leave approval creation after explicit confirmation.",
+        remediation="Set DINGTALK_LEAVE_APPROVAL_ENABLED to true/false.",
+    ),
+    ConfigRule(
+        key="DINGTALK_LEAVE_APPROVAL_PROCESS_CODE",
+        category="dingtalk",
+        required=False,
+        default="",
+        parser=parse_str,
+        description="DingTalk approval process code for leave submission.",
+        remediation="Set DINGTALK_LEAVE_APPROVAL_PROCESS_CODE to your leave approval process code.",
+    ),
+    ConfigRule(
+        key="DINGTALK_LEAVE_APPROVAL_TYPE_FIELD",
+        category="dingtalk",
+        required=False,
+        default="",
+        parser=parse_str,
+        description="Form component name for leave type.",
+        remediation="Set DINGTALK_LEAVE_APPROVAL_TYPE_FIELD to the leave type field name in the approval form.",
+    ),
+    ConfigRule(
+        key="DINGTALK_LEAVE_APPROVAL_START_TIME_FIELD",
+        category="dingtalk",
+        required=False,
+        default="",
+        parser=parse_str,
+        description="Form component name for leave start time.",
+        remediation="Set DINGTALK_LEAVE_APPROVAL_START_TIME_FIELD to the leave start time field name in the approval form.",
+    ),
+    ConfigRule(
+        key="DINGTALK_LEAVE_APPROVAL_END_TIME_FIELD",
+        category="dingtalk",
+        required=False,
+        default="",
+        parser=parse_str,
+        description="Form component name for leave end time.",
+        remediation="Set DINGTALK_LEAVE_APPROVAL_END_TIME_FIELD to the leave end time field name in the approval form.",
+    ),
+    ConfigRule(
+        key="DINGTALK_LEAVE_APPROVAL_REASON_FIELD",
+        category="dingtalk",
+        required=False,
+        default="",
+        parser=parse_str,
+        description="Optional form component name for leave reason.",
+        remediation="Set DINGTALK_LEAVE_APPROVAL_REASON_FIELD when your leave approval form includes a reason field.",
+    ),
+    ConfigRule(
+        key="DINGTALK_LEAVE_APPROVAL_APPLICANT_FIELD",
+        category="dingtalk",
+        required=False,
+        default="",
+        parser=parse_str,
+        description="Optional form component name for applicant display name.",
+        remediation="Set DINGTALK_LEAVE_APPROVAL_APPLICANT_FIELD when your leave approval form includes an applicant field.",
+    ),
+    ConfigRule(
+        key="DINGTALK_LEAVE_APPROVAL_DEPARTMENT_FIELD",
+        category="dingtalk",
+        required=False,
+        default="",
+        parser=parse_str,
+        description="Optional form component name for department.",
+        remediation="Set DINGTALK_LEAVE_APPROVAL_DEPARTMENT_FIELD when your leave approval form includes a department field.",
     ),
     ConfigRule(
         key="DINGTALK_CARD_CALLBACK_DEBUG",

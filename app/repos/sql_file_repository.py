@@ -5,12 +5,16 @@ import sqlite3
 from typing import Any
 
 from app.repos.file_repository import FileRepository
-from app.schemas.file_asset import FileAsset, FileSearchResult, FileVariant
+from app.schemas.file_asset import FileAsset, FileSearchCandidate, FileSearchResult, FileVariant
 from app.schemas.user_context import UserContext
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]{2,}")
 _STOP_TOKENS = (
+    "请帮我申请",
+    "帮我申请",
+    "请申请",
+    "申请",
     "请帮我",
     "帮我",
     "我想要",
@@ -158,19 +162,28 @@ class SQLFileRepository(FileRepository):
             (variant,),
         ).fetchall()
 
-        best_asset: FileAsset | None = None
-        best_score = -1
+        scored_assets: list[tuple[int, FileAsset]] = []
         for row in rows:
             asset = self._row_to_asset(row)
             score = _score_asset(query_text=query_text, asset=asset)
-            if score > best_score:
-                best_score = score
-                best_asset = asset
+            if score > 0:
+                scored_assets.append((score, asset))
 
-        if best_asset is None or best_score <= 0:
+        if not scored_assets:
             return FileSearchResult.no_hit()
 
-        return FileSearchResult(matched=True, asset=best_asset, match_score=float(best_score))
+        scored_assets.sort(key=lambda item: item[0], reverse=True)
+        best_score, best_asset = scored_assets[0]
+        candidates = tuple(
+            FileSearchCandidate(asset=asset, match_score=float(score))
+            for score, asset in scored_assets[:5]
+        )
+        return FileSearchResult(
+            matched=True,
+            asset=best_asset,
+            match_score=float(best_score),
+            candidates=candidates,
+        )
 
     @staticmethod
     def _row_to_asset(row: Any) -> FileAsset:

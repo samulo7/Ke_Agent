@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Literal, Protocol
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from app.repos.file_repository import FileRepository
 from app.repos.in_memory_file_repository import InMemoryFileRepository
@@ -17,6 +18,8 @@ ApprovalStatus = Literal["awaiting_requester_confirmation", "pending", "delivere
 
 DEFAULT_APPROVER_USER_ID = "人事行政"
 PENDING_REMINDER_SECONDS = 5 * 60
+MULTI_MATCH_SELECTION_TIMEOUT_SECONDS = 5 * 60
+_SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 _SCAN_HINTS = ("扫描", "扫描件", "扫描版", "电子版", "pdf")
 _PAPER_HINTS = ("纸质", "纸质版", "纸质件", "原件")
@@ -121,6 +124,15 @@ class _MutableFileApprovalRecord:
         )
 
 
+@dataclass(frozen=True)
+class _MultiMatchSelectionState:
+    query_text: str
+    variant: FileVariant
+    fallback_from_scan_to_paper: bool
+    candidates: tuple[FileAsset, ...]
+    created_at: datetime
+
+
 class FileRequestService:
     """File request flow with requester confirmation and approval-before-delivery."""
 
@@ -138,6 +150,7 @@ class FileRequestService:
         self._now = now_provider or (lambda: datetime.now(timezone.utc))
         self._records_by_request_id: dict[str, _MutableFileApprovalRecord] = {}
         self._request_id_by_session: dict[str, str] = {}
+        self._selection_by_session: dict[str, _MultiMatchSelectionState] = {}
 
     @staticmethod
     def _session_key(*, conversation_id: str, sender_id: str) -> str:
@@ -148,6 +161,30 @@ class FileRequestService:
         request_id = self._request_id_by_session.get(key, "")
         record = self._records_by_request_id.get(request_id)
         return record is not None
+
+    def has_pending_selection(self, *, conversation_id: str, sender_id: str) -> bool:
+        key = self._session_key(conversation_id=conversation_id, sender_id=sender_id)
+        self._clear_expired_selection_state(key=key, now=self._now())
+        return key in self._selection_by_session
+
+    def clear_pending_selection(self, *, conversation_id: str, sender_id: str) -> None:
+        key = self._session_key(conversation_id=conversation_id, sender_id=sender_id)
+        self._selection_by_session.pop(key, None)
+
+    def is_selection_reply(self, *, conversation_id: str, sender_id: str, text: str) -> bool:
+        key = self._session_key(conversation_id=conversation_id, sender_id=sender_id)
+        self._clear_expired_selection_state(key=key, now=self._now())
+        state = self._selection_by_session.get(key)
+        if state is None:
+            return False
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return False
+        if self._is_cancel_query(text):
+            return True
+        if normalized.isdigit():
+            return True
+        return self._candidate_title_match_count(state=state, user_text=text) > 0
 
     def resolve_active_request_id(self, *, conversation_id: str, sender_id: str) -> str:
         key = self._session_key(conversation_id=conversation_id, sender_id=sender_id)
@@ -180,6 +217,22 @@ class FileRequestService:
         user_context: UserContext | None = None,
     ) -> ChatHandleResult:
         key = self._session_key(conversation_id=message.conversation_id, sender_id=message.sender_id)
+        now = self._now()
+        self._clear_expired_selection_state(key=key, now=now)
+        selection_state = self._selection_by_session.get(key)
+        if selection_state is not None:
+            selection_followup = self._handle_multi_match_selection_followup(
+                key=key,
+                state=selection_state,
+                user_text=query_text,
+                sender_id=message.sender_id,
+                conversation_id=message.conversation_id,
+                user_context=user_context,
+                now=now,
+            )
+            if selection_followup is not None:
+                return selection_followup
+
         request_id = self._request_id_by_session.get(key, "")
         existing = self._records_by_request_id.get(request_id)
         if existing is not None:
@@ -217,23 +270,28 @@ class FileRequestService:
                 ),
             )
 
-        request_id = f"file-req-{uuid4().hex[:12]}"
-        requester_name = self._resolve_requester_name(user_context=user_context, sender_id=message.sender_id)
-        record = _MutableFileApprovalRecord(
-            request_id=request_id,
-            requester_sender_id=message.sender_id,
-            requester_conversation_id=message.conversation_id,
-            requester_display_name=requester_name,
+        candidates = self._resolve_candidates_from_search(search_result=search_result)
+        if len(candidates) > 1:
+            self._selection_by_session[key] = _MultiMatchSelectionState(
+                query_text=query_text,
+                variant=selected_variant,
+                fallback_from_scan_to_paper=fallback,
+                candidates=candidates,
+                created_at=now,
+            )
+            return self._build_multi_match_result(state=self._selection_by_session[key], invalid_choice=False)
+
+        record = self._create_request_record(
+            key=key,
+            sender_id=message.sender_id,
+            conversation_id=message.conversation_id,
             query_text=query_text,
-            variant=selected_variant,
+            selected_variant=selected_variant,
             asset=search_result.asset,
             fallback_from_scan_to_paper=fallback,
-            approver_user_id=self._approver_user_id,
-            created_at=self._now(),
-            status="awaiting_requester_confirmation",
+            user_context=user_context,
+            created_at=now,
         )
-        self._records_by_request_id[request_id] = record
-        self._request_id_by_session[key] = request_id
 
         return ChatHandleResult(
             handled=False,
@@ -426,6 +484,167 @@ class FileRequestService:
         normalized = FileRequestService._normalize_text(text)
         return any(token in normalized for token in _CANCEL_HINTS)
 
+    @staticmethod
+    def _resolve_candidates_from_search(*, search_result: FileSearchResult) -> tuple[FileAsset, ...]:
+        if search_result.candidates:
+            unique: dict[str, FileAsset] = {}
+            for candidate in search_result.candidates:
+                unique[candidate.asset.file_id] = candidate.asset
+            if unique:
+                return tuple(unique.values())
+        if search_result.asset is not None:
+            return (search_result.asset,)
+        return ()
+
+    def _clear_expired_selection_state(self, *, key: str, now: datetime) -> None:
+        state = self._selection_by_session.get(key)
+        if state is None:
+            return
+        elapsed = int((now - state.created_at).total_seconds())
+        if elapsed <= MULTI_MATCH_SELECTION_TIMEOUT_SECONDS:
+            return
+        self._selection_by_session.pop(key, None)
+
+    def _candidate_title_match_count(self, *, state: _MultiMatchSelectionState, user_text: str) -> int:
+        normalized = self._normalize_text(user_text)
+        if not normalized:
+            return 0
+        count = 0
+        for asset in state.candidates:
+            title = self._normalize_text(asset.title)
+            if normalized in title or title in normalized:
+                count += 1
+        return count
+
+    def _resolve_candidate_by_input(self, *, state: _MultiMatchSelectionState, user_text: str) -> FileAsset | None:
+        normalized = self._normalize_text(user_text)
+        if not normalized:
+            return None
+        if normalized.isdigit():
+            index = int(normalized)
+            if 1 <= index <= len(state.candidates):
+                return state.candidates[index - 1]
+            return None
+
+        matched: list[FileAsset] = []
+        for asset in state.candidates:
+            title = self._normalize_text(asset.title)
+            if normalized in title or title in normalized:
+                matched.append(asset)
+        if len(matched) == 1:
+            return matched[0]
+        return None
+
+    def _looks_like_selection_input(self, *, state: _MultiMatchSelectionState, user_text: str) -> bool:
+        normalized = self._normalize_text(user_text)
+        if not normalized:
+            return False
+        if normalized.isdigit():
+            return True
+        return self._candidate_title_match_count(state=state, user_text=user_text) > 0
+
+    def _build_multi_match_result(
+        self,
+        *,
+        state: _MultiMatchSelectionState,
+        invalid_choice: bool,
+    ) -> ChatHandleResult:
+        lines = ["找到多个匹配文件，请确认："]
+        for index, asset in enumerate(state.candidates, start=1):
+            lines.append(f"{index}. {asset.title}")
+        hint = "请回复序号或完整文件名。"
+        if invalid_choice:
+            hint = "未识别到有效选择。请回复序号或完整文件名。"
+        lines.append(hint)
+        return ChatHandleResult(
+            handled=False,
+            reason="file_lookup_multiple_matches",
+            intent="file_request",
+            reply=AgentReply(channel="text", text="\n".join(lines)),
+        )
+
+    def _create_request_record(
+        self,
+        *,
+        key: str,
+        sender_id: str,
+        conversation_id: str,
+        query_text: str,
+        selected_variant: FileVariant,
+        asset: FileAsset,
+        fallback_from_scan_to_paper: bool,
+        user_context: UserContext | None,
+        created_at: datetime,
+    ) -> _MutableFileApprovalRecord:
+        request_id = f"file-req-{uuid4().hex[:12]}"
+        requester_name = self._resolve_requester_name(user_context=user_context, sender_id=sender_id)
+        record = _MutableFileApprovalRecord(
+            request_id=request_id,
+            requester_sender_id=sender_id,
+            requester_conversation_id=conversation_id,
+            requester_display_name=requester_name,
+            query_text=query_text,
+            variant=selected_variant,
+            asset=asset,
+            fallback_from_scan_to_paper=fallback_from_scan_to_paper,
+            approver_user_id=self._approver_user_id,
+            created_at=created_at,
+            status="awaiting_requester_confirmation",
+        )
+        self._records_by_request_id[request_id] = record
+        self._request_id_by_session[key] = request_id
+        return record
+
+    def _handle_multi_match_selection_followup(
+        self,
+        *,
+        key: str,
+        state: _MultiMatchSelectionState,
+        user_text: str,
+        sender_id: str,
+        conversation_id: str,
+        user_context: UserContext | None,
+        now: datetime,
+    ) -> ChatHandleResult | None:
+        if self._is_cancel_query(user_text):
+            self._selection_by_session.pop(key, None)
+            return ChatHandleResult(
+                handled=False,
+                reason="file_request_cancelled",
+                intent="file_request",
+                reply=AgentReply(channel="text", text="已取消本次文件选择。需要时可以重新发起。"),
+            )
+
+        selected_asset = self._resolve_candidate_by_input(state=state, user_text=user_text)
+        if selected_asset is not None:
+            self._selection_by_session.pop(key, None)
+            record = self._create_request_record(
+                key=key,
+                sender_id=sender_id,
+                conversation_id=conversation_id,
+                query_text=state.query_text,
+                selected_variant=state.variant,
+                asset=selected_asset,
+                fallback_from_scan_to_paper=state.fallback_from_scan_to_paper,
+                user_context=user_context,
+                created_at=now,
+            )
+            return ChatHandleResult(
+                handled=False,
+                reason="file_lookup_confirm_required",
+                intent="file_request",
+                reply=AgentReply(
+                    channel="interactive_card",
+                    interactive_card=self._build_requester_confirmation_card_payload(record=record),
+                ),
+            )
+
+        if self._looks_like_selection_input(state=state, user_text=user_text):
+            return self._build_multi_match_result(state=state, invalid_choice=True)
+
+        self._selection_by_session.pop(key, None)
+        return None
+
     def _handle_existing_request_followup(
         self,
         *,
@@ -578,7 +797,7 @@ class FileRequestService:
     def _format_time(value: datetime | None) -> str:
         if value is None:
             return "unknown"
-        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        return value.astimezone(_SHANGHAI_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S Asia/Shanghai")
 
     def _build_requester_confirmation_card_payload(self, *, record: _MutableFileApprovalRecord) -> dict[str, object]:
         variant_label = "扫描件" if record.variant == "scan" else "纸质版"

@@ -98,6 +98,11 @@ def validate_config(raw_env: Mapping[str, str]) -> ValidationResult:
     interactive_template_id = str(result.resolved.get("DINGTALK_CARD_TEMPLATE_ID", "") or "").strip()
     hr_approver_user_id = str(result.resolved.get("DINGTALK_HR_APPROVER_USER_ID", "") or "").strip()
     hr_template_id = str(result.resolved.get("DINGTALK_HR_CARD_TEMPLATE_ID", "") or "").strip()
+    leave_approval_enabled = bool(result.resolved.get("DINGTALK_LEAVE_APPROVAL_ENABLED", False))
+    leave_approval_process_code = str(result.resolved.get("DINGTALK_LEAVE_APPROVAL_PROCESS_CODE", "") or "").strip()
+    leave_approval_type_field = str(result.resolved.get("DINGTALK_LEAVE_APPROVAL_TYPE_FIELD", "") or "").strip()
+    leave_approval_start_time_field = str(result.resolved.get("DINGTALK_LEAVE_APPROVAL_START_TIME_FIELD", "") or "").strip()
+    leave_approval_end_time_field = str(result.resolved.get("DINGTALK_LEAVE_APPROVAL_END_TIME_FIELD", "") or "").strip()
     ai_streaming_enabled = bool(result.resolved.get("DINGTALK_AI_CARD_STREAMING_ENABLED", False))
     ai_streaming_template_id = str(result.resolved.get("DINGTALK_AI_CARD_TEMPLATE_ID", "") or "").strip()
     ai_streaming_content_key = str(result.resolved.get("DINGTALK_AI_CARD_CONTENT_KEY", "") or "").strip()
@@ -156,6 +161,39 @@ def validate_config(raw_env: Mapping[str, str]) -> ValidationResult:
                     "Set both DINGTALK_HR_APPROVER_USER_ID and DINGTALK_HR_CARD_TEMPLATE_ID, "
                     "or leave both empty to disable HR approval card delivery."
                 ),
+            )
+        )
+    if leave_approval_enabled:
+        required_leave_pairs = (
+            ("DINGTALK_LEAVE_APPROVAL_PROCESS_CODE", leave_approval_process_code),
+            ("DINGTALK_LEAVE_APPROVAL_TYPE_FIELD", leave_approval_type_field),
+            ("DINGTALK_LEAVE_APPROVAL_START_TIME_FIELD", leave_approval_start_time_field),
+            ("DINGTALK_LEAVE_APPROVAL_END_TIME_FIELD", leave_approval_end_time_field),
+        )
+        for key, value in required_leave_pairs:
+            if value:
+                continue
+            result.errors.append(
+                ConfigIssue(
+                    key=key,
+                    code="MISSING_REQUIRED_WHEN_ENABLED",
+                    message=f"{key} is required when DINGTALK_LEAVE_APPROVAL_ENABLED=true.",
+                    remediation=(
+                        f"Set {key} to the mapped DingTalk leave approval value, "
+                        "or disable DINGTALK_LEAVE_APPROVAL_ENABLED."
+                    ),
+                )
+            )
+    elif any((leave_approval_process_code, leave_approval_type_field, leave_approval_start_time_field, leave_approval_end_time_field)):
+        result.warnings.append(
+            ConfigIssue(
+                key="DINGTALK_LEAVE_APPROVAL_ENABLED",
+                code="DISABLED_FEATURE_CONFIG_PRESENT",
+                message=(
+                    "Leave approval config is present but DINGTALK_LEAVE_APPROVAL_ENABLED is false; "
+                    "manual OA handoff will remain active."
+                ),
+                remediation="Set DINGTALK_LEAVE_APPROVAL_ENABLED=true to activate direct approval creation.",
             )
         )
     if hr_template_id:

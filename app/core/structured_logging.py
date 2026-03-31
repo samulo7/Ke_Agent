@@ -11,6 +11,31 @@ class JsonObservabilityFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         obs: dict[str, Any] = getattr(record, "obs", {})
+        reserved_keys = {
+            "module",
+            "trace_id",
+            "user_id",
+            "dept_id",
+            "intent",
+            "identity_source",
+            "is_degraded",
+            "source_ids",
+            "permission_decision",
+            "knowledge_version",
+            "answered_at",
+            "llm_trace",
+            "event",
+            "path",
+            "method",
+            "status_code",
+            "duration_ms",
+            "error_category",
+        }
+        extra_obs = {
+            key: value
+            for key, value in obs.items()
+            if key not in reserved_keys
+        }
         payload = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
@@ -33,6 +58,7 @@ class JsonObservabilityFormatter(logging.Formatter):
             "duration_ms": obs.get("duration_ms"),
             "error_category": obs.get("error_category"),
         }
+        payload.update(extra_obs)
         return json.dumps(payload, ensure_ascii=False)
 
 

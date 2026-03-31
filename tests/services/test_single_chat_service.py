@@ -7,12 +7,13 @@ from datetime import datetime, timedelta, timezone
 from app.rag.knowledge_retriever import KnowledgeRetriever
 from app.repos.sql_knowledge_repository import SQLKnowledgeRepository, bootstrap_sqlite_schema
 from app.schemas.dingtalk_chat import AgentReply, ChatHandleResult, IncomingChatMessage
-from app.schemas.file_asset import FileAsset, FileSearchResult
+from app.schemas.file_asset import FileAsset, FileSearchCandidate, FileSearchResult
 from app.schemas.llm import IntentInferenceResult, OrchestratorShadowResult
 from app.schemas.user_context import UserContext
 from app.services.document_request_draft import DocumentRequestDraftOrchestrator
 from app.services.file_request import FileRequestService
 from app.services.intent_classifier import IntentClassification
+from app.services.leave_request import LeaveApprovalResult, LeaveRequestOrchestrator
 from app.services.knowledge_answering import KnowledgeAnswerService
 from app.services.single_chat import SingleChatService
 from app.services.tone_resolver import ToneResolver
@@ -55,6 +56,15 @@ class _StubFileRequestService:
         )
 
 
+class _StubLeaveApprovalCreator:
+    def __init__(self, result: LeaveApprovalResult) -> None:
+        self._result = result
+
+    def submit(self, submission):  # type: ignore[no-untyped-def]
+        self.submission = submission
+        return self._result
+
+
 class _AlwaysHitFileRepository:
     def __init__(self) -> None:
         self._scan_asset = FileAsset(
@@ -81,6 +91,53 @@ class _AlwaysHitFileRepository:
     def search(self, *, query_text: str, variant: str, requester_context=None):  # type: ignore[no-untyped-def]
         asset = self._scan_asset if variant == "scan" else self._paper_asset
         return FileSearchResult(matched=True, match_score=0.99, asset=asset)
+
+
+class _MultiHitFileRepository:
+    def __init__(self) -> None:
+        self._assets = (
+            FileAsset(
+                file_id="file-1",
+                contract_key="dingyingqi_contract",
+                title="定影器采购合同-2024版",
+                variant="scan",
+                file_url="https://example.local/files/dingyingqi-contract-2024-scan",
+                tags=("采购", "合同", "定影器", "2024"),
+                status="active",
+                updated_at="2026-03-27",
+            ),
+            FileAsset(
+                file_id="file-2",
+                contract_key="printer_contract",
+                title="打印机采购合同-2023版",
+                variant="scan",
+                file_url="https://example.local/files/printer-contract-2023-scan",
+                tags=("采购", "合同", "打印机", "2023"),
+                status="active",
+                updated_at="2026-03-27",
+            ),
+            FileAsset(
+                file_id="file-3",
+                contract_key="copier_contract",
+                title="复印机采购合同-2024版",
+                variant="scan",
+                file_url="https://example.local/files/copier-contract-2024-scan",
+                tags=("采购", "合同", "复印机", "2024"),
+                status="active",
+                updated_at="2026-03-27",
+            ),
+        )
+
+    def search(self, *, query_text: str, variant: str, requester_context=None):  # type: ignore[no-untyped-def]
+        del query_text, requester_context
+        if variant != "scan":
+            return FileSearchResult.no_hit()
+        return FileSearchResult(
+            matched=True,
+            match_score=0.91,
+            asset=self._assets[0],
+            candidates=tuple(FileSearchCandidate(asset=asset, match_score=0.9 - index * 0.01) for index, asset in enumerate(self._assets)),
+        )
 
 
 class _StubLLMIntentService:
@@ -130,12 +187,12 @@ def make_message(
     )
 
 
-def make_user_context(*, user_id: str, dept_id: str) -> UserContext:
+def make_user_context(*, user_id: str, dept_id: str, dept_name: str | None = None) -> UserContext:
     return UserContext(
         user_id=user_id,
         user_name=user_id,
         dept_id=dept_id,
-        dept_name=dept_id,
+        dept_name=dept_name or dept_id,
         identity_source="openapi",
         is_degraded=False,
         resolved_at="2026-03-27T00:00:00+00:00",
@@ -342,6 +399,309 @@ class SingleChatServiceTests(unittest.TestCase):
         self.assertEqual("file_request", second.intent)
         self.assertEqual("file_lookup_confirm_required", second.reason)
 
+    def test_file_request_multi_match_returns_selection_text_without_confirmation_card(self) -> None:
+        service = SingleChatService(file_request_service=FileRequestService(file_repository=_MultiHitFileRepository()))
+        result = service.handle(
+            make_message(
+                text="我要采购合同",
+                conversation_id="conv-multi-route-1",
+                sender_id="user-multi-route-1",
+            )
+        )
+        self.assertEqual("file_request", result.intent)
+        self.assertEqual("file_lookup_multiple_matches", result.reason)
+        self.assertEqual("text", result.reply.channel)
+        self.assertIn("找到多个匹配文件", result.reply.text or "")
+
+    def test_pending_multi_match_selection_does_not_hijack_leave_intent(self) -> None:
+        clock = _FakeClock()
+        service = SingleChatService(
+            file_request_service=FileRequestService(
+                file_repository=_MultiHitFileRepository(),
+                now_provider=clock.now,
+            )
+        )
+        first = service.handle(
+            make_message(
+                text="我要采购合同",
+                conversation_id="conv-multi-route-2",
+                sender_id="user-multi-route-2",
+            )
+        )
+        self.assertEqual("file_lookup_multiple_matches", first.reason)
+
+        clock.advance(seconds=601)
+        second = service.handle(
+            make_message(
+                text="我要请假",
+                conversation_id="conv-multi-route-2",
+                sender_id="user-multi-route-2",
+            )
+        )
+        self.assertEqual("leave", second.intent)
+        self.assertEqual("leave_workflow_collecting", second.reason)
+        self.assertEqual("text", second.reply.channel)
+        self.assertIn("开始和结束时间", second.reply.text)
+
+    def test_leave_workflow_collects_then_requires_button_confirmation(self) -> None:
+        service = SingleChatService()
+        start = service.handle(
+            make_message(
+                text="我要请假",
+                conversation_id="conv-leave-1",
+                sender_id="user-leave-1",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+        self.assertEqual("leave_workflow_collecting", start.reason)
+        self.assertEqual("text", start.reply.channel)
+        self.assertIn("开始和结束时间", start.reply.text)
+
+        ready = service.handle(
+            make_message(
+                text="年假 2026-04-01 到 2026-04-02",
+                conversation_id="conv-leave-1",
+                sender_id="user-leave-1",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+        self.assertEqual("leave_workflow_ready", ready.reason)
+        self.assertEqual("leave_request_ready", ready.reply.interactive_card["card_type"])
+        self.assertNotIn("draft_fields", ready.reply.interactive_card)
+        self.assertIn("我将按年假", ready.reply.interactive_card["summary"])
+        self.assertEqual("leave_confirm_submit", ready.reply.interactive_card["actions"][0]["action"])
+        self.assertEqual("leave_cancel_submit", ready.reply.interactive_card["actions"][1]["action"])
+
+        text_confirm = service.handle(
+            make_message(
+                text="可以",
+                conversation_id="conv-leave-1",
+                sender_id="user-leave-1",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+        self.assertEqual("leave_workflow_waiting_button_action", text_confirm.reason)
+        self.assertEqual("text", text_confirm.reply.channel)
+        self.assertIn("点击卡片按钮", text_confirm.reply.text or "")
+
+    def test_leave_workflow_defaults_to_work_hours_when_time_missing(self) -> None:
+        service = SingleChatService()
+        service.handle(
+            make_message(
+                text="我要请假",
+                conversation_id="conv-leave-default-hours-1",
+                sender_id="user-leave-default-hours-1",
+            )
+        )
+        ready = service.handle(
+            make_message(
+                text="明天年假",
+                conversation_id="conv-leave-default-hours-1",
+                sender_id="user-leave-default-hours-1",
+            )
+        )
+        self.assertEqual("leave_workflow_ready", ready.reason)
+        summary = ready.reply.interactive_card["summary"]
+        self.assertIn("09:00", summary)
+        self.assertIn("18:00", summary)
+
+    def test_leave_workflow_parses_minghoutian_as_two_day_range(self) -> None:
+        clock = _FakeClock()
+        service = SingleChatService(
+            leave_request_orchestrator=LeaveRequestOrchestrator(now_provider=clock.now),
+        )
+        service.handle(
+            make_message(
+                text="我要请假",
+                conversation_id="conv-leave-minghoutian-1",
+                sender_id="user-leave-minghoutian-1",
+            )
+        )
+        ready = service.handle(
+            make_message(
+                text="明后天年假",
+                conversation_id="conv-leave-minghoutian-1",
+                sender_id="user-leave-minghoutian-1",
+            )
+        )
+        self.assertEqual("leave_workflow_ready", ready.reason)
+        summary = ready.reply.interactive_card["summary"]
+        self.assertIn("2026-03-28 09:00", summary)
+        self.assertIn("2026-03-29 18:00", summary)
+
+    def test_leave_workflow_submits_approval_when_creator_succeeds(self) -> None:
+        creator = _StubLeaveApprovalCreator(
+            LeaveApprovalResult(success=True, reason="submitted", process_instance_id="proc-1")
+        )
+        service = SingleChatService(
+            leave_request_orchestrator=LeaveRequestOrchestrator(approval_creator=creator),
+        )
+
+        service.handle(
+            make_message(
+                text="我要请假",
+                conversation_id="conv-leave-submit-1",
+                sender_id="user-leave-submit-1",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="1001", dept_name="财务部"),
+        )
+        service.handle(
+            make_message(
+                text="年假 2026-04-01 到 2026-04-02",
+                conversation_id="conv-leave-submit-1",
+                sender_id="user-leave-submit-1",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="1001", dept_name="财务部"),
+        )
+
+        submitted = service.handle_leave_confirmation_action_by_session(
+            action="leave_confirm_submit",
+            conversation_id="conv-leave-submit-1",
+            sender_id="user-leave-submit-1",
+        )
+        self.assertEqual("leave_workflow_submitted", submitted.reason)
+        self.assertEqual("text", submitted.reply.channel)
+        self.assertIn("已帮你发起", submitted.reply.text)
+        self.assertEqual("Alice", creator.submission.originator_user_id)
+        self.assertEqual("财务部", creator.submission.department)
+        self.assertEqual("1001", creator.submission.department_id)
+        self.assertEqual("年假", creator.submission.leave_type)
+        self.assertEqual("2026-04-01 09:00", creator.submission.leave_start_time)
+        self.assertEqual("2026-04-02 18:00", creator.submission.leave_end_time)
+
+    def test_leave_workflow_continues_collecting_when_time_is_ambiguous(self) -> None:
+        creator = _StubLeaveApprovalCreator(
+            LeaveApprovalResult(success=True, reason="submitted", process_instance_id="proc-1")
+        )
+        service = SingleChatService(
+            leave_request_orchestrator=LeaveRequestOrchestrator(approval_creator=creator),
+        )
+
+        service.handle(
+            make_message(
+                text="我要请假",
+                conversation_id="conv-leave-submit-ambiguous-1",
+                sender_id="user-leave-submit-ambiguous-1",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+        collecting = service.handle(
+            make_message(
+                text="请两天年假",
+                conversation_id="conv-leave-submit-ambiguous-1",
+                sender_id="user-leave-submit-ambiguous-1",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+
+        self.assertEqual("leave_workflow_collecting", collecting.reason)
+        self.assertEqual("text", collecting.reply.channel)
+        self.assertIn("请假时间", collecting.reply.text or "")
+        self.assertFalse(hasattr(creator, "submission"))
+
+    def test_leave_workflow_falls_back_when_creator_fails(self) -> None:
+        creator = _StubLeaveApprovalCreator(LeaveApprovalResult(success=False, reason="api_error"))
+        service = SingleChatService(
+            leave_request_orchestrator=LeaveRequestOrchestrator(approval_creator=creator),
+        )
+
+        service.handle(
+            make_message(
+                text="我要请假",
+                conversation_id="conv-leave-submit-2",
+                sender_id="user-leave-submit-2",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+        service.handle(
+            make_message(
+                text="年假 2026-04-01 到 2026-04-02",
+                conversation_id="conv-leave-submit-2",
+                sender_id="user-leave-submit-2",
+            ),
+            user_context=make_user_context(user_id="Alice", dept_id="Finance"),
+        )
+
+        fallback = service.handle_leave_confirmation_action_by_session(
+            action="leave_confirm_submit",
+            conversation_id="conv-leave-submit-2",
+            sender_id="user-leave-submit-2",
+        )
+        self.assertEqual("leave_workflow_handoff_fallback", fallback.reason)
+        self.assertEqual("text", fallback.reply.channel)
+        self.assertIn("暂时没能直接帮你发起钉钉审批", fallback.reply.text)
+        self.assertIn("OA审批", fallback.reply.text)
+
+    def test_leave_workflow_can_start_from_low_confidence_leave_text(self) -> None:
+        service = SingleChatService(
+            llm_intent_service=_StubLLMIntentService(intent="other", confidence=0.2),  # type: ignore[arg-type]
+            orchestrator_shadow_service=_StubShadowService(),  # type: ignore[arg-type]
+        )
+        result = service.handle(make_message(text="明天后天请两天年假"))
+        self.assertTrue(result.handled)
+        self.assertEqual("leave", result.intent)
+        self.assertEqual("leave_workflow_ready", result.reason)
+        self.assertEqual("leave_request_ready", result.reply.interactive_card["card_type"])
+        self.assertNotIn("draft_fields", result.reply.interactive_card)
+
+    def test_leave_workflow_times_out_before_confirm_button_click(self) -> None:
+        clock = _FakeClock()
+        service = SingleChatService(
+            leave_request_orchestrator=LeaveRequestOrchestrator(now_provider=clock.now),
+        )
+        start = service.handle(
+            make_message(
+                text="我要请假",
+                conversation_id="conv-leave-timeout-1",
+                sender_id="user-leave-timeout-1",
+            )
+        )
+        self.assertEqual("leave_workflow_collecting", start.reason)
+
+        service.handle(
+            make_message(
+                text="明天年假",
+                conversation_id="conv-leave-timeout-1",
+                sender_id="user-leave-timeout-1",
+            )
+        )
+
+        clock.advance(seconds=301)
+        timed_out = service.handle_leave_confirmation_action_by_session(
+            action="leave_confirm_submit",
+            conversation_id="conv-leave-timeout-1",
+            sender_id="user-leave-timeout-1",
+        )
+        self.assertEqual("leave_workflow_confirmation_expired", timed_out.reason)
+        self.assertEqual("text", timed_out.reply.channel)
+        self.assertIn("重新发送“我要请假”", timed_out.reply.text or "")
+
+    def test_leave_workflow_cancelled_by_button_action(self) -> None:
+        service = SingleChatService()
+        service.handle(
+            make_message(
+                text="我要请假",
+                conversation_id="conv-leave-cancel-1",
+                sender_id="user-leave-cancel-1",
+            )
+        )
+        service.handle(
+            make_message(
+                text="明天年假",
+                conversation_id="conv-leave-cancel-1",
+                sender_id="user-leave-cancel-1",
+            )
+        )
+
+        cancelled = service.handle_leave_confirmation_action_by_session(
+            action="leave_cancel_submit",
+            conversation_id="conv-leave-cancel-1",
+            sender_id="user-leave-cancel-1",
+        )
+        self.assertEqual("leave_workflow_cancelled", cancelled.reason)
+        self.assertEqual("text", cancelled.reply.channel)
+        self.assertIn("已取消", cancelled.reply.text or "")
+
     def test_returns_knowledge_text_answer_for_policy_question(self) -> None:
         service = SingleChatService()
         result = service.handle(make_message(text="宴请标准是什么"))
@@ -403,13 +763,31 @@ class SingleChatServiceTests(unittest.TestCase):
         self.assertIn("稍后再试", result.reply.text or "")
         self.assertIn("联系", result.reply.text or "")
 
-    def test_returns_flow_guidance_card_for_leave(self) -> None:
+    def test_returns_flow_guidance_text_for_leave(self) -> None:
         service = SingleChatService()
         result = service.handle(make_message(text="请假流程入口在哪"))
         self.assertTrue(result.handled)
-        self.assertEqual("interactive_card", result.reply.channel)
-        self.assertEqual("flow_guidance", result.reply.interactive_card["card_type"])
+        self.assertEqual("flow_guidance_text", result.reason)
+        self.assertEqual("text", result.reply.channel)
+        self.assertIn("OA审批", result.reply.text or "")
+        self.assertIn("我要请假", result.reply.text or "")
         self.assertEqual("leave", result.intent)
+
+    def test_plain_leave_word_starts_leave_workflow(self) -> None:
+        service = SingleChatService()
+        result = service.handle(make_message(text="请假"))
+        self.assertEqual("leave_workflow_collecting", result.reason)
+        self.assertEqual("leave", result.intent)
+        self.assertEqual("text", result.reply.channel)
+        self.assertIn("开始和结束时间", result.reply.text or "")
+
+    def test_natural_leave_phrase_with_duration_starts_leave_workflow(self) -> None:
+        service = SingleChatService()
+        result = service.handle(make_message(text="我要请一天的假，4月7号"))
+        self.assertEqual("leave_workflow_collecting", result.reason)
+        self.assertEqual("leave", result.intent)
+        self.assertEqual("text", result.reply.channel)
+        self.assertIn("请假类型", result.reply.text or "")
 
     def test_returns_flow_guidance_card_for_reimbursement(self) -> None:
         service = SingleChatService()
@@ -417,11 +795,14 @@ class SingleChatServiceTests(unittest.TestCase):
         self.assertTrue(result.handled)
         self.assertEqual("interactive_card", result.reply.channel)
         self.assertEqual("flow_guidance", result.reply.interactive_card["card_type"])
+        self.assertEqual("报销办理指引", result.reply.interactive_card["title"])
+        self.assertIn("报销模板", result.reply.interactive_card["primary_action"])
+        self.assertEqual("钉钉 > 工作台 > 审批 > 报销", result.reply.interactive_card["entry_point"])
         self.assertEqual("reimbursement", result.intent)
 
     def test_returns_application_draft_card(self) -> None:
         service = SingleChatService()
-        result = service.handle(make_message(text="我要申请项目资料"))
+        result = service.handle(make_message(text="我要申请项目资料权限"))
         self.assertTrue(result.handled)
         self.assertEqual("application_draft_collecting", result.reason)
         self.assertEqual("interactive_card", result.reply.channel)
@@ -432,7 +813,7 @@ class SingleChatServiceTests(unittest.TestCase):
         service = SingleChatService()
         start = service.handle(
             make_message(
-                text="我要申请采购制度文件",
+                text="我要申请采购制度文件权限",
                 conversation_id="conv-b14-1",
                 sender_id="user-b14-1",
             ),
@@ -469,7 +850,7 @@ class SingleChatServiceTests(unittest.TestCase):
         service = SingleChatService()
         start = service.handle(
             make_message(
-                text="我要申请采购制度文件",
+                text="我要申请采购制度文件权限",
                 conversation_id="conv-b14-purpose-1",
                 sender_id="user-b14-purpose-1",
             ),
@@ -494,7 +875,7 @@ class SingleChatServiceTests(unittest.TestCase):
         service = SingleChatService()
         service.handle(
             make_message(
-                text="我要申请采购制度文件",
+                text="我要申请采购制度文件权限",
                 conversation_id="conv-b14-2",
                 sender_id="user-b14-2",
             ),
@@ -520,7 +901,7 @@ class SingleChatServiceTests(unittest.TestCase):
 
         service.handle(
             make_message(
-                text="我要申请采购制度文件",
+                text="我要申请采购制度文件权限",
                 conversation_id="conv-b14-3",
                 sender_id="user-b14-3",
             )
@@ -538,7 +919,7 @@ class SingleChatServiceTests(unittest.TestCase):
 
         restarted = service.handle(
             make_message(
-                text="我要申请采购制度文件",
+                text="我要申请采购制度文件权限",
                 conversation_id="conv-b14-3",
                 sender_id="user-b14-3",
             )
@@ -549,7 +930,7 @@ class SingleChatServiceTests(unittest.TestCase):
         service = SingleChatService()
         service.handle(
             make_message(
-                text="我要申请采购制度文件",
+                text="我要申请采购制度文件权限",
                 conversation_id="conv-b14-4",
                 sender_id="user-b14-4",
             )

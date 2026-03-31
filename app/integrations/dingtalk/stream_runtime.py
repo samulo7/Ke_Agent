@@ -204,23 +204,26 @@ def _extract_card_text_lines(card_payload: Mapping[str, Any]) -> tuple[str, list
         "request_purpose": "申请用途",
         "expected_use_time": "期望使用时间",
         "suggested_approver": "建议审批对象",
+        "leave_type": "请假类型",
+        "leave_time": "请假时间",
+        "leave_reason": "请假事由",
+        "entry_point": "办理入口",
+        "required_materials": "准备材料",
     }
-    title = str(card_payload.get("title") or "Agent Reply Card")
+    title = str(card_payload.get("title") or "助手回复").strip() or "助手回复"
     lines: list[str] = []
 
     summary = card_payload.get("summary")
     if isinstance(summary, str) and summary.strip():
         lines.append(summary.strip())
 
-    question = card_payload.get("question")
-    if isinstance(question, str) and question.strip():
-        lines.append(f"Question: {question.strip()}")
+    primary_action = card_payload.get("primary_action")
+    if isinstance(primary_action, str) and primary_action.strip():
+        lines.append(f"建议动作：{primary_action.strip()}")
 
-    steps = card_payload.get("steps")
-    if isinstance(steps, list):
-        for index, step in enumerate(steps, start=1):
-            if isinstance(step, str) and step.strip():
-                lines.append(f"{index}. {step.strip()}")
+    context = card_payload.get("context")
+    if isinstance(context, str) and context.strip() and not lines:
+        lines.append(context.strip())
 
     draft_fields = card_payload.get("draft_fields")
     if isinstance(draft_fields, Mapping):
@@ -236,6 +239,28 @@ def _extract_card_text_lines(card_payload: Mapping[str, Any]) -> tuple[str, list
                 lines.append(f"【需细化】{label}: {text_value or '____'}")
             else:
                 lines.append(f"{label}: {text_value}")
+
+    for key in ("entry_point", "required_materials"):
+        value = card_payload.get(key)
+        if isinstance(value, str) and value.strip():
+            label = field_label_map.get(key, key)
+            lines.append(f"{label}：{value.strip()}")
+
+    process_path = card_payload.get("process_path")
+    if isinstance(process_path, list):
+        normalized_path = [str(item).strip() for item in process_path if str(item).strip()]
+        if normalized_path:
+            lines.append(f"流程路径：{' > '.join(normalized_path)}")
+
+    question = card_payload.get("question")
+    if isinstance(question, str) and question.strip() and not lines:
+        lines.append(question.strip())
+
+    steps = card_payload.get("steps")
+    if isinstance(steps, list):
+        for index, step in enumerate(steps, start=1):
+            if isinstance(step, str) and step.strip():
+                lines.append(f"{index}. {step.strip()}")
 
     actions = card_payload.get("actions")
     if not isinstance(actions, list):
@@ -256,12 +281,16 @@ def _extract_card_text_lines(card_payload: Mapping[str, Any]) -> tuple[str, list
         if action_labels:
             lines.append(f"可操作：{' / '.join(action_labels)}")
 
+    next_action = card_payload.get("next_action")
+    if isinstance(next_action, str) and next_action.strip():
+        lines.append(f"下一步：{next_action.strip()}")
+
     note = card_payload.get("note")
     if isinstance(note, str) and note.strip():
-        lines.append(f"Note: {note.strip()}")
+        lines.append(f"补充说明：{note.strip()}")
 
     if not lines:
-        lines.append("No structured card fields provided.")
+        lines.append("未提供结构化卡片内容。")
 
     return title, lines
 
@@ -393,12 +422,15 @@ def _build_action_card_param_map(
     title: str,
     lines: list[str],
 ) -> dict[str, str]:
+    card_type = str(card_payload.get("card_type") or "").strip()
+    workflow_type = "leave" if card_type == "leave_request_ready" else "file_request"
     summary = str(card_payload.get("summary") or "").strip()
     if not summary:
         summary = "\n".join(line for line in lines if line).strip()
 
     card_param_map: dict[str, Any] = {
         "summary": summary,
+        "workflow_type": workflow_type,
         # Explicit unlocked state for first delivery to make template visibility deterministic.
         "actions_locked": "false",
         "approval_status": "awaiting_requester_confirmation",
@@ -692,7 +724,8 @@ class _RequesterResultCardNotifier:
 
 
 def _is_template_driven_action_card(card_payload: Mapping[str, Any]) -> bool:
-    return str(card_payload.get("card_type") or "").strip() == "file_request_confirmation"
+    card_type = str(card_payload.get("card_type") or "").strip()
+    return card_type in {"file_request_confirmation", "leave_request_ready"}
 
 
 def _dump_stream_event_if_enabled(*, payload: Any, trace_id: str, logger: logging.Logger) -> None:
@@ -744,6 +777,118 @@ def _resolve_file_approval_action(
             sender_id=approval_action.get("sender_id", ""),
         )
     return approval_action, approval_outcome
+
+
+def _resolve_leave_confirmation_action(
+    *,
+    payload: Mapping[str, Any],
+    service: SingleChatService,
+) -> tuple[dict[str, str], Any] | None:
+    leave_action = _extract_leave_action_payload(payload)
+    if leave_action is None:
+        return None
+    leave_outcome = service.handle_leave_confirmation_action_by_session(
+        action=leave_action["action"],
+        conversation_id=leave_action.get("conversation_id", ""),
+        sender_id=leave_action.get("sender_id", ""),
+    )
+    return leave_action, leave_outcome
+
+
+def _build_leave_action_outcome_payload(
+    *,
+    leave_action: Mapping[str, str],
+    leave_outcome: Any,
+    replies: tuple[AgentReply, ...],
+) -> dict[str, Any]:
+    return {
+        "handled": leave_outcome.handled,
+        "reason": leave_outcome.reason,
+        "intent": "leave",
+        "channel": leave_outcome.reply.channel if replies else "none",
+        "replies": [reply.to_dict() for reply in replies],
+        "source_ids": [],
+        "permission_decision": "allow",
+        "knowledge_version": "",
+        "answered_at": "",
+        "citations": [],
+        "llm_trace": {},
+        "user_context": {
+            "user_id": leave_action.get("sender_id", "unknown") or "unknown",
+            "dept_id": "unknown",
+            "identity_source": "event_fallback",
+            "is_degraded": True,
+        },
+        "leave_action": leave_action.get("action", ""),
+        "leave_status": _resolve_leave_callback_status(leave_outcome=leave_outcome),
+    }
+
+
+def _resolve_leave_callback_status(*, leave_outcome: Any) -> str:
+    reason = str(leave_outcome.reason or "")
+    if reason == "leave_workflow_submitted":
+        return "submitted"
+    if reason == "leave_workflow_cancelled":
+        return "cancelled"
+    if reason in {"leave_workflow_not_found", "leave_workflow_confirmation_expired"}:
+        return "not_found"
+    if reason == "leave_workflow_handoff_fallback":
+        return "fallback"
+    if reason == "leave_workflow_handoff":
+        return "handoff"
+    return "pending"
+
+
+def _resolve_leave_callback_feedback_text(*, leave_outcome: Any, replies: tuple[AgentReply, ...]) -> str:
+    reason = str(leave_outcome.reason or "")
+    reason_text_map = {
+        "leave_workflow_submitted": "请假审批已提交。",
+        "leave_workflow_cancelled": "本次请假已取消。",
+        "leave_workflow_not_found": "未找到待确认请假，请重新发送“我要请假”。",
+        "leave_workflow_confirmation_expired": "请假确认已过期，请重新发送“我要请假”。",
+        "leave_workflow_handoff_fallback": "自动提交流程失败，请到 OA 审批入口手动提交。",
+    }
+    mapped = reason_text_map.get(reason)
+    if mapped:
+        return mapped
+    for reply in replies:
+        if reply.channel == "text":
+            text = (reply.text or "").strip()
+            if text:
+                return text
+    return "请假操作已处理。"
+
+
+def _build_leave_card_callback_response_payload(
+    *,
+    leave_action: Mapping[str, str],
+    leave_outcome: Any,
+    replies: tuple[AgentReply, ...],
+) -> dict[str, Any]:
+    status = _resolve_leave_callback_status(leave_outcome=leave_outcome)
+    feedback = _resolve_leave_callback_feedback_text(leave_outcome=leave_outcome, replies=replies)
+    actions_locked = status in {"submitted", "cancelled", "not_found", "fallback", "handoff"}
+    card_param_map = {
+        "leave_action": leave_action.get("action", ""),
+        "leave_status": status,
+        "approval_status": status,
+        "approval_message": feedback,
+        "summary": feedback,
+        "actions_locked": "true" if actions_locked else "false",
+    }
+    string_card_param_map = {key: _to_string_card_param_map_value(value) for key, value in card_param_map.items()}
+    return {
+        "cardUpdateOptions": {
+            "updateCardDataByKey": True,
+            "updatePrivateDataByKey": True,
+        },
+        "cardData": {
+            "cardParamMap": string_card_param_map,
+        },
+        "userPrivateData": {
+            "cardParamMap": string_card_param_map,
+        },
+    }
 
 
 def _build_file_approval_outcome_payload(
@@ -901,18 +1046,35 @@ def handle_single_chat_payload(
     sender: ReplySender,
     user_context_resolver: UserContextResolver,
 ) -> dict[str, Any]:
+    leave_resolution = _resolve_leave_confirmation_action(payload=payload, service=service)
+    if leave_resolution is not None:
+        leave_action, leave_outcome = leave_resolution
+        replies = leave_outcome.all_replies()
+        _dispatch_replies(sender=sender, replies=replies)
+        return _build_leave_action_outcome_payload(
+            leave_action=leave_action,
+            leave_outcome=leave_outcome,
+            replies=replies,
+        )
+
     approval_resolution = _resolve_file_approval_action(payload=payload, service=service)
     if approval_resolution is not None:
         approval_action, approval_outcome = approval_resolution
-        replies = approval_outcome.replies
-        if not replies and approval_outcome.reason == "file_approval_not_found":
-            replies = _build_approval_not_found_replies()
-        _dispatch_replies(sender=sender, replies=replies)
-        return _build_file_approval_outcome_payload(
-            approval_action=approval_action,
-            approval_outcome=approval_outcome,
-            replies=replies,
+        plain_text_single_chat = _is_plain_text_single_chat(
+            _collect_mapping_candidates(payload.get("data") if isinstance(payload.get("data"), Mapping) else payload)
         )
+        if not approval_action.get("request_id") and plain_text_single_chat and approval_outcome.reason == "file_approval_not_found":
+            approval_resolution = None
+        else:
+            replies = approval_outcome.replies
+            if not replies and approval_outcome.reason == "file_approval_not_found":
+                replies = _build_approval_not_found_replies()
+            _dispatch_replies(sender=sender, replies=replies)
+            return _build_file_approval_outcome_payload(
+                approval_action=approval_action,
+                approval_outcome=approval_outcome,
+                replies=replies,
+            )
 
     incoming_message = parse_stream_event(payload)
     user_context = user_context_resolver.resolve(incoming_message)
@@ -944,6 +1106,113 @@ def _dispatch_replies(*, sender: ReplySender, replies: tuple[AgentReply, ...]) -
             sender.send_interactive_card(reply.interactive_card or {})
 
 
+def _extract_leave_action_payload(payload: Mapping[str, Any]) -> dict[str, str] | None:
+    data = payload.get("data")
+    event = data if isinstance(data, Mapping) else payload
+    candidates = _collect_mapping_candidates(event)
+    leave_callback_context = _is_leave_callback_context(candidates)
+
+    action = ""
+    for candidate in candidates:
+        action_value = _pick_payload_string(
+            candidate,
+            (
+                "leave_action",
+                "leaveAction",
+                "action",
+                "action_name",
+                "actionName",
+                "button_text",
+                "buttonText",
+            ),
+        )
+        normalized_action = _normalize_leave_action_text(action_value, allow_file_alias=leave_callback_context)
+        if normalized_action:
+            action = normalized_action
+            break
+
+        parsed_private_action = _extract_leave_action_from_card_private_data(
+            candidate,
+            allow_file_alias=leave_callback_context,
+        )
+        if parsed_private_action:
+            action = parsed_private_action
+            break
+
+        button_id = _pick_payload_string(
+            candidate,
+            ("button_id", "buttonId", "action_id", "actionId", "id", "componentId", "component_id"),
+        )
+        normalized_button_action = _parse_leave_action_from_button_id(
+            button_id,
+            allow_file_alias=leave_callback_context,
+        )
+        if normalized_button_action:
+            action = normalized_button_action
+            break
+
+    if not action:
+        return None
+
+    conversation_id = _pick_string_from_candidates(
+        candidates,
+        (
+            "conversation_id",
+            "conversationId",
+            "cid",
+            "openConversationId",
+            "open_conversation_id",
+            "spaceId",
+            "space_id",
+            "openSpaceId",
+            "open_space_id",
+        ),
+    )
+    sender_id = _pick_string_from_candidates(
+        candidates,
+        ("sender_id", "senderStaffId", "senderId", "staffId", "userId", "user_id", "userid"),
+    )
+    return {
+        "action": action,
+        "conversation_id": conversation_id,
+        "sender_id": sender_id or "unknown",
+    }
+
+
+def _is_leave_callback_context(candidates: list[Mapping[str, Any]]) -> bool:
+    workflow_type = _pick_string_from_candidates(candidates, ("workflow_type", "workflowType")).strip().lower()
+    if workflow_type == "leave":
+        return True
+    out_track_id = _pick_string_from_candidates(candidates, ("outTrackId", "out_track_id")).strip().lower()
+    return out_track_id.startswith("leave-confirm-")
+
+
+def _parse_leave_action_from_button_id(button_id: str, *, allow_file_alias: bool) -> str:
+    raw = (button_id or "").strip()
+    if not raw:
+        return ""
+    head = raw.split("::", 1)[0]
+    return _normalize_leave_action_text(head, allow_file_alias=allow_file_alias)
+
+
+def _extract_leave_action_from_card_private_data(candidate: Mapping[str, Any], *, allow_file_alias: bool) -> str:
+    private_data = _extract_card_private_data_mapping(candidate)
+    if private_data is None:
+        return ""
+
+    action_ids = private_data.get("actionIds")
+    if isinstance(action_ids, list):
+        for item in action_ids:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            normalized = _parse_leave_action_from_button_id(item, allow_file_alias=allow_file_alias)
+            if normalized:
+                return normalized
+
+    action_value = _pick_payload_string(private_data, ("action", "action_name", "actionName"))
+    return _normalize_leave_action_text(action_value, allow_file_alias=allow_file_alias)
+
+
 def _extract_approval_action_payload(payload: Mapping[str, Any]) -> dict[str, str] | None:
     if _is_card_callback_debug_enabled():
         logging.getLogger(OBS_LOGGER_NAME).warning(
@@ -972,15 +1241,18 @@ def _extract_approval_action_payload(payload: Mapping[str, Any]) -> dict[str, st
                 "actionName",
                 "button_text",
                 "buttonText",
-                "text",
-                "content",
-                "title",
-                "name",
             ),
         )
         normalized_action = _normalize_approval_action_text(action_value)
         if normalized_action:
             action = normalized_action
+        if request_id and action:
+            break
+
+        text_action_value = _pick_payload_string(candidate, ("text", "content", "title", "name"))
+        normalized_text_action = _normalize_explicit_text_approval_action(text_action_value)
+        if normalized_text_action:
+            action = normalized_text_action
         if request_id and action:
             break
 
@@ -1008,7 +1280,17 @@ def _extract_approval_action_payload(payload: Mapping[str, Any]) -> dict[str, st
     )
     conversation_id = _pick_string_from_candidates(
         candidates,
-        ("conversation_id", "conversationId", "cid", "openConversationId", "open_conversation_id"),
+        (
+            "conversation_id",
+            "conversationId",
+            "cid",
+            "openConversationId",
+            "open_conversation_id",
+            "spaceId",
+            "space_id",
+            "openSpaceId",
+            "open_space_id",
+        ),
     )
     sender_id = _pick_string_from_candidates(
         candidates,
@@ -1037,6 +1319,17 @@ def _pick_string_from_candidates(candidates: list[Mapping[str, Any]], keys: tupl
         if value:
             return value
     return ""
+
+
+def _is_plain_text_single_chat(candidates: list[Mapping[str, Any]]) -> bool:
+    raw_conversation_type = _pick_string_from_candidates(candidates, ("conversation_type", "conversationType")).lower()
+    conversation_type = (
+        "single"
+        if raw_conversation_type in {"single", "single_chat", "1", "1v1", "private"}
+        else raw_conversation_type
+    )
+    message_type = _pick_string_from_candidates(candidates, ("message_type", "messageType", "msgtype")).lower()
+    return conversation_type == "single" and message_type == "text"
 
 
 def _parse_action_from_button_id(button_id: str) -> tuple[str, str] | None:
@@ -1114,6 +1407,32 @@ def _normalize_approval_action_text(raw: str) -> str:
         return "approve"
     if normalized in {"reject", "rejected", "refuse", "拒绝", "驳回"}:
         return "reject"
+    return ""
+
+
+def _normalize_leave_action_text(raw: str, *, allow_file_alias: bool = False) -> str:
+    normalized = "".join((raw or "").strip().lower().split())
+    if normalized in {"leave_confirm_submit", "leaveconfirmsubmit"}:
+        return "leave_confirm_submit"
+    if normalized in {"leave_cancel_submit", "leavecancelsubmit"}:
+        return "leave_cancel_submit"
+    if normalized in {"确认提交请假", "确认请假", "提交请假"}:
+        return "leave_confirm_submit"
+    if normalized in {"取消请假"}:
+        return "leave_cancel_submit"
+    if allow_file_alias and normalized == "confirm_request":
+        return "leave_confirm_submit"
+    if allow_file_alias and normalized == "cancel_request":
+        return "leave_cancel_submit"
+    return ""
+
+
+def _normalize_explicit_text_approval_action(raw: str) -> str:
+    normalized = "".join((raw or "").strip().lower().split())
+    if normalized in {"确认申请", "提交申请", "发起申请"}:
+        return "confirm_request"
+    if normalized in {"cancel_request", "cancel", "取消申请", "不用申请", "放弃申请", "先不申请"}:
+        return "cancel_request"
     return ""
 
 
@@ -1257,6 +1576,7 @@ class _SdkReplySender:
         ai_card_replier_cls: Any = None,
         streaming_card_settings: StreamingCardSettings | None = None,
         action_card_template_id: str | None = None,
+        leave_action_card_template_id: str | None = None,
         openapi_endpoint: str | None = None,
         async_sleep_fn: Callable[[float], Awaitable[Any]] = asyncio.sleep,
     ) -> None:
@@ -1280,6 +1600,11 @@ class _SdkReplySender:
             action_card_template_id
             if action_card_template_id is not None
             else str(os.getenv("DINGTALK_CARD_TEMPLATE_ID") or "").strip()
+        )
+        self._leave_action_card_template_id = (
+            leave_action_card_template_id
+            if leave_action_card_template_id is not None
+            else str(os.getenv("DINGTALK_LEAVE_CARD_TEMPLATE_ID") or "").strip()
         )
         endpoint = (
             openapi_endpoint
@@ -1320,7 +1645,11 @@ class _SdkReplySender:
             # Do not fallback to legacy request-button cards when card callback delivery
             # is unavailable; those cards may render but never produce callbacks.
             fallback_text_parts = [line.strip() for line in lines if isinstance(line, str) and line.strip()]
-            fallback_text_parts.append("请回复“确认申请”或“取消”。")
+            card_type = str(card_payload.get("card_type") or "").strip()
+            if card_type == "leave_request_ready":
+                fallback_text_parts.append("当前确认卡片回调不可用，请重新发送“我要请假”后重试，或前往 OA 审批提交。")
+            else:
+                fallback_text_parts.append("请回复“确认申请”或“取消”。")
             self._handler.reply_text("\n".join(fallback_text_parts), self._incoming_message)
             return
         if action_buttons:
@@ -1360,7 +1689,11 @@ class _SdkReplySender:
         title: str,
         lines: list[str],
     ) -> bool:
-        template_id = self._action_card_template_id.strip()
+        card_type = str(card_payload.get("card_type") or "").strip()
+        if card_type == "leave_request_ready":
+            template_id = self._leave_action_card_template_id.strip() or self._action_card_template_id.strip()
+        else:
+            template_id = self._action_card_template_id.strip()
         if not template_id:
             return False
         dingtalk_client = getattr(self._handler, "dingtalk_client", None)
@@ -1378,7 +1711,12 @@ class _SdkReplySender:
             self._logger.warning("action card createAndDeliver skipped: sender_staff_id is empty")
             return False
 
-        out_track_id = f"card-{uuid4().hex}"
+        if card_type == "leave_request_ready":
+            out_track_id = f"leave-confirm-{uuid4().hex}"
+        elif card_type == "file_request_confirmation":
+            out_track_id = f"file-confirm-{uuid4().hex}"
+        else:
+            out_track_id = f"card-{uuid4().hex}"
         card_param_map = _build_action_card_param_map(
             card_payload=card_payload,
             title=title,
@@ -1697,6 +2035,22 @@ def build_stream_client(
                     trace_id=trace_id,
                     logger=obs_logger,
                 )
+                leave_resolution = _resolve_leave_confirmation_action(payload=callback_message.data, service=service)
+                if leave_resolution is not None:
+                    leave_action, leave_outcome = leave_resolution
+                    leave_replies = leave_outcome.all_replies()
+                    outcome = _build_leave_action_outcome_payload(
+                        leave_action=leave_action,
+                        leave_outcome=leave_outcome,
+                        replies=leave_replies,
+                    )
+                    response_payload = _build_leave_card_callback_response_payload(
+                        leave_action=leave_action,
+                        leave_outcome=leave_outcome,
+                        replies=leave_replies,
+                    )
+                    return sdk.AckMessage.STATUS_OK, response_payload
+
                 approval_resolution = _resolve_file_approval_action(payload=callback_message.data, service=service)
                 if approval_resolution is None:
                     outcome = {

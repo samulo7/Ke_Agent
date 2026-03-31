@@ -25,8 +25,8 @@ _INTENT_SYSTEM_PROMPT = (
     "confidence范围0到1。"
     "规则：\n"
     "1) 规则解释/流程/入口/步骤/内容是什么 -> policy_process。\n"
-    "2) 申请受控文档权限/提交申请 -> document_request。\n"
-    "3) 明确要拿文件或下载链接（我想要/给我/发我/找+XX文件, XX文件在哪里看/下载）-> file_request。\n"
+    "2) 申请文档查看权限/调阅权限（如开通权限、访问权限、授权）-> document_request。\n"
+    "3) 明确要拿具体文件（包括“我要XX文件”“申请XX文件”“给我/发我/找/下载XX文件”）-> file_request。\n"
     "4) 报销相关 -> reimbursement。5) 请假相关 -> leave。6) 固定报价 -> fixed_quote。\n"
     "不确定时返回 other。"
 )

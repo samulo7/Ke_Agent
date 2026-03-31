@@ -4,12 +4,22 @@ from dataclasses import dataclass
 
 from app.schemas.dingtalk_chat import IntentType
 
-DOCUMENT_ACTION_KEYWORDS = ("申请", "调阅", "获取", "查看", "访问", "开通", "审批")
-DOCUMENT_TARGET_KEYWORDS = ("文档", "文件", "资料", "手册", "模板", "制度", "权限", "正文")
+DOCUMENT_ACTION_KEYWORDS = ("申请", "调阅", "查看", "访问", "开通", "授权")
+DOCUMENT_PERMISSION_KEYWORDS = (
+    "权限",
+    "开通",
+    "授权",
+    "调阅权限",
+    "访问权限",
+    "查看权限",
+    "阅读权限",
+)
+DOCUMENT_TARGET_KEYWORDS = ("文档", "文件", "资料", "手册", "模板", "制度", "正文", "合同", "协议")
 FILE_ACTION_KEYWORDS = (
     "找",
     "查",
     "检索",
+    "申请",
     "发我",
     "给我",
     "下载",
@@ -70,6 +80,9 @@ class IntentClassifier:
         return any(keyword in question for keyword in keywords)
 
     def _is_document_request(self, question: str) -> bool:
+        has_permission = self._contains_any(question, DOCUMENT_PERMISSION_KEYWORDS)
+        if not has_permission:
+            return False
         has_target = self._contains_any(question, DOCUMENT_TARGET_KEYWORDS)
         if not has_target:
             return False

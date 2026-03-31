@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import logging
+import re
 from typing import Any
 
 from app.schemas.dingtalk_chat import AgentReply, ChatHandleResult, IncomingChatMessage
@@ -12,6 +13,7 @@ from app.services.document_request_draft import DocumentRequestDraftOrchestrator
 from app.services.file_request import FileApprovalActionResult, FileRequestService
 from app.services.intent_classifier import IntentClassifier
 from app.services.knowledge_answering import KnowledgeAnswerService, build_default_knowledge_answer_service
+from app.services.leave_request import LeaveRequestOrchestrator, build_default_leave_request_orchestrator
 from app.services.llm_intent import LLMIntentService, build_default_llm_intent_service
 from app.services.llm_orchestrator_shadow import LLMOrchestratorShadowService, build_default_orchestrator_shadow_service
 
@@ -48,6 +50,7 @@ PENDING_FILE_CONTEXT_HINTS = {
     "好了没",
     "状态",
 }
+_LEAVE_ACTION_PHRASE_PATTERN = re.compile(r"请[^，。！？,.!?]{0,8}假")
 
 
 class SingleChatService:
@@ -60,6 +63,7 @@ class SingleChatService:
         knowledge_answer_service: KnowledgeAnswerService | None = None,
         document_request_orchestrator: DocumentRequestDraftOrchestrator | None = None,
         file_request_service: FileRequestService | None = None,
+        leave_request_orchestrator: LeaveRequestOrchestrator | None = None,
         llm_intent_service: LLMIntentService | None = None,
         orchestrator_shadow_service: LLMOrchestratorShadowService | None = None,
     ) -> None:
@@ -67,6 +71,7 @@ class SingleChatService:
         self._knowledge_answer_service = knowledge_answer_service or build_default_knowledge_answer_service()
         self._document_request_orchestrator = document_request_orchestrator or DocumentRequestDraftOrchestrator()
         self._file_request_service = file_request_service or FileRequestService()
+        self._leave_request_orchestrator = leave_request_orchestrator or build_default_leave_request_orchestrator()
         self._llm_intent_service = llm_intent_service or build_default_llm_intent_service(
             fallback_classifier=self._intent_classifier
         )
@@ -118,15 +123,47 @@ class SingleChatService:
                 ),
             )
 
-        draft_continuation = self._document_request_orchestrator.handle(
-            conversation_id=message.conversation_id,
-            sender_id=message.sender_id,
-            text=question,
-            user_context=user_context,
-            force_start=False,
-        )
-        if draft_continuation is not None:
-            return draft_continuation
+        rule_hint_intent = self._intent_classifier.classify(question).intent
+        if rule_hint_intent != "file_request":
+            draft_continuation = self._document_request_orchestrator.handle(
+                conversation_id=message.conversation_id,
+                sender_id=message.sender_id,
+                text=question,
+                user_context=user_context,
+                force_start=False,
+            )
+            if draft_continuation is not None:
+                return draft_continuation
+
+        has_pending_selection = getattr(self._file_request_service, "has_pending_selection", None)
+        is_selection_reply = getattr(self._file_request_service, "is_selection_reply", None)
+        pending_selection = False
+        if callable(has_pending_selection):
+            pending_selection = bool(
+                has_pending_selection(
+                    conversation_id=message.conversation_id,
+                    sender_id=message.sender_id,
+                )
+            )
+            if pending_selection and callable(is_selection_reply):
+                if is_selection_reply(
+                    conversation_id=message.conversation_id,
+                    sender_id=message.sender_id,
+                    text=question,
+                ):
+                    result = self._file_request_service.handle(
+                        message=message,
+                        query_text=question,
+                        user_context=user_context,
+                    )
+                    llm_trace["orchestrator_shadow"] = self._orchestrator_shadow_service.suggest(
+                        question=question,
+                        intent="file_request",
+                        rule_action="file_request",
+                        conversation_id=message.conversation_id,
+                        sender_id=message.sender_id,
+                    ).to_trace()
+                    return self._apply_llm_trace(result=result, llm_trace=llm_trace)
 
         has_pending_request = getattr(self._file_request_service, "has_pending_request", None)
         if callable(has_pending_request):
@@ -145,6 +182,23 @@ class SingleChatService:
                         sender_id=message.sender_id,
                     ).to_trace()
                     return self._apply_llm_trace(result=result, llm_trace=llm_trace)
+
+        leave_continuation = self._leave_request_orchestrator.handle(
+            conversation_id=message.conversation_id,
+            sender_id=message.sender_id,
+            text=question,
+            user_context=user_context,
+            force_start=False,
+        )
+        if leave_continuation is not None:
+            llm_trace["orchestrator_shadow"] = self._orchestrator_shadow_service.suggest(
+                question=question,
+                intent="leave",
+                rule_action="flow_guidance",
+                conversation_id=message.conversation_id,
+                sender_id=message.sender_id,
+            ).to_trace()
+            return self._apply_llm_trace(result=leave_continuation, llm_trace=llm_trace)
 
         if self._is_ambiguous_question(question):
             return ChatHandleResult(
@@ -168,6 +222,18 @@ class SingleChatService:
         )
         llm_trace["intent"] = intent_result.to_trace()
         intent = intent_result.intent
+
+        if pending_selection and intent != "file_request":
+            clear_pending_selection = getattr(self._file_request_service, "clear_pending_selection", None)
+            if callable(clear_pending_selection):
+                clear_pending_selection(
+                    conversation_id=message.conversation_id,
+                    sender_id=message.sender_id,
+                )
+
+        if intent == "other" and self._should_start_leave_workflow(question=question):
+            intent = "leave"
+            llm_trace["intent"] = {**llm_trace["intent"], "intent": intent, "reason": "leave_workflow_heuristic"}
 
         if (
             intent == "other"
@@ -228,14 +294,40 @@ class SingleChatService:
             )
             return self._apply_llm_trace(result=result, llm_trace=llm_trace)
 
-        if intent in {"reimbursement", "leave"}:
+        if intent == "leave":
+            if self._should_start_leave_workflow(question=question):
+                result = self._leave_request_orchestrator.handle(
+                    conversation_id=message.conversation_id,
+                    sender_id=message.sender_id,
+                    text=question,
+                    user_context=user_context,
+                    force_start=True,
+                ) or ChatHandleResult(
+                    handled=False,
+                    reason="leave_workflow_incomplete",
+                    intent="leave",
+                    reply=AgentReply(channel="text", text="请假信息暂未收集成功，请重试。"),
+                )
+                return self._apply_llm_trace(result=result, llm_trace=llm_trace)
+            return ChatHandleResult(
+                handled=True,
+                reason="flow_guidance_text",
+                intent=intent,
+                reply=AgentReply(
+                    channel="text",
+                    text=self._build_leave_flow_guidance_text(),
+                ),
+                llm_trace=llm_trace,
+            )
+
+        if intent == "reimbursement":
             return ChatHandleResult(
                 handled=True,
                 reason="flow_guidance_card",
                 intent=intent,
                 reply=AgentReply(
                     channel="interactive_card",
-                    interactive_card=self._build_flow_guidance_card(question),
+                    interactive_card=self._build_flow_guidance_card(intent=intent, question=question),
                 ),
                 llm_trace=llm_trace,
             )
@@ -334,6 +426,19 @@ class SingleChatService:
             status=None,
         )
 
+    def handle_leave_confirmation_action_by_session(
+        self,
+        *,
+        action: str,
+        conversation_id: str,
+        sender_id: str,
+    ) -> ChatHandleResult:
+        return self._leave_request_orchestrator.handle_confirmation_action_by_session(
+            action=action,
+            conversation_id=conversation_id,
+            sender_id=sender_id,
+        )
+
     @staticmethod
     def _to_access_context(user_context: UserContext | None) -> KnowledgeAccessContext | None:
         if user_context is None:
@@ -344,18 +449,45 @@ class SingleChatService:
         )
 
     @staticmethod
-    def _build_flow_guidance_card(question: str) -> dict[str, Any]:
+    def _build_leave_flow_guidance_text() -> str:
+        return "请假入口在钉钉工作台 > OA审批 > 请假；也可以直接说“我要请假 + 时间 + 假别”，我按流程帮你发起。"
+
+    @staticmethod
+    def _build_flow_guidance_card(intent: str, question: str) -> dict[str, Any]:
+        normalized_question = question.strip()
+        if intent == "leave":
+            return {
+                "card_type": "flow_guidance",
+                "title": "请假申请指引",
+                "summary": "我可以先帮你判断入口；如果你是要实际办理，也可以直接说“我要请假”。",
+                "primary_action": "先到控制台/工作台进入 OA审批，选择“请假”后发起提交。",
+                "context": normalized_question,
+                "entry_point": "控制台/工作台 > OA审批 > 请假",
+                "required_materials": "提前确认假期类型、请假时间，并按模板补充必要说明。",
+                "process_path": [
+                    "控制台/工作台",
+                    "OA审批",
+                    "请假",
+                    "选择提交",
+                    "领导审批",
+                    "通过",
+                ],
+                "next_action": "如果你已经确定请假类型和时间，也可以直接告诉我，我先帮你整理提交草稿。",
+            }
         return {
             "card_type": "flow_guidance",
-            "title": "Process Guidance",
-            "question": question,
-            "summary": "Use the standard DingTalk approval process entry.",
-            "steps": [
-                "Open DingTalk > Workbench > Approvals.",
-                "Select the matching process template.",
-                "Prepare required materials and submit.",
+            "title": "报销办理指引",
+            "summary": "我先帮你收拢报销入口和关键动作，避免你去翻整套制度说明。",
+            "primary_action": "先到钉钉工作台进入“审批”，选择对应的报销模板发起办理。",
+            "context": normalized_question,
+            "entry_point": "钉钉 > 工作台 > 审批 > 报销",
+            "required_materials": "提前准备票据、金额和事由说明，按模板补全必填信息。",
+            "process_path": [
+                "选择报销模板",
+                "填写金额与事由",
+                "上传票据并提交",
             ],
-            "next_action": "If you need rule details, ask the specific process name.",
+            "next_action": "如果你不确定该选哪种报销类型，我可以继续帮你缩小到对应入口。",
         }
 
     @staticmethod
@@ -381,6 +513,85 @@ class SingleChatService:
         if normalized in LOW_CONFIDENCE_EXCLUSIONS:
             return False
         return self._contains_cjk(question)
+
+    def _should_start_leave_workflow(self, *, question: str) -> bool:
+        normalized = self._normalize(question)
+        if not normalized:
+            return False
+        if self._is_leave_information_query(question):
+            return False
+        leave_tokens = (
+            "请假",
+            "我要请假",
+            "我想请假",
+            "帮我请假",
+            "请帮我请假",
+            "发起请假",
+            "提交请假",
+            "请一天",
+            "请一天假",
+            "请一天的假",
+            "请两天",
+            "请两天假",
+            "请两天的假",
+            "请半天",
+            "年假",
+            "病假",
+            "事假",
+            "调休",
+        )
+        if any(token in normalized for token in leave_tokens):
+            return True
+        leave_action_hints = (
+            "我要",
+            "我想",
+            "帮我",
+            "发起",
+            "提交",
+            "年假",
+            "病假",
+            "事假",
+            "调休",
+            "婚假",
+            "产假",
+            "陪产假",
+            "丧假",
+            "今天",
+            "明天",
+            "后天",
+            "月",
+            "号",
+            "日",
+        )
+        return bool(_LEAVE_ACTION_PHRASE_PATTERN.search(normalized)) and any(
+            token in normalized for token in leave_action_hints
+        )
+
+    def _is_leave_information_query(self, question: str) -> bool:
+        normalized = self._normalize(question)
+        leave_scope_tokens = ("请假", "年假", "病假", "事假", "调休", "婚假", "产假", "陪产假", "丧假", "假期", "休假")
+        if not any(token in normalized for token in leave_scope_tokens):
+            return False
+        info_tokens = ("流程", "入口", "在哪", "怎么", "如何", "规则", "制度", "说明")
+        action_tokens = (
+            "我要",
+            "我想",
+            "帮我",
+            "发起",
+            "提交",
+            "请一天",
+            "请两天",
+            "请半天",
+            "今天",
+            "明天",
+            "后天",
+            "月",
+            "号",
+            "日",
+            "到",
+            "至",
+        )
+        return any(token in normalized for token in info_tokens) and not any(token in normalized for token in action_tokens)
 
     @staticmethod
     def _contains_cjk(text: str) -> bool:
