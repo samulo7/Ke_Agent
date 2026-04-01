@@ -41,8 +41,10 @@ from app.rag.knowledge_retriever import KnowledgeRetriever
 from app.repos.sql_knowledge_repository import SQLKnowledgeRepository, bootstrap_sqlite_schema
 from app.schemas.user_context import UserContext
 from app.schemas.file_asset import FileAsset, FileSearchCandidate, FileSearchResult
+from app.schemas.reimbursement import ReimbursementApprovalResult, ReimbursementAttachmentProcessResult, TravelApplication
 from app.services.file_request import FileApprovalRequest, FileRequestService
 from app.services.leave_request import LeaveApprovalResult, LeaveRequestOrchestrator
+from app.services.reimbursement_request import ReimbursementRequestOrchestrator
 from app.services.document_request_draft import DocumentRequestDraftOrchestrator
 from app.services.knowledge_answering import KnowledgeAnswerService
 from app.services.single_chat import SingleChatService
@@ -146,6 +148,42 @@ class _StubLeaveApprovalCreator:
         return self._result
 
 
+class _StubTravelApplicationProvider:
+    def __init__(self, items: list[TravelApplication] | None = None) -> None:
+        self._items = items or [
+            TravelApplication(process_instance_id="trip-1", start_date="2026-03-15", destination="北京", purpose="云亨售后"),
+            TravelApplication(process_instance_id="trip-2", start_date="2026-03-28", destination="上海", purpose=""),
+        ]
+
+    def list_recent_approved(self, *, originator_user_id: str, lookback_days: int, now: datetime) -> list[TravelApplication]:
+        del originator_user_id, lookback_days, now
+        return list(self._items)
+
+
+class _StubReimbursementAttachmentProcessor:
+    def __init__(self, result: ReimbursementAttachmentProcessResult | None = None) -> None:
+        self._result = result or ReimbursementAttachmentProcessResult(
+            success=True,
+            reason="processed",
+            department="总经办",
+            amount="106",
+            attachment_media_id="media-pdf-1",
+        )
+
+    def process(self, *, message, conversation_id: str, sender_id: str):  # type: ignore[no-untyped-def]
+        del message, conversation_id, sender_id
+        return self._result
+
+
+class _StubReimbursementApprovalCreator:
+    def __init__(self, result: ReimbursementApprovalResult) -> None:
+        self._result = result
+
+    def submit(self, submission):  # type: ignore[no-untyped-def]
+        self.submission = submission
+        return self._result
+
+
 class _FakeCardModule:
     @staticmethod
     def generate_multi_text_line_card_data(*, title: str, logo: str, texts: list[str]) -> dict[str, Any]:
@@ -230,8 +268,12 @@ def _make_payload(
     conversation_id: str = "conv-a05-001",
     sender_id: str = "user-a05-001",
     message_type: str = "text",
+    file_name: str = "",
+    file_download_url: str = "",
+    file_media_id: str = "",
+    file_content_base64: str = "",
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "event_id": "evt-a05-001",
         "conversation_id": conversation_id,
         "conversation_type": conversation_type,
@@ -239,6 +281,14 @@ def _make_payload(
         "message_type": message_type,
         "text": text,
     }
+    if message_type == "file":
+        payload["content"] = {
+            "fileName": file_name,
+            "downloadUrl": file_download_url,
+            "mediaId": file_media_id,
+            "contentBase64": file_content_base64,
+        }
+    return payload
 
 
 def _make_leave_callback_payload(
@@ -253,6 +303,23 @@ def _make_leave_callback_payload(
             "userId": sender_id,
             "extension": json.dumps({"openConversationId": conversation_id}, ensure_ascii=False),
             "content": json.dumps({"componentType": "button", "componentId": action_id}, ensure_ascii=False),
+        }
+    }
+
+
+def _make_reimbursement_callback_payload(
+    *,
+    action_id: str,
+    conversation_id: str,
+    sender_id: str,
+) -> dict[str, Any]:
+    return {
+        "data": {
+            "type": "actionCallback",
+            "userId": sender_id,
+            "extension": json.dumps({"openConversationId": conversation_id}, ensure_ascii=False),
+            "content": json.dumps({"componentType": "button", "componentId": action_id}, ensure_ascii=False),
+            "outTrackId": "reimbursement-confirm-test-1",
         }
     }
 
@@ -1787,6 +1854,7 @@ class StreamRuntimeTests(unittest.TestCase):
                 "context": "我要请假",
                 "entry_point": "控制台/工作台 > OA审批 > 请假",
                 "required_materials": "提前确认假期类型、请假时间，并按模板补充必要说明。",
+                "common_errors": ["未提前申请（需提前1天）", "假种选择错误"],
                 "process_path": ["控制台/工作台", "OA审批", "请假", "选择提交", "领导审批", "通过"],
                 "next_action": "如果你已经确定请假类型和时间，也可以直接告诉我，我先帮你整理提交草稿。",
             }
@@ -1798,6 +1866,7 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertNotIn("你的问题：我要请假", lines)
         self.assertIn("办理入口：控制台/工作台 > OA审批 > 请假", lines)
         self.assertIn("准备材料：提前确认假期类型、请假时间，并按模板补充必要说明。", lines)
+        self.assertIn("常见错误：未提前申请（需提前1天）；假种选择错误", lines)
         self.assertIn("流程路径：控制台/工作台 > OA审批 > 请假 > 选择提交 > 领导审批 > 通过", lines)
         self.assertIn("下一步：如果你已经确定请假类型和时间，也可以直接告诉我，我先帮你整理提交草稿。", lines)
 
@@ -2356,6 +2425,95 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertEqual("leave_workflow_waiting_button_action", third["reason"])
         self.assertEqual(2, len(sender.text_messages))
         self.assertIn("点击卡片按钮", sender.text_messages[-1])
+
+    def test_handle_single_chat_payload_reimbursement_workflow_with_callback_submit(self) -> None:
+        sender = _FakeSender()
+        resolver = self._build_resolver()
+        creator = _StubReimbursementApprovalCreator(
+            ReimbursementApprovalResult(success=True, reason="submitted", process_instance_id="proc-rmb-stream-1")
+        )
+        service = SingleChatService(
+            reimbursement_request_orchestrator=ReimbursementRequestOrchestrator(
+                travel_application_provider=_StubTravelApplicationProvider(),
+                attachment_processor=_StubReimbursementAttachmentProcessor(),
+                approval_creator=creator,
+            )
+        )
+
+        first = handle_single_chat_payload(
+            _make_payload(
+                text="我要报销差旅费",
+                conversation_id="conv-rmb-stream-1",
+                sender_id="user-rmb-stream-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertEqual("reimbursement_travel_collecting_trip", first["reason"])
+        self.assertEqual(1, len(sender.text_messages))
+        self.assertIn("你最近的出差申请", sender.text_messages[-1])
+
+        second = handle_single_chat_payload(
+            _make_payload(
+                text="1",
+                conversation_id="conv-rmb-stream-1",
+                sender_id="user-rmb-stream-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertEqual("reimbursement_travel_collecting_attachment", second["reason"])
+        self.assertIn("差旅费报销单（Excel）", sender.text_messages[-1])
+
+        third = handle_single_chat_payload(
+            _make_payload(
+                text="",
+                message_type="file",
+                conversation_id="conv-rmb-stream-1",
+                sender_id="user-rmb-stream-1",
+                file_name="差旅费报销单.xlsx",
+                file_content_base64="ZmFrZQ==",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertEqual("reimbursement_travel_collecting_company", third["reason"])
+        self.assertIn("部门：总经办", sender.text_messages[-1])
+
+        fourth = handle_single_chat_payload(
+            _make_payload(
+                text="SY",
+                conversation_id="conv-rmb-stream-1",
+                sender_id="user-rmb-stream-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertEqual("reimbursement_travel_ready", fourth["reason"])
+        self.assertEqual("reimbursement_request_ready", sender.card_payloads[-1]["card_type"])
+
+        fifth = handle_single_chat_payload(
+            _make_reimbursement_callback_payload(
+                action_id="reimbursement_confirm_submit",
+                conversation_id="conv-rmb-stream-1",
+                sender_id="user-rmb-stream-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertEqual("reimbursement_travel_submitted", fifth["reason"])
+        self.assertEqual("reimbursement", fifth["intent"])
+        self.assertEqual("reimbursement_confirm_submit", fifth["reimbursement_action"])
+        self.assertEqual("submitted", fifth["reimbursement_status"])
+        self.assertIn("已提交，审批中", sender.text_messages[-1])
+        self.assertEqual("trip-1", creator.submission.travel_process_instance_id)
+        self.assertEqual("YXQY", creator.submission.fixed_company)
+        self.assertEqual("SY", creator.submission.cost_company)
 
     def test_handle_single_chat_payload_leave_confirm_button_submits_text(self) -> None:
         sender = _FakeSender()

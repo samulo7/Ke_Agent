@@ -103,6 +103,10 @@ def validate_config(raw_env: Mapping[str, str]) -> ValidationResult:
     leave_approval_type_field = str(result.resolved.get("DINGTALK_LEAVE_APPROVAL_TYPE_FIELD", "") or "").strip()
     leave_approval_start_time_field = str(result.resolved.get("DINGTALK_LEAVE_APPROVAL_START_TIME_FIELD", "") or "").strip()
     leave_approval_end_time_field = str(result.resolved.get("DINGTALK_LEAVE_APPROVAL_END_TIME_FIELD", "") or "").strip()
+    reimburse_approval_enabled = bool(result.resolved.get("DINGTALK_REIMBURSE_APPROVAL_ENABLED", False))
+    reimburse_approval_process_code = str(result.resolved.get("DINGTALK_REIMBURSE_APPROVAL_PROCESS_CODE", "") or "").strip()
+    travel_lookup_enabled = bool(result.resolved.get("DINGTALK_REIMBURSE_TRAVEL_LOOKUP_ENABLED", False))
+    travel_approval_process_code = str(result.resolved.get("DINGTALK_TRAVEL_APPROVAL_PROCESS_CODE", "") or "").strip()
     ai_streaming_enabled = bool(result.resolved.get("DINGTALK_AI_CARD_STREAMING_ENABLED", False))
     ai_streaming_template_id = str(result.resolved.get("DINGTALK_AI_CARD_TEMPLATE_ID", "") or "").strip()
     ai_streaming_content_key = str(result.resolved.get("DINGTALK_AI_CARD_CONTENT_KEY", "") or "").strip()
@@ -194,6 +198,45 @@ def validate_config(raw_env: Mapping[str, str]) -> ValidationResult:
                     "manual OA handoff will remain active."
                 ),
                 remediation="Set DINGTALK_LEAVE_APPROVAL_ENABLED=true to activate direct approval creation.",
+            )
+        )
+    if reimburse_approval_enabled and not reimburse_approval_process_code:
+        result.errors.append(
+            ConfigIssue(
+                key="DINGTALK_REIMBURSE_APPROVAL_PROCESS_CODE",
+                code="MISSING_REQUIRED_WHEN_ENABLED",
+                message="DINGTALK_REIMBURSE_APPROVAL_PROCESS_CODE is required when DINGTALK_REIMBURSE_APPROVAL_ENABLED=true.",
+                remediation=(
+                    "Set DINGTALK_REIMBURSE_APPROVAL_PROCESS_CODE to your reimbursement approval process code, "
+                    "or disable DINGTALK_REIMBURSE_APPROVAL_ENABLED."
+                ),
+            )
+        )
+    elif reimburse_approval_process_code:
+        result.warnings.append(
+            ConfigIssue(
+                key="DINGTALK_REIMBURSE_APPROVAL_ENABLED",
+                code="DISABLED_FEATURE_CONFIG_PRESENT",
+                message=(
+                    "Reimbursement approval config is present but DINGTALK_REIMBURSE_APPROVAL_ENABLED is false; "
+                    "auto submit remains disabled."
+                ),
+                remediation="Set DINGTALK_REIMBURSE_APPROVAL_ENABLED=true to activate reimbursement auto submission.",
+            )
+        )
+    if travel_lookup_enabled and not travel_approval_process_code:
+        result.errors.append(
+            ConfigIssue(
+                key="DINGTALK_TRAVEL_APPROVAL_PROCESS_CODE",
+                code="MISSING_REQUIRED_WHEN_ENABLED",
+                message=(
+                    "DINGTALK_TRAVEL_APPROVAL_PROCESS_CODE is required when "
+                    "DINGTALK_REIMBURSE_TRAVEL_LOOKUP_ENABLED=true."
+                ),
+                remediation=(
+                    "Set DINGTALK_TRAVEL_APPROVAL_PROCESS_CODE to your travel approval process code, "
+                    "or disable DINGTALK_REIMBURSE_TRAVEL_LOOKUP_ENABLED."
+                ),
             )
         )
     if hr_template_id:

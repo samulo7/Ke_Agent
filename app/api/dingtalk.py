@@ -209,12 +209,88 @@ def _extract_leave_confirmation_action(payload: Mapping[str, Any]) -> dict[str, 
     }
 
 
+def _extract_reimbursement_confirmation_action(payload: Mapping[str, Any]) -> dict[str, str] | None:
+    data = _extract_mapping(payload)
+    candidates = _collect_mapping_candidates(data)
+    reimbursement_context = _is_reimbursement_callback_context(candidates)
+
+    action = ""
+    for candidate in candidates:
+        action_value = _pick_string(
+            candidate,
+            (
+                "reimbursement_action",
+                "reimbursementAction",
+                "action",
+                "action_name",
+                "actionName",
+                "button_text",
+                "buttonText",
+            ),
+        )
+        normalized_action = _normalize_reimbursement_action_text(action_value, allow_alias=reimbursement_context)
+        if normalized_action:
+            action = normalized_action
+            break
+
+        parsed_private_action = _extract_reimbursement_action_from_card_private_data(
+            candidate,
+            allow_alias=reimbursement_context,
+        )
+        if parsed_private_action:
+            action = parsed_private_action
+            break
+
+        button_id = _pick_string(
+            candidate,
+            ("button_id", "buttonId", "action_id", "actionId", "id", "componentId", "component_id"),
+        )
+        parsed_action = _parse_reimbursement_action_from_button_id(button_id, allow_alias=reimbursement_context)
+        if parsed_action:
+            action = parsed_action
+            break
+
+    if not action:
+        return None
+
+    return {
+        "action": action,
+        "conversation_id": _pick_string_from_candidates(
+            candidates,
+            (
+                "conversation_id",
+                "conversationId",
+                "cid",
+                "openConversationId",
+                "open_conversation_id",
+                "spaceId",
+                "space_id",
+                "openSpaceId",
+                "open_space_id",
+            ),
+        ),
+        "sender_id": _pick_string_from_candidates(
+            candidates,
+            ("sender_id", "senderStaffId", "senderId", "staffId", "userId", "user_id", "userid"),
+        )
+        or "unknown",
+    }
+
+
 def _is_leave_callback_context(candidates: list[Mapping[str, Any]]) -> bool:
     workflow_type = _pick_string_from_candidates(candidates, ("workflow_type", "workflowType")).strip().lower()
     if workflow_type == "leave":
         return True
     out_track_id = _pick_string_from_candidates(candidates, ("outTrackId", "out_track_id")).strip().lower()
     return out_track_id.startswith("leave-confirm-")
+
+
+def _is_reimbursement_callback_context(candidates: list[Mapping[str, Any]]) -> bool:
+    workflow_type = _pick_string_from_candidates(candidates, ("workflow_type", "workflowType")).strip().lower()
+    if workflow_type == "reimbursement":
+        return True
+    out_track_id = _pick_string_from_candidates(candidates, ("outTrackId", "out_track_id")).strip().lower()
+    return out_track_id.startswith("reimbursement-confirm-")
 
 
 def _normalize_approval_action_text(raw: str) -> str:
@@ -227,6 +303,23 @@ def _normalize_approval_action_text(raw: str) -> str:
         return "approve"
     if normalized in {"reject", "rejected", "refuse", "拒绝", "驳回"}:
         return "reject"
+    return ""
+
+
+def _normalize_reimbursement_action_text(raw: str, *, allow_alias: bool = False) -> str:
+    normalized = "".join((raw or "").strip().lower().split())
+    if normalized in {"reimbursement_confirm_submit", "reimbursementconfirmsubmit"}:
+        return "reimbursement_confirm_submit"
+    if normalized in {"reimbursement_cancel_submit", "reimbursementcancelsubmit"}:
+        return "reimbursement_cancel_submit"
+    if normalized in {"确认提交报销", "确认报销", "提交报销"}:
+        return "reimbursement_confirm_submit"
+    if normalized in {"取消报销"}:
+        return "reimbursement_cancel_submit"
+    if allow_alias and normalized == "confirm_request":
+        return "reimbursement_confirm_submit"
+    if allow_alias and normalized == "cancel_request":
+        return "reimbursement_cancel_submit"
     return ""
 
 
@@ -262,6 +355,14 @@ def _parse_leave_action_from_button_id(button_id: str, *, allow_file_alias: bool
         return ""
     head = raw.split("::", 1)[0]
     return _normalize_leave_action_text(head, allow_file_alias=allow_file_alias)
+
+
+def _parse_reimbursement_action_from_button_id(button_id: str, *, allow_alias: bool) -> str:
+    raw = (button_id or "").strip()
+    if not raw:
+        return ""
+    head = raw.split("::", 1)[0]
+    return _normalize_reimbursement_action_text(head, allow_alias=allow_alias)
 
 
 def _extract_action_from_card_private_data(candidate: Mapping[str, Any]) -> tuple[str, str]:
@@ -312,6 +413,24 @@ def _extract_leave_action_from_card_private_data(candidate: Mapping[str, Any], *
 
     action_value = _pick_string(private_data, ("action", "action_name", "actionName"))
     return _normalize_leave_action_text(action_value, allow_file_alias=allow_file_alias)
+
+
+def _extract_reimbursement_action_from_card_private_data(candidate: Mapping[str, Any], *, allow_alias: bool) -> str:
+    private_data = _extract_card_private_data_mapping(candidate)
+    if private_data is None:
+        return ""
+
+    action_ids = private_data.get("actionIds")
+    if isinstance(action_ids, list):
+        for item in action_ids:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            normalized_action = _parse_reimbursement_action_from_button_id(item, allow_alias=allow_alias)
+            if normalized_action:
+                return normalized_action
+
+    action_value = _pick_string(private_data, ("action", "action_name", "actionName"))
+    return _normalize_reimbursement_action_text(action_value, allow_alias=allow_alias)
 
 
 def _extract_card_private_data_mapping(candidate: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -415,6 +534,55 @@ async def receive_dingtalk_stream_event(
 
     single_chat_service: SingleChatService = request.app.state.single_chat_service
     plain_text_single_chat = _is_plain_text_single_chat(_collect_mapping_candidates(_extract_mapping(payload)))
+    reimbursement_action = _extract_reimbursement_confirmation_action(payload)
+    if reimbursement_action is not None:
+        reimbursement_outcome = single_chat_service.handle_reimbursement_confirmation_action_by_session(
+            action=reimbursement_action["action"],
+            conversation_id=reimbursement_action.get("conversation_id", ""),
+            sender_id=reimbursement_action.get("sender_id", ""),
+        )
+        request.state.intent = "reimbursement"
+        replies = list(reimbursement_outcome.all_replies())
+        serialized_replies, dingtalk_payloads = _serialize_replies(replies=replies)
+        primary_reply = (
+            serialized_replies[0] if serialized_replies else {"channel": "text", "text": "", "interactive_card": None}
+        )
+        primary_payload = dingtalk_payloads[0] if dingtalk_payloads else {"msgtype": "text", "text": {"content": ""}}
+        reason = str(reimbursement_outcome.reason or "")
+        if reason == "reimbursement_travel_submitted":
+            reimbursement_status = "submitted"
+        elif reason == "reimbursement_travel_cancelled":
+            reimbursement_status = "cancelled"
+        elif reason in {"reimbursement_travel_not_found", "reimbursement_travel_confirmation_expired"}:
+            reimbursement_status = "not_found"
+        elif reason == "reimbursement_travel_handoff_fallback":
+            reimbursement_status = "fallback"
+        else:
+            reimbursement_status = "pending"
+        return JSONResponse(
+            status_code=200,
+            media_type=UTF8_JSON_MEDIA_TYPE,
+            content={
+                "ack": "ok",
+                "trace_id": trace_id,
+                "handled": reimbursement_outcome.handled,
+                "reason": reimbursement_outcome.reason,
+                "intent": "reimbursement",
+                "reimbursement_action": reimbursement_action["action"],
+                "reimbursement_status": reimbursement_status,
+                "reply": primary_reply,
+                "replies": serialized_replies,
+                "dingtalk_payload": primary_payload,
+                "dingtalk_payloads": dingtalk_payloads,
+                "source_ids": [],
+                "permission_decision": "allow",
+                "knowledge_version": "",
+                "answered_at": "",
+                "citations": [],
+                "llm_trace": {},
+            },
+        )
+
     leave_action = _extract_leave_confirmation_action(payload)
     if leave_action is not None:
         leave_outcome = single_chat_service.handle_leave_confirmation_action_by_session(

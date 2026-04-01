@@ -19,6 +19,10 @@ class IncomingChatMessage:
     text: str
     sender_staff_id: str = ""
     sender_nick: str = ""
+    file_name: str = ""
+    file_download_url: str = ""
+    file_media_id: str = ""
+    file_content_base64: str = ""
 
 
 @dataclass(frozen=True)

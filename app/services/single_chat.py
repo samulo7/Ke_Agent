@@ -11,9 +11,19 @@ from app.schemas.llm import OrchestratorAction
 from app.schemas.user_context import UserContext
 from app.services.document_request_draft import DocumentRequestDraftOrchestrator
 from app.services.file_request import FileApprovalActionResult, FileRequestService
+from app.services.flow_guidance import (
+    build_flow_guidance_card,
+    build_reimbursement_guidance_fallback_text,
+    build_reimbursement_guidance_prompt_fields,
+)
 from app.services.intent_classifier import IntentClassifier
 from app.services.knowledge_answering import KnowledgeAnswerService, build_default_knowledge_answer_service
 from app.services.leave_request import LeaveRequestOrchestrator, build_default_leave_request_orchestrator
+from app.services.reimbursement_request import (
+    ReimbursementRequestOrchestrator,
+    build_default_reimbursement_request_orchestrator,
+)
+from app.services.llm_content_generation import LLMContentGenerationService, build_default_llm_content_generation_service
 from app.services.llm_intent import LLMIntentService, build_default_llm_intent_service
 from app.services.llm_orchestrator_shadow import LLMOrchestratorShadowService, build_default_orchestrator_shadow_service
 
@@ -64,6 +74,8 @@ class SingleChatService:
         document_request_orchestrator: DocumentRequestDraftOrchestrator | None = None,
         file_request_service: FileRequestService | None = None,
         leave_request_orchestrator: LeaveRequestOrchestrator | None = None,
+        reimbursement_request_orchestrator: ReimbursementRequestOrchestrator | None = None,
+        content_generation_service: LLMContentGenerationService | None = None,
         llm_intent_service: LLMIntentService | None = None,
         orchestrator_shadow_service: LLMOrchestratorShadowService | None = None,
     ) -> None:
@@ -72,6 +84,10 @@ class SingleChatService:
         self._document_request_orchestrator = document_request_orchestrator or DocumentRequestDraftOrchestrator()
         self._file_request_service = file_request_service or FileRequestService()
         self._leave_request_orchestrator = leave_request_orchestrator or build_default_leave_request_orchestrator()
+        self._reimbursement_request_orchestrator = (
+            reimbursement_request_orchestrator or build_default_reimbursement_request_orchestrator()
+        )
+        self._content_generation_service = content_generation_service or build_default_llm_content_generation_service()
         self._llm_intent_service = llm_intent_service or build_default_llm_intent_service(
             fallback_classifier=self._intent_classifier
         )
@@ -100,6 +116,28 @@ class SingleChatService:
                 ),
             )
 
+        question = message.text.strip() if message.message_type == "text" else ""
+        reimbursement_continuation = self._reimbursement_request_orchestrator.handle(
+            conversation_id=message.conversation_id,
+            sender_id=message.sender_id,
+            message=message,
+            user_context=user_context,
+            force_start=(
+                message.message_type == "text"
+                and question != ""
+                and self._should_start_reimbursement_workflow(question=question)
+            ),
+        )
+        if reimbursement_continuation is not None:
+            llm_trace["orchestrator_shadow"] = self._orchestrator_shadow_service.suggest(
+                question=question,
+                intent="reimbursement",
+                rule_action="flow_guidance",
+                conversation_id=message.conversation_id,
+                sender_id=message.sender_id,
+            ).to_trace()
+            return self._apply_llm_trace(result=reimbursement_continuation, llm_trace=llm_trace)
+
         if message.message_type != "text":
             return ChatHandleResult(
                 handled=False,
@@ -111,7 +149,6 @@ class SingleChatService:
                 ),
             )
 
-        question = message.text.strip()
         if not question:
             return ChatHandleResult(
                 handled=False,
@@ -234,6 +271,9 @@ class SingleChatService:
         if intent == "other" and self._should_start_leave_workflow(question=question):
             intent = "leave"
             llm_trace["intent"] = {**llm_trace["intent"], "intent": intent, "reason": "leave_workflow_heuristic"}
+        if intent == "other" and self._should_start_reimbursement_workflow(question=question):
+            intent = "reimbursement"
+            llm_trace["intent"] = {**llm_trace["intent"], "intent": intent, "reason": "reimbursement_workflow_heuristic"}
 
         if (
             intent == "other"
@@ -311,23 +351,46 @@ class SingleChatService:
                 return self._apply_llm_trace(result=result, llm_trace=llm_trace)
             return ChatHandleResult(
                 handled=True,
-                reason="flow_guidance_text",
+                reason="flow_guidance_card",
                 intent=intent,
                 reply=AgentReply(
-                    channel="text",
-                    text=self._build_leave_flow_guidance_text(),
+                    channel="interactive_card",
+                    interactive_card=build_flow_guidance_card(intent="leave", question=question),
                 ),
                 llm_trace=llm_trace,
             )
 
         if intent == "reimbursement":
+            if self._should_start_reimbursement_workflow(question=question):
+                result = self._reimbursement_request_orchestrator.handle(
+                    conversation_id=message.conversation_id,
+                    sender_id=message.sender_id,
+                    message=message,
+                    user_context=user_context,
+                    force_start=True,
+                ) or ChatHandleResult(
+                    handled=False,
+                    reason="reimbursement_workflow_incomplete",
+                    intent="reimbursement",
+                    reply=AgentReply(channel="text", text="报销信息暂未收集成功，请重试。"),
+                )
+                return self._apply_llm_trace(result=result, llm_trace=llm_trace)
+            generated = self._content_generation_service.generate(
+                mode="flow_guidance_reimbursement",
+                question=question,
+                prompt_fields=build_reimbursement_guidance_prompt_fields(user_input=question),
+                fallback_text=build_reimbursement_guidance_fallback_text(user_input=question),
+                conversation_id=message.conversation_id,
+                sender_id=message.sender_id,
+            )
+            llm_trace["content"] = generated.to_trace()
             return ChatHandleResult(
                 handled=True,
-                reason="flow_guidance_card",
+                reason="flow_guidance_text",
                 intent=intent,
                 reply=AgentReply(
-                    channel="interactive_card",
-                    interactive_card=self._build_flow_guidance_card(intent=intent, question=question),
+                    channel="text",
+                    text=generated.text,
                 ),
                 llm_trace=llm_trace,
             )
@@ -439,6 +502,19 @@ class SingleChatService:
             sender_id=sender_id,
         )
 
+    def handle_reimbursement_confirmation_action_by_session(
+        self,
+        *,
+        action: str,
+        conversation_id: str,
+        sender_id: str,
+    ) -> ChatHandleResult:
+        return self._reimbursement_request_orchestrator.handle_confirmation_action_by_session(
+            action=action,
+            conversation_id=conversation_id,
+            sender_id=sender_id,
+        )
+
     @staticmethod
     def _to_access_context(user_context: UserContext | None) -> KnowledgeAccessContext | None:
         if user_context is None:
@@ -447,48 +523,6 @@ class SingleChatService:
             user_id=(user_context.user_id or "").strip(),
             dept_id=(user_context.dept_id or "").strip(),
         )
-
-    @staticmethod
-    def _build_leave_flow_guidance_text() -> str:
-        return "请假入口在钉钉工作台 > OA审批 > 请假；也可以直接说“我要请假 + 时间 + 假别”，我按流程帮你发起。"
-
-    @staticmethod
-    def _build_flow_guidance_card(intent: str, question: str) -> dict[str, Any]:
-        normalized_question = question.strip()
-        if intent == "leave":
-            return {
-                "card_type": "flow_guidance",
-                "title": "请假申请指引",
-                "summary": "我可以先帮你判断入口；如果你是要实际办理，也可以直接说“我要请假”。",
-                "primary_action": "先到控制台/工作台进入 OA审批，选择“请假”后发起提交。",
-                "context": normalized_question,
-                "entry_point": "控制台/工作台 > OA审批 > 请假",
-                "required_materials": "提前确认假期类型、请假时间，并按模板补充必要说明。",
-                "process_path": [
-                    "控制台/工作台",
-                    "OA审批",
-                    "请假",
-                    "选择提交",
-                    "领导审批",
-                    "通过",
-                ],
-                "next_action": "如果你已经确定请假类型和时间，也可以直接告诉我，我先帮你整理提交草稿。",
-            }
-        return {
-            "card_type": "flow_guidance",
-            "title": "报销办理指引",
-            "summary": "我先帮你收拢报销入口和关键动作，避免你去翻整套制度说明。",
-            "primary_action": "先到钉钉工作台进入“审批”，选择对应的报销模板发起办理。",
-            "context": normalized_question,
-            "entry_point": "钉钉 > 工作台 > 审批 > 报销",
-            "required_materials": "提前准备票据、金额和事由说明，按模板补全必填信息。",
-            "process_path": [
-                "选择报销模板",
-                "填写金额与事由",
-                "上传票据并提交",
-            ],
-            "next_action": "如果你不确定该选哪种报销类型，我可以继续帮你缩小到对应入口。",
-        }
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -591,6 +625,38 @@ class SingleChatService:
             "到",
             "至",
         )
+        return any(token in normalized for token in info_tokens) and not any(token in normalized for token in action_tokens)
+
+    def _should_start_reimbursement_workflow(self, *, question: str) -> bool:
+        normalized = self._normalize(question)
+        if not normalized:
+            return False
+        if self._is_reimbursement_information_query(question):
+            return False
+        explicit_tokens = (
+            "我要报销差旅费",
+            "我要差旅报销",
+            "我要报销差旅",
+            "我想报销差旅费",
+            "发起差旅报销",
+            "提交差旅报销",
+        )
+        if any(token in normalized for token in explicit_tokens):
+            return True
+        action_tokens = ("我要", "我想", "帮我", "发起", "提交", "申请")
+        return (
+            "报销" in normalized
+            and any(scope in normalized for scope in ("差旅", "出差"))
+            and any(token in normalized for token in action_tokens)
+        )
+
+    def _is_reimbursement_information_query(self, question: str) -> bool:
+        normalized = self._normalize(question)
+        reimbursement_scope_tokens = ("报销", "差旅", "出差")
+        if not any(token in normalized for token in reimbursement_scope_tokens):
+            return False
+        info_tokens = ("流程", "入口", "在哪", "怎么", "如何", "规则", "制度", "说明")
+        action_tokens = ("我要", "我想", "帮我", "发起", "提交", "申请")
         return any(token in normalized for token in info_tokens) and not any(token in normalized for token in action_tokens)
 
     @staticmethod

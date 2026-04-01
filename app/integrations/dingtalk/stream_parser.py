@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import json
 from typing import Any
 
 from app.schemas.dingtalk_chat import ConversationType, IncomingChatMessage
@@ -52,6 +53,106 @@ def _extract_text(payload: Mapping[str, Any]) -> str:
     return ""
 
 
+def _extract_file_payload(payload: Mapping[str, Any]) -> dict[str, str]:
+    candidates = _collect_mapping_candidates(payload)
+    file_name = _pick_string_from_candidates(
+        candidates,
+        (
+            "file_name",
+            "fileName",
+            "filename",
+            "name",
+        ),
+    )
+    file_download_url = _pick_string_from_candidates(
+        candidates,
+        (
+            "file_download_url",
+            "fileDownloadUrl",
+            "download_url",
+            "downloadUrl",
+            "file_url",
+            "fileUrl",
+            "url",
+        ),
+    )
+    file_media_id = _pick_string_from_candidates(
+        candidates,
+        (
+            "file_media_id",
+            "fileMediaId",
+            "media_id",
+            "mediaId",
+            "file_id",
+            "fileId",
+        ),
+    )
+    file_content_base64 = _pick_string_from_candidates(
+        candidates,
+        (
+            "file_content_base64",
+            "fileContentBase64",
+            "content_base64",
+            "contentBase64",
+            "base64",
+        ),
+    )
+    return {
+        "file_name": file_name,
+        "file_download_url": file_download_url,
+        "file_media_id": file_media_id,
+        "file_content_base64": file_content_base64,
+    }
+
+
+def _pick_string_from_candidates(candidates: list[Mapping[str, Any]], keys: tuple[str, ...]) -> str:
+    for candidate in candidates:
+        value = _pick_string(candidate, keys)
+        if value:
+            return value
+    return ""
+
+
+def _collect_mapping_candidates(root: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    candidates: list[Mapping[str, Any]] = []
+    stack: list[Mapping[str, Any]] = [root]
+    visited: set[int] = set()
+    while stack:
+        current = stack.pop()
+        marker = id(current)
+        if marker in visited:
+            continue
+        visited.add(marker)
+        candidates.append(current)
+        for value in current.values():
+            if isinstance(value, Mapping):
+                stack.append(value)
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, Mapping):
+                        stack.append(item)
+                continue
+            if isinstance(value, str):
+                stack.extend(_parse_json_mappings_from_string(value))
+    return candidates
+
+
+def _parse_json_mappings_from_string(value: str) -> list[Mapping[str, Any]]:
+    raw = (value or "").strip()
+    if not raw.startswith("{") and not raw.startswith("["):
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    if isinstance(parsed, Mapping):
+        return [parsed]
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, Mapping)]
+    return []
+
+
 def _contains_cjk(text: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in text)
 
@@ -88,6 +189,7 @@ def parse_stream_event(payload: Mapping[str, Any]) -> IncomingChatMessage:
         raise ValueError("conversation_type is required and must be single/group")
 
     message_type = _pick_string(event, ("message_type", "messageType", "msgtype")) or "text"
+    file_payload = _extract_file_payload(event)
 
     return IncomingChatMessage(
         event_id=_pick_string(event, ("event_id", "eventId", "id")) or "unknown_event",
@@ -98,4 +200,8 @@ def parse_stream_event(payload: Mapping[str, Any]) -> IncomingChatMessage:
         text=_repair_possible_mojibake(_extract_text(event)),
         sender_staff_id=_pick_string(event, ("senderStaffId", "sender_staff_id", "staffId", "userid")) or sender_id,
         sender_nick=_pick_string(event, ("senderNick", "sender_nick", "nick", "name")),
+        file_name=file_payload["file_name"],
+        file_download_url=file_payload["file_download_url"],
+        file_media_id=file_payload["file_media_id"],
+        file_content_base64=file_payload["file_content_base64"],
     )

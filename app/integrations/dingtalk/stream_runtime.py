@@ -207,8 +207,12 @@ def _extract_card_text_lines(card_payload: Mapping[str, Any]) -> tuple[str, list
         "leave_type": "请假类型",
         "leave_time": "请假时间",
         "leave_reason": "请假事由",
+        "linked_trip": "关联申请",
         "entry_point": "办理入口",
         "required_materials": "准备材料",
+        "cost_company": "归属公司",
+        "over_5000": "是否超5千",
+        "attachment_status": "附件",
     }
     title = str(card_payload.get("title") or "助手回复").strip() or "助手回复"
     lines: list[str] = []
@@ -245,6 +249,12 @@ def _extract_card_text_lines(card_payload: Mapping[str, Any]) -> tuple[str, list
         if isinstance(value, str) and value.strip():
             label = field_label_map.get(key, key)
             lines.append(f"{label}：{value.strip()}")
+
+    common_errors = card_payload.get("common_errors")
+    if isinstance(common_errors, list):
+        normalized_errors = [str(item).strip() for item in common_errors if str(item).strip()]
+        if normalized_errors:
+            lines.append(f"常见错误：{'；'.join(normalized_errors)}")
 
     process_path = card_payload.get("process_path")
     if isinstance(process_path, list):
@@ -423,7 +433,12 @@ def _build_action_card_param_map(
     lines: list[str],
 ) -> dict[str, str]:
     card_type = str(card_payload.get("card_type") or "").strip()
-    workflow_type = "leave" if card_type == "leave_request_ready" else "file_request"
+    if card_type == "leave_request_ready":
+        workflow_type = "leave"
+    elif card_type == "reimbursement_request_ready":
+        workflow_type = "reimbursement"
+    else:
+        workflow_type = "file_request"
     summary = str(card_payload.get("summary") or "").strip()
     if not summary:
         summary = "\n".join(line for line in lines if line).strip()
@@ -725,7 +740,7 @@ class _RequesterResultCardNotifier:
 
 def _is_template_driven_action_card(card_payload: Mapping[str, Any]) -> bool:
     card_type = str(card_payload.get("card_type") or "").strip()
-    return card_type in {"file_request_confirmation", "leave_request_ready"}
+    return card_type in {"file_request_confirmation", "leave_request_ready", "reimbursement_request_ready"}
 
 
 def _dump_stream_event_if_enabled(*, payload: Any, trace_id: str, logger: logging.Logger) -> None:
@@ -795,6 +810,22 @@ def _resolve_leave_confirmation_action(
     return leave_action, leave_outcome
 
 
+def _resolve_reimbursement_confirmation_action(
+    *,
+    payload: Mapping[str, Any],
+    service: SingleChatService,
+) -> tuple[dict[str, str], Any] | None:
+    reimbursement_action = _extract_reimbursement_action_payload(payload)
+    if reimbursement_action is None:
+        return None
+    reimbursement_outcome = service.handle_reimbursement_confirmation_action_by_session(
+        action=reimbursement_action["action"],
+        conversation_id=reimbursement_action.get("conversation_id", ""),
+        sender_id=reimbursement_action.get("sender_id", ""),
+    )
+    return reimbursement_action, reimbursement_outcome
+
+
 def _build_leave_action_outcome_payload(
     *,
     leave_action: Mapping[str, str],
@@ -837,6 +868,107 @@ def _resolve_leave_callback_status(*, leave_outcome: Any) -> str:
     if reason == "leave_workflow_handoff":
         return "handoff"
     return "pending"
+
+
+def _resolve_reimbursement_callback_status(*, reimbursement_outcome: Any) -> str:
+    reason = str(reimbursement_outcome.reason or "")
+    if reason == "reimbursement_travel_submitted":
+        return "submitted"
+    if reason == "reimbursement_travel_cancelled":
+        return "cancelled"
+    if reason in {"reimbursement_travel_not_found", "reimbursement_travel_confirmation_expired"}:
+        return "not_found"
+    if reason == "reimbursement_travel_handoff_fallback":
+        return "fallback"
+    return "pending"
+
+
+def _build_reimbursement_action_outcome_payload(
+    *,
+    reimbursement_action: Mapping[str, str],
+    reimbursement_outcome: Any,
+    replies: tuple[AgentReply, ...],
+) -> dict[str, Any]:
+    return {
+        "handled": reimbursement_outcome.handled,
+        "reason": reimbursement_outcome.reason,
+        "intent": "reimbursement",
+        "channel": reimbursement_outcome.reply.channel if replies else "none",
+        "replies": [reply.to_dict() for reply in replies],
+        "source_ids": [],
+        "permission_decision": "allow",
+        "knowledge_version": "",
+        "answered_at": "",
+        "citations": [],
+        "llm_trace": {},
+        "user_context": {
+            "user_id": reimbursement_action.get("sender_id", "unknown") or "unknown",
+            "dept_id": "unknown",
+            "identity_source": "event_fallback",
+            "is_degraded": True,
+        },
+        "reimbursement_action": reimbursement_action.get("action", ""),
+        "reimbursement_status": _resolve_reimbursement_callback_status(reimbursement_outcome=reimbursement_outcome),
+    }
+
+
+def _resolve_reimbursement_callback_feedback_text(
+    *,
+    reimbursement_outcome: Any,
+    replies: tuple[AgentReply, ...],
+) -> str:
+    reason = str(reimbursement_outcome.reason or "")
+    reason_text_map = {
+        "reimbursement_travel_submitted": "差旅报销审批已提交。",
+        "reimbursement_travel_cancelled": "本次差旅报销已取消。",
+        "reimbursement_travel_not_found": "未找到待确认报销，请重新发送“我要报销差旅费”。",
+        "reimbursement_travel_confirmation_expired": "报销确认已过期，请重新发送“我要报销差旅费”。",
+        "reimbursement_travel_handoff_fallback": "自动提交流程失败，请到 OA 审批入口手动提交。",
+    }
+    mapped = reason_text_map.get(reason)
+    if mapped:
+        return mapped
+    for reply in replies:
+        if reply.channel == "text":
+            text = (reply.text or "").strip()
+            if text:
+                return text
+    return "差旅报销操作已处理。"
+
+
+def _build_reimbursement_card_callback_response_payload(
+    *,
+    reimbursement_action: Mapping[str, str],
+    reimbursement_outcome: Any,
+    replies: tuple[AgentReply, ...],
+) -> dict[str, Any]:
+    status = _resolve_reimbursement_callback_status(reimbursement_outcome=reimbursement_outcome)
+    feedback = _resolve_reimbursement_callback_feedback_text(
+        reimbursement_outcome=reimbursement_outcome,
+        replies=replies,
+    )
+    actions_locked = status in {"submitted", "cancelled", "not_found", "fallback"}
+    card_param_map = {
+        "reimbursement_action": reimbursement_action.get("action", ""),
+        "reimbursement_status": status,
+        "approval_status": status,
+        "approval_message": feedback,
+        "summary": feedback,
+        "actions_locked": "true" if actions_locked else "false",
+    }
+    string_card_param_map = {key: _to_string_card_param_map_value(value) for key, value in card_param_map.items()}
+    return {
+        "cardUpdateOptions": {
+            "updateCardDataByKey": True,
+            "updatePrivateDataByKey": True,
+        },
+        "cardData": {
+            "cardParamMap": string_card_param_map,
+        },
+        "userPrivateData": {
+            "cardParamMap": string_card_param_map,
+        },
+    }
 
 
 def _resolve_leave_callback_feedback_text(*, leave_outcome: Any, replies: tuple[AgentReply, ...]) -> str:
@@ -1046,6 +1178,17 @@ def handle_single_chat_payload(
     sender: ReplySender,
     user_context_resolver: UserContextResolver,
 ) -> dict[str, Any]:
+    reimbursement_resolution = _resolve_reimbursement_confirmation_action(payload=payload, service=service)
+    if reimbursement_resolution is not None:
+        reimbursement_action, reimbursement_outcome = reimbursement_resolution
+        replies = reimbursement_outcome.all_replies()
+        _dispatch_replies(sender=sender, replies=replies)
+        return _build_reimbursement_action_outcome_payload(
+            reimbursement_action=reimbursement_action,
+            reimbursement_outcome=reimbursement_outcome,
+            replies=replies,
+        )
+
     leave_resolution = _resolve_leave_confirmation_action(payload=payload, service=service)
     if leave_resolution is not None:
         leave_action, leave_outcome = leave_resolution
@@ -1179,6 +1322,79 @@ def _extract_leave_action_payload(payload: Mapping[str, Any]) -> dict[str, str] 
     }
 
 
+def _extract_reimbursement_action_payload(payload: Mapping[str, Any]) -> dict[str, str] | None:
+    data = payload.get("data")
+    event = data if isinstance(data, Mapping) else payload
+    candidates = _collect_mapping_candidates(event)
+    reimbursement_context = _is_reimbursement_callback_context(candidates)
+
+    action = ""
+    for candidate in candidates:
+        action_value = _pick_payload_string(
+            candidate,
+            (
+                "reimbursement_action",
+                "reimbursementAction",
+                "action",
+                "action_name",
+                "actionName",
+                "button_text",
+                "buttonText",
+            ),
+        )
+        normalized_action = _normalize_reimbursement_action_text(action_value, allow_alias=reimbursement_context)
+        if normalized_action:
+            action = normalized_action
+            break
+
+        parsed_private_action = _extract_reimbursement_action_from_card_private_data(
+            candidate,
+            allow_alias=reimbursement_context,
+        )
+        if parsed_private_action:
+            action = parsed_private_action
+            break
+
+        button_id = _pick_payload_string(
+            candidate,
+            ("button_id", "buttonId", "action_id", "actionId", "id", "componentId", "component_id"),
+        )
+        normalized_button_action = _parse_reimbursement_action_from_button_id(
+            button_id,
+            allow_alias=reimbursement_context,
+        )
+        if normalized_button_action:
+            action = normalized_button_action
+            break
+
+    if not action:
+        return None
+
+    conversation_id = _pick_string_from_candidates(
+        candidates,
+        (
+            "conversation_id",
+            "conversationId",
+            "cid",
+            "openConversationId",
+            "open_conversation_id",
+            "spaceId",
+            "space_id",
+            "openSpaceId",
+            "open_space_id",
+        ),
+    )
+    sender_id = _pick_string_from_candidates(
+        candidates,
+        ("sender_id", "senderStaffId", "senderId", "staffId", "userId", "user_id", "userid"),
+    )
+    return {
+        "action": action,
+        "conversation_id": conversation_id,
+        "sender_id": sender_id or "unknown",
+    }
+
+
 def _is_leave_callback_context(candidates: list[Mapping[str, Any]]) -> bool:
     workflow_type = _pick_string_from_candidates(candidates, ("workflow_type", "workflowType")).strip().lower()
     if workflow_type == "leave":
@@ -1187,12 +1403,28 @@ def _is_leave_callback_context(candidates: list[Mapping[str, Any]]) -> bool:
     return out_track_id.startswith("leave-confirm-")
 
 
+def _is_reimbursement_callback_context(candidates: list[Mapping[str, Any]]) -> bool:
+    workflow_type = _pick_string_from_candidates(candidates, ("workflow_type", "workflowType")).strip().lower()
+    if workflow_type == "reimbursement":
+        return True
+    out_track_id = _pick_string_from_candidates(candidates, ("outTrackId", "out_track_id")).strip().lower()
+    return out_track_id.startswith("reimbursement-confirm-")
+
+
 def _parse_leave_action_from_button_id(button_id: str, *, allow_file_alias: bool) -> str:
     raw = (button_id or "").strip()
     if not raw:
         return ""
     head = raw.split("::", 1)[0]
     return _normalize_leave_action_text(head, allow_file_alias=allow_file_alias)
+
+
+def _parse_reimbursement_action_from_button_id(button_id: str, *, allow_alias: bool) -> str:
+    raw = (button_id or "").strip()
+    if not raw:
+        return ""
+    head = raw.split("::", 1)[0]
+    return _normalize_reimbursement_action_text(head, allow_alias=allow_alias)
 
 
 def _extract_leave_action_from_card_private_data(candidate: Mapping[str, Any], *, allow_file_alias: bool) -> str:
@@ -1211,6 +1443,24 @@ def _extract_leave_action_from_card_private_data(candidate: Mapping[str, Any], *
 
     action_value = _pick_payload_string(private_data, ("action", "action_name", "actionName"))
     return _normalize_leave_action_text(action_value, allow_file_alias=allow_file_alias)
+
+
+def _extract_reimbursement_action_from_card_private_data(candidate: Mapping[str, Any], *, allow_alias: bool) -> str:
+    private_data = _extract_card_private_data_mapping(candidate)
+    if private_data is None:
+        return ""
+
+    action_ids = private_data.get("actionIds")
+    if isinstance(action_ids, list):
+        for item in action_ids:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            normalized = _parse_reimbursement_action_from_button_id(item, allow_alias=allow_alias)
+            if normalized:
+                return normalized
+
+    action_value = _pick_payload_string(private_data, ("action", "action_name", "actionName"))
+    return _normalize_reimbursement_action_text(action_value, allow_alias=allow_alias)
 
 
 def _extract_approval_action_payload(payload: Mapping[str, Any]) -> dict[str, str] | None:
@@ -1407,6 +1657,23 @@ def _normalize_approval_action_text(raw: str) -> str:
         return "approve"
     if normalized in {"reject", "rejected", "refuse", "拒绝", "驳回"}:
         return "reject"
+    return ""
+
+
+def _normalize_reimbursement_action_text(raw: str, *, allow_alias: bool = False) -> str:
+    normalized = "".join((raw or "").strip().lower().split())
+    if normalized in {"reimbursement_confirm_submit", "reimbursementconfirmsubmit"}:
+        return "reimbursement_confirm_submit"
+    if normalized in {"reimbursement_cancel_submit", "reimbursementcancelsubmit"}:
+        return "reimbursement_cancel_submit"
+    if normalized in {"确认提交报销", "确认报销", "提交报销"}:
+        return "reimbursement_confirm_submit"
+    if normalized in {"取消报销"}:
+        return "reimbursement_cancel_submit"
+    if allow_alias and normalized == "confirm_request":
+        return "reimbursement_confirm_submit"
+    if allow_alias and normalized == "cancel_request":
+        return "reimbursement_cancel_submit"
     return ""
 
 
@@ -1648,6 +1915,8 @@ class _SdkReplySender:
             card_type = str(card_payload.get("card_type") or "").strip()
             if card_type == "leave_request_ready":
                 fallback_text_parts.append("当前确认卡片回调不可用，请重新发送“我要请假”后重试，或前往 OA 审批提交。")
+            elif card_type == "reimbursement_request_ready":
+                fallback_text_parts.append("当前确认卡片回调不可用，请重新发送“我要报销差旅费”后重试，或前往 OA 审批提交。")
             else:
                 fallback_text_parts.append("请回复“确认申请”或“取消”。")
             self._handler.reply_text("\n".join(fallback_text_parts), self._incoming_message)
@@ -1713,6 +1982,8 @@ class _SdkReplySender:
 
         if card_type == "leave_request_ready":
             out_track_id = f"leave-confirm-{uuid4().hex}"
+        elif card_type == "reimbursement_request_ready":
+            out_track_id = f"reimbursement-confirm-{uuid4().hex}"
         elif card_type == "file_request_confirmation":
             out_track_id = f"file-confirm-{uuid4().hex}"
         else:
@@ -2035,6 +2306,25 @@ def build_stream_client(
                     trace_id=trace_id,
                     logger=obs_logger,
                 )
+                reimbursement_resolution = _resolve_reimbursement_confirmation_action(
+                    payload=callback_message.data,
+                    service=service,
+                )
+                if reimbursement_resolution is not None:
+                    reimbursement_action, reimbursement_outcome = reimbursement_resolution
+                    reimbursement_replies = reimbursement_outcome.all_replies()
+                    outcome = _build_reimbursement_action_outcome_payload(
+                        reimbursement_action=reimbursement_action,
+                        reimbursement_outcome=reimbursement_outcome,
+                        replies=reimbursement_replies,
+                    )
+                    response_payload = _build_reimbursement_card_callback_response_payload(
+                        reimbursement_action=reimbursement_action,
+                        reimbursement_outcome=reimbursement_outcome,
+                        replies=reimbursement_replies,
+                    )
+                    return sdk.AckMessage.STATUS_OK, response_payload
+
                 leave_resolution = _resolve_leave_confirmation_action(payload=callback_message.data, service=service)
                 if leave_resolution is not None:
                     leave_action, leave_outcome = leave_resolution

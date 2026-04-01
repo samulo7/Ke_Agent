@@ -13,11 +13,13 @@ from app.api.main import create_app
 from app.rag.knowledge_retriever import KnowledgeRetriever
 from app.repos.sql_knowledge_repository import SQLKnowledgeRepository, bootstrap_sqlite_schema
 from app.schemas.file_asset import FileAsset, FileSearchCandidate, FileSearchResult
+from app.schemas.reimbursement import ReimbursementApprovalResult, ReimbursementAttachmentProcessResult, TravelApplication
 from app.schemas.user_context import UserContext
 from app.services.document_request_draft import DocumentRequestDraftOrchestrator
 from app.services.file_request import FileRequestService
 from app.services.knowledge_answering import KnowledgeAnswerService
 from app.services.leave_request import LeaveApprovalResult, LeaveRequestOrchestrator
+from app.services.reimbursement_request import ReimbursementRequestOrchestrator
 from app.services.single_chat import SingleChatService
 from app.services.tone_resolver import ToneResolver
 
@@ -29,6 +31,42 @@ class _RaisingKnowledgeAnswerService:
 
 class _StubLeaveApprovalCreator:
     def __init__(self, result: LeaveApprovalResult) -> None:
+        self._result = result
+
+    def submit(self, submission):  # type: ignore[no-untyped-def]
+        self.submission = submission
+        return self._result
+
+
+class _StubTravelApplicationProvider:
+    def __init__(self, items: list[TravelApplication] | None = None) -> None:
+        self._items = items or [
+            TravelApplication(process_instance_id="trip-1", start_date="2026-03-15", destination="北京", purpose="云亨售后"),
+            TravelApplication(process_instance_id="trip-2", start_date="2026-03-28", destination="上海", purpose=""),
+        ]
+
+    def list_recent_approved(self, *, originator_user_id: str, lookback_days: int, now: datetime) -> list[TravelApplication]:
+        del originator_user_id, lookback_days, now
+        return list(self._items)
+
+
+class _StubReimbursementAttachmentProcessor:
+    def __init__(self, result: ReimbursementAttachmentProcessResult | None = None) -> None:
+        self._result = result or ReimbursementAttachmentProcessResult(
+            success=True,
+            reason="processed",
+            department="总经办",
+            amount="106",
+            attachment_media_id="media-pdf-1",
+        )
+
+    def process(self, *, message, conversation_id: str, sender_id: str):  # type: ignore[no-untyped-def]
+        del message, conversation_id, sender_id
+        return self._result
+
+
+class _StubReimbursementApprovalCreator:
+    def __init__(self, result: ReimbursementApprovalResult) -> None:
         self._result = result
 
     def submit(self, submission):  # type: ignore[no-untyped-def]
@@ -239,8 +277,12 @@ def make_stream_payload(
     sender_id: str = "user-001",
     conversation_id: str = "conv-001",
     message_type: str = "text",
+    file_name: str = "",
+    file_download_url: str = "",
+    file_media_id: str = "",
+    file_content_base64: str = "",
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "event_id": "evt-001",
         "conversation_id": conversation_id,
         "conversation_type": conversation_type,
@@ -248,6 +290,14 @@ def make_stream_payload(
         "message_type": message_type,
         "text": text,
     }
+    if message_type == "file":
+        payload["content"] = {
+            "fileName": file_name,
+            "downloadUrl": file_download_url,
+            "mediaId": file_media_id,
+            "contentBase64": file_content_base64,
+        }
+    return payload
 
 
 def make_leave_button_callback_payload(
@@ -265,6 +315,26 @@ def make_leave_button_callback_payload(
                 {"componentType": "button", "componentId": action_id},
                 ensure_ascii=False,
             ),
+        }
+    }
+
+
+def make_reimbursement_button_callback_payload(
+    *,
+    action_id: str,
+    sender_id: str,
+    conversation_id: str,
+) -> dict[str, object]:
+    return {
+        "data": {
+            "type": "actionCallback",
+            "userId": sender_id,
+            "extension": json.dumps({"openConversationId": conversation_id}, ensure_ascii=False),
+            "content": json.dumps(
+                {"componentType": "button", "componentId": action_id},
+                ensure_ascii=False,
+            ),
+            "outTrackId": "reimbursement-confirm-test-1",
         }
     }
 
@@ -386,7 +456,7 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertEqual("policy_process", body["intent"])
         self.assertIn("doc-policy-banquet-2026-01", body["source_ids"])
 
-    def test_flow_query_returns_interactive_card(self) -> None:
+    def test_flow_query_returns_text_guidance(self) -> None:
         app = create_app(log_stream=StringIO())
         client = TestClient(app)
 
@@ -395,18 +465,117 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         body = response.json()
 
         self.assertTrue(body["handled"])
-        self.assertEqual("flow_guidance_card", body["reason"])
+        self.assertEqual("flow_guidance_text", body["reason"])
         self.assertEqual("reimbursement", body["intent"])
-        self.assertEqual("interactive_card", body["reply"]["channel"])
-        self.assertEqual("flow_guidance", body["reply"]["interactive_card"]["card_type"])
-        self.assertEqual("报销办理指引", body["reply"]["interactive_card"]["title"])
-        self.assertEqual("钉钉 > 工作台 > 审批 > 报销", body["reply"]["interactive_card"]["entry_point"])
-        self.assertIn("报销模板", body["reply"]["interactive_card"]["primary_action"])
-        self.assertEqual("interactive_card", body["dingtalk_payload"]["msgtype"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("发票", body["reply"]["text"])
+        self.assertIn("行程单", body["reply"]["text"])
+        self.assertIn("30天", body["reply"]["text"])
+        self.assertIn("金额", body["reply"]["text"])
+        self.assertNotIn("办理入口：", body["reply"]["text"])
+        self.assertNotIn("准备材料：", body["reply"]["text"])
+        self.assertNotIn("流程路径：", body["reply"]["text"])
+        self.assertNotIn("下一步：", body["reply"]["text"])
+        self.assertEqual("text", body["dingtalk_payload"]["msgtype"])
         self.assertEqual([], body["source_ids"])
-        self.assertEqual("allow", body["permission_decision"])
 
-    def test_leave_info_query_returns_flow_guidance_text(self) -> None:
+    def test_reimbursement_travel_workflow_happy_path_with_callback_submit(self) -> None:
+        clock = _FakeClock()
+        approval_creator = _StubReimbursementApprovalCreator(
+            ReimbursementApprovalResult(success=True, reason="submitted", process_instance_id="proc-rmb-api-1")
+        )
+        service = SingleChatService(
+            reimbursement_request_orchestrator=ReimbursementRequestOrchestrator(
+                travel_application_provider=_StubTravelApplicationProvider(),
+                attachment_processor=_StubReimbursementAttachmentProcessor(),
+                approval_creator=approval_creator,
+                now_provider=clock.now,
+            )
+        )
+        app = create_app(
+            log_stream=StringIO(),
+            single_chat_service=service,
+            user_context_resolver=_PermissionResolver(),
+        )
+        client = TestClient(app)
+
+        first = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要报销差旅费",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-1",
+            ),
+        )
+        self.assertEqual(200, first.status_code)
+        self.assertEqual("reimbursement_travel_collecting_trip", first.json()["reason"])
+
+        second = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="1",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-1",
+            ),
+        )
+        self.assertEqual(200, second.status_code)
+        self.assertEqual("reimbursement_travel_collecting_attachment", second.json()["reason"])
+
+        third = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="",
+                message_type="file",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-1",
+                file_name="差旅费报销单.xlsx",
+                file_content_base64="ZmFrZQ==",
+            ),
+        )
+        self.assertEqual(200, third.status_code)
+        self.assertEqual("reimbursement_travel_collecting_company", third.json()["reason"])
+        self.assertIn("部门：总经办", third.json()["reply"]["text"])
+
+        fourth = client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="SY",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-1",
+            ),
+        )
+        self.assertEqual(200, fourth.status_code)
+        body_fourth = fourth.json()
+        self.assertEqual("reimbursement_travel_ready", body_fourth["reason"])
+        self.assertEqual("interactive_card", body_fourth["reply"]["channel"])
+        self.assertEqual("reimbursement_request_ready", body_fourth["reply"]["interactive_card"]["card_type"])
+
+        fifth = client.post(
+            "/dingtalk/stream/events",
+            json=make_reimbursement_button_callback_payload(
+                action_id="reimbursement_confirm_submit",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-1",
+            ),
+        )
+        self.assertEqual(200, fifth.status_code)
+        body_fifth = fifth.json()
+        self.assertEqual("reimbursement_travel_submitted", body_fifth["reason"])
+        self.assertEqual("reimbursement", body_fifth["intent"])
+        self.assertEqual("submitted", body_fifth["reimbursement_status"])
+        self.assertEqual("reimbursement_confirm_submit", body_fifth["reimbursement_action"])
+        self.assertEqual("text", body_fifth["dingtalk_payload"]["msgtype"])
+        self.assertIn("已提交，审批中", body_fifth["reply"]["text"])
+        self.assertEqual("trip-1", approval_creator.submission.travel_process_instance_id)
+        self.assertEqual("YXQY", approval_creator.submission.fixed_company)
+        self.assertEqual("总经办", approval_creator.submission.department)
+        self.assertEqual("SY", approval_creator.submission.cost_company)
+        self.assertEqual("106", approval_creator.submission.amount)
+        self.assertEqual("否", approval_creator.submission.over_five_thousand)
+        self.assertEqual("media-pdf-1", approval_creator.submission.attachment_media_id)
+        self.assertEqual("allow", body_fifth["permission_decision"])
+
+    def test_leave_info_query_returns_flow_guidance_card(self) -> None:
         app = create_app(log_stream=StringIO())
         client = TestClient(app)
 
@@ -415,12 +584,15 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         body = response.json()
 
         self.assertTrue(body["handled"])
-        self.assertEqual("flow_guidance_text", body["reason"])
+        self.assertEqual("flow_guidance_card", body["reason"])
         self.assertEqual("leave", body["intent"])
-        self.assertEqual("text", body["reply"]["channel"])
-        self.assertIn("OA审批", body["reply"]["text"])
-        self.assertIn("我要请假", body["reply"]["text"])
-        self.assertEqual("text", body["dingtalk_payload"]["msgtype"])
+        self.assertEqual("interactive_card", body["reply"]["channel"])
+        self.assertEqual("flow_guidance", body["reply"]["interactive_card"]["card_type"])
+        self.assertIn("请假", body["reply"]["interactive_card"]["title"])
+        self.assertIn("OA审批", body["reply"]["interactive_card"]["entry_point"])
+        self.assertIn("未提前申请（需提前1天）", body["reply"]["interactive_card"]["common_errors"])
+        self.assertIn("假种选择错误", body["reply"]["interactive_card"]["common_errors"])
+        self.assertEqual("interactive_card", body["dingtalk_payload"]["msgtype"])
 
     def test_plain_leave_word_starts_leave_workflow(self) -> None:
         app = create_app(log_stream=StringIO())

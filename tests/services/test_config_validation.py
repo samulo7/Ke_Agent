@@ -221,6 +221,43 @@ class ConfigValidationTests(unittest.TestCase):
         ]
         self.assertEqual(1, len(matches))
 
+    def test_reimbursement_approval_enabled_requires_process_code(self) -> None:
+        env = make_valid_env()
+        env["DINGTALK_REIMBURSE_APPROVAL_ENABLED"] = "true"
+        result = validate_config(env)
+        self.assertFalse(result.ok)
+        matches = [
+            err
+            for err in result.errors
+            if err.key == "DINGTALK_REIMBURSE_APPROVAL_PROCESS_CODE" and err.code == "MISSING_REQUIRED_WHEN_ENABLED"
+        ]
+        self.assertEqual(1, len(matches))
+
+    def test_reimbursement_approval_disabled_with_process_code_warns_only(self) -> None:
+        env = make_valid_env()
+        env["DINGTALK_REIMBURSE_APPROVAL_PROCESS_CODE"] = "PROC-RMB"
+        result = validate_config(env)
+        self.assertTrue(result.ok)
+        matches = [
+            warning
+            for warning in result.warnings
+            if warning.key == "DINGTALK_REIMBURSE_APPROVAL_ENABLED"
+            and warning.code == "DISABLED_FEATURE_CONFIG_PRESENT"
+        ]
+        self.assertEqual(1, len(matches))
+
+    def test_travel_lookup_enabled_requires_travel_process_code(self) -> None:
+        env = make_valid_env()
+        env["DINGTALK_REIMBURSE_TRAVEL_LOOKUP_ENABLED"] = "true"
+        result = validate_config(env)
+        self.assertFalse(result.ok)
+        matches = [
+            err
+            for err in result.errors
+            if err.key == "DINGTALK_TRAVEL_APPROVAL_PROCESS_CODE" and err.code == "MISSING_REQUIRED_WHEN_ENABLED"
+        ]
+        self.assertEqual(1, len(matches))
+
 
 if __name__ == "__main__":
     unittest.main()

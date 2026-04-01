@@ -129,6 +129,63 @@ class LLMContentGenerationServiceTests(unittest.TestCase):
         self.assertEqual("fallback-text", result.text)
         self.assertIn("llm_disabled", result.safety_flags)
 
+    def test_flow_guidance_reimbursement_uses_special_prompt_and_passes_validation(self) -> None:
+        client = _FakeLLMClient(
+            {
+                "text": (
+                    "出差报销先准备发票、行程单和金额说明，然后在钉钉工作台审批里选报销模板提交。"
+                    "注意出差后30天内要报，而且金额与发票不符会被退回。"
+                    "如果你不确定该选哪个模板，可以告诉我你的场景，我帮你判断。"
+                )
+            }
+        )
+        service = LLMContentGenerationService(
+            llm_client=client,
+            model="qwen-plus",
+            enabled=True,
+            rollout_percentage=100,
+            timeout_seconds=10,
+            max_retries=2,
+        )
+
+        result = service.generate(
+            mode="flow_guidance_reimbursement",
+            question="出差报销怎么弄",
+            prompt_fields={"canonical_block": "entry_point=钉钉 > 工作台 > 审批 > 报销"},
+            fallback_text="fallback",
+            conversation_id="conv-1",
+            sender_id="u-1",
+        )
+
+        self.assertFalse(result.fallback_used)
+        self.assertIn("你是企业内部助手", client.last_user_prompt)
+        self.assertIn("用户问题：出差报销怎么弄", client.last_user_prompt)
+        self.assertIn("已知报销规则：entry_point=钉钉 > 工作台 > 审批 > 报销", client.last_user_prompt)
+
+    def test_flow_guidance_reimbursement_falls_back_when_output_violates_contract(self) -> None:
+        client = _FakeLLMClient({"text": "办理入口：钉钉工作台审批。"})
+        service = LLMContentGenerationService(
+            llm_client=client,
+            model="qwen-plus",
+            enabled=True,
+            rollout_percentage=100,
+            timeout_seconds=10,
+            max_retries=2,
+        )
+
+        result = service.generate(
+            mode="flow_guidance_reimbursement",
+            question="出差报销怎么弄",
+            prompt_fields={"canonical_block": "x"},
+            fallback_text="fallback-text",
+            conversation_id="conv-1",
+            sender_id="u-1",
+        )
+
+        self.assertTrue(result.fallback_used)
+        self.assertEqual("fallback-text", result.text)
+        self.assertIn("flow_guidance_reimbursement_contains_field_labels", result.safety_flags)
+
 
 if __name__ == "__main__":
     unittest.main()

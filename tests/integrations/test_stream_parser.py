@@ -27,6 +27,29 @@ class StreamParserTests(unittest.TestCase):
         message = parse_stream_event(_payload_with_text(mojibake))
         self.assertEqual(original, message.text)
 
+    def test_parse_stream_event_extracts_file_payload_fields(self) -> None:
+        payload = {
+            "data": {
+                "event_id": "evt-parser-file-001",
+                "conversation_id": "conv-parser-file-001",
+                "conversation_type": "single",
+                "sender_id": "user-parser-file-001",
+                "message_type": "file",
+                "content": {
+                    "fileName": "差旅费报销单.xlsx",
+                    "downloadUrl": "https://example.local/file.xlsx",
+                    "mediaId": "media-file-001",
+                    "contentBase64": "ZmFrZQ==",
+                },
+            }
+        }
+        message = parse_stream_event(payload)
+        self.assertEqual("file", message.message_type)
+        self.assertEqual("差旅费报销单.xlsx", message.file_name)
+        self.assertEqual("https://example.local/file.xlsx", message.file_download_url)
+        self.assertEqual("media-file-001", message.file_media_id)
+        self.assertEqual("ZmFrZQ==", message.file_content_base64)
+
 
 if __name__ == "__main__":
     unittest.main()

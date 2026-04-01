@@ -9,12 +9,14 @@ from app.repos.sql_knowledge_repository import SQLKnowledgeRepository, bootstrap
 from app.schemas.dingtalk_chat import AgentReply, ChatHandleResult, IncomingChatMessage
 from app.schemas.file_asset import FileAsset, FileSearchCandidate, FileSearchResult
 from app.schemas.llm import IntentInferenceResult, OrchestratorShadowResult
+from app.schemas.reimbursement import ReimbursementApprovalResult, ReimbursementAttachmentProcessResult, TravelApplication
 from app.schemas.user_context import UserContext
 from app.services.document_request_draft import DocumentRequestDraftOrchestrator
 from app.services.file_request import FileRequestService
 from app.services.intent_classifier import IntentClassification
 from app.services.leave_request import LeaveApprovalResult, LeaveRequestOrchestrator
 from app.services.knowledge_answering import KnowledgeAnswerService
+from app.services.reimbursement_request import ReimbursementRequestOrchestrator
 from app.services.single_chat import SingleChatService
 from app.services.tone_resolver import ToneResolver
 
@@ -58,6 +60,42 @@ class _StubFileRequestService:
 
 class _StubLeaveApprovalCreator:
     def __init__(self, result: LeaveApprovalResult) -> None:
+        self._result = result
+
+    def submit(self, submission):  # type: ignore[no-untyped-def]
+        self.submission = submission
+        return self._result
+
+
+class _StubTravelApplicationProvider:
+    def __init__(self, items: list[TravelApplication] | None = None) -> None:
+        self._items = items or [
+            TravelApplication(process_instance_id="trip-1", start_date="2026-03-15", destination="北京", purpose="云亨售后"),
+            TravelApplication(process_instance_id="trip-2", start_date="2026-03-28", destination="上海", purpose=""),
+        ]
+
+    def list_recent_approved(self, *, originator_user_id: str, lookback_days: int, now: datetime) -> list[TravelApplication]:
+        del originator_user_id, lookback_days, now
+        return list(self._items)
+
+
+class _StubReimbursementAttachmentProcessor:
+    def __init__(self, result: ReimbursementAttachmentProcessResult | None = None) -> None:
+        self._result = result or ReimbursementAttachmentProcessResult(
+            success=True,
+            reason="processed",
+            department="总经办",
+            amount="106",
+            attachment_media_id="media-pdf-1",
+        )
+
+    def process(self, *, message, conversation_id: str, sender_id: str):  # type: ignore[no-untyped-def]
+        del message, conversation_id, sender_id
+        return self._result
+
+
+class _StubReimbursementApprovalCreator:
+    def __init__(self, result: ReimbursementApprovalResult) -> None:
         self._result = result
 
     def submit(self, submission):  # type: ignore[no-untyped-def]
@@ -176,6 +214,10 @@ def make_message(
     text: str = "hello",
     conversation_id: str = "conv-1",
     sender_id: str = "user-1",
+    file_name: str = "",
+    file_download_url: str = "",
+    file_media_id: str = "",
+    file_content_base64: str = "",
 ) -> IncomingChatMessage:
     return IncomingChatMessage(
         event_id="evt-1",
@@ -184,6 +226,10 @@ def make_message(
         sender_id=sender_id,
         message_type=message_type,
         text=text,
+        file_name=file_name,
+        file_download_url=file_download_url,
+        file_media_id=file_media_id,
+        file_content_base64=file_content_base64,
     )
 
 
@@ -763,14 +809,20 @@ class SingleChatServiceTests(unittest.TestCase):
         self.assertIn("稍后再试", result.reply.text or "")
         self.assertIn("联系", result.reply.text or "")
 
-    def test_returns_flow_guidance_text_for_leave(self) -> None:
+    def test_returns_flow_guidance_card_for_leave_info_query(self) -> None:
         service = SingleChatService()
         result = service.handle(make_message(text="请假流程入口在哪"))
         self.assertTrue(result.handled)
-        self.assertEqual("flow_guidance_text", result.reason)
-        self.assertEqual("text", result.reply.channel)
-        self.assertIn("OA审批", result.reply.text or "")
-        self.assertIn("我要请假", result.reply.text or "")
+        self.assertEqual("flow_guidance_card", result.reason)
+        self.assertEqual("interactive_card", result.reply.channel)
+        card = result.reply.interactive_card
+        self.assertIsNotNone(card)
+        assert card is not None
+        self.assertEqual("flow_guidance", card["card_type"])
+        self.assertIn("请假", card["title"])
+        self.assertIn("OA审批", card["entry_point"])
+        self.assertIn("未提前申请（需提前1天）", card["common_errors"])
+        self.assertIn("假种选择错误", card["common_errors"])
         self.assertEqual("leave", result.intent)
 
     def test_plain_leave_word_starts_leave_workflow(self) -> None:
@@ -789,16 +841,145 @@ class SingleChatServiceTests(unittest.TestCase):
         self.assertEqual("text", result.reply.channel)
         self.assertIn("请假类型", result.reply.text or "")
 
-    def test_returns_flow_guidance_card_for_reimbursement(self) -> None:
+    def test_returns_flow_guidance_text_for_reimbursement(self) -> None:
         service = SingleChatService()
         result = service.handle(make_message(text="出差报销怎么弄"))
         self.assertTrue(result.handled)
-        self.assertEqual("interactive_card", result.reply.channel)
-        self.assertEqual("flow_guidance", result.reply.interactive_card["card_type"])
-        self.assertEqual("报销办理指引", result.reply.interactive_card["title"])
-        self.assertIn("报销模板", result.reply.interactive_card["primary_action"])
-        self.assertEqual("钉钉 > 工作台 > 审批 > 报销", result.reply.interactive_card["entry_point"])
+        self.assertEqual("flow_guidance_text", result.reason)
+        self.assertEqual("text", result.reply.channel)
+        text = result.reply.text or ""
+        self.assertNotEqual("", text.strip())
+        self.assertIn("发票", text)
+        self.assertIn("行程单", text)
+        self.assertIn("30天", text)
+        self.assertIn("金额", text)
+        self.assertNotIn("办理入口：", text)
+        self.assertNotIn("准备材料：", text)
+        self.assertNotIn("流程路径：", text)
+        self.assertNotIn("下一步：", text)
         self.assertEqual("reimbursement", result.intent)
+        self.assertIn("fallback_used", result.llm_trace["content"])
+        self.assertIn("validation_passed", result.llm_trace["content"])
+
+    def test_reimbursement_flow_guidance_followups_keep_same_core_notice(self) -> None:
+        service = SingleChatService()
+        first = service.handle(make_message(text="出差报销怎么弄"))
+        second = service.handle(make_message(text="报销入口在哪"))
+
+        self.assertEqual("flow_guidance_text", first.reason)
+        self.assertEqual("flow_guidance_text", second.reason)
+        self.assertEqual("reimbursement", first.intent)
+        self.assertEqual("reimbursement", second.intent)
+        for result in (first, second):
+            text = result.reply.text or ""
+            self.assertIn("30天", text)
+            self.assertIn("金额", text)
+            self.assertIn("发票", text)
+
+    def test_reimbursement_travel_workflow_collects_and_returns_confirmation_card(self) -> None:
+        clock = _FakeClock()
+        service = SingleChatService(
+            reimbursement_request_orchestrator=ReimbursementRequestOrchestrator(
+                travel_application_provider=_StubTravelApplicationProvider(),
+                attachment_processor=_StubReimbursementAttachmentProcessor(),
+                approval_creator=_StubReimbursementApprovalCreator(
+                    ReimbursementApprovalResult(success=True, reason="submitted", process_instance_id="proc-rmb-1")
+                ),
+                now_provider=clock.now,
+            )
+        )
+        start = service.handle(
+            make_message(
+                text="我要报销差旅费",
+                conversation_id="conv-rmb-1",
+                sender_id="user-rmb-1",
+            )
+        )
+        self.assertEqual("reimbursement_travel_collecting_trip", start.reason)
+        self.assertEqual("reimbursement", start.intent)
+        self.assertIn("你最近的出差申请", start.reply.text or "")
+        self.assertIn("1. 2026-03-15 北京（云亨售后）", start.reply.text or "")
+
+        select = service.handle(
+            make_message(
+                text="1",
+                conversation_id="conv-rmb-1",
+                sender_id="user-rmb-1",
+            )
+        )
+        self.assertEqual("reimbursement_travel_collecting_attachment", select.reason)
+        self.assertIn("差旅费报销单（Excel）", select.reply.text or "")
+
+        upload = service.handle(
+            make_message(
+                message_type="file",
+                text="",
+                file_name="差旅费报销单.xlsx",
+                file_content_base64="ZmFrZQ==",
+                conversation_id="conv-rmb-1",
+                sender_id="user-rmb-1",
+            )
+        )
+        self.assertEqual("reimbursement_travel_collecting_company", upload.reason)
+        self.assertIn("部门：总经办", upload.reply.text or "")
+        self.assertIn("金额：106元", upload.reply.text or "")
+
+        choose = service.handle(
+            make_message(
+                text="SY",
+                conversation_id="conv-rmb-1",
+                sender_id="user-rmb-1",
+            )
+        )
+        self.assertEqual("reimbursement_travel_ready", choose.reason)
+        self.assertEqual("interactive_card", choose.reply.channel)
+        card = choose.reply.interactive_card or {}
+        self.assertEqual("reimbursement_request_ready", card.get("card_type"))
+        self.assertEqual("SY", card.get("cost_company"))
+        self.assertEqual("否", card.get("over_5000"))
+
+        submitted = service.handle_reimbursement_confirmation_action_by_session(
+            action="reimbursement_confirm_submit",
+            conversation_id="conv-rmb-1",
+            sender_id="user-rmb-1",
+        )
+        self.assertEqual("reimbursement_travel_submitted", submitted.reason)
+        self.assertIn("已提交，审批中", submitted.reply.text or "")
+
+    def test_reimbursement_flow_guidance_query_still_returns_text(self) -> None:
+        service = SingleChatService(
+            reimbursement_request_orchestrator=ReimbursementRequestOrchestrator(
+                travel_application_provider=_StubTravelApplicationProvider(),
+                attachment_processor=_StubReimbursementAttachmentProcessor(),
+            )
+        )
+        result = service.handle(make_message(text="报销流程入口在哪"))
+        self.assertEqual("flow_guidance_text", result.reason)
+        self.assertEqual("reimbursement", result.intent)
+        self.assertEqual("text", result.reply.channel)
+
+    def test_leave_info_flow_guidance_followups_keep_same_canonical_fields(self) -> None:
+        service = SingleChatService()
+        first = service.handle(make_message(text="请假流程入口在哪"))
+        second = service.handle(make_message(text="请假规则是什么"))
+
+        self.assertEqual("flow_guidance_card", first.reason)
+        self.assertEqual("flow_guidance_card", second.reason)
+        self.assertEqual("leave", first.intent)
+        self.assertEqual("leave", second.intent)
+
+        first_card = first.reply.interactive_card or {}
+        second_card = second.reply.interactive_card or {}
+        keys = (
+            "summary",
+            "required_materials",
+            "process_path",
+            "common_errors",
+            "entry_point",
+            "next_action",
+        )
+        for key in keys:
+            self.assertEqual(first_card.get(key), second_card.get(key), f"mismatch on canonical field: {key}")
 
     def test_returns_application_draft_card(self) -> None:
         service = SingleChatService()

@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
 from app.integrations.qwen.client import DEFAULT_QWEN_CHAT_ENDPOINT, HttpQwenChatClient, QwenChatClient
@@ -13,6 +14,27 @@ _CONTENT_SYSTEM_PROMPT = (
     "不能新增输入中不存在的敏感事实。"
     "要保持可执行、简洁、中文。"
 )
+_REIMBURSEMENT_FORBIDDEN_LABELS = (
+    "办理入口：",
+    "办理入口:",
+    "准备材料：",
+    "准备材料:",
+    "流程路径：",
+    "流程路径:",
+    "下一步：",
+    "下一步:",
+)
+_REIMBURSEMENT_MATERIAL_KEYWORDS = ("发票", "行程单", "金额")
+_REIMBURSEMENT_FOLLOWUP_HINTS = (
+    "告诉我",
+    "我帮你",
+    "我来帮你",
+    "不确定",
+    "要不要",
+    "你可以",
+    "可以说",
+)
+_SENTENCE_SPLIT_PATTERN = re.compile(r"[。！？!?]+")
 
 
 class LLMContentGenerationService:
@@ -118,6 +140,26 @@ class LLMContentGenerationService:
 
     @staticmethod
     def _build_user_prompt(*, mode: str, question: str, prompt_fields: Mapping[str, str]) -> str:
+        if mode == "flow_guidance_reimbursement":
+            user_input = prompt_fields.get("user_input", question).strip()
+            canonical_block = prompt_fields.get("canonical_block", "")
+            return (
+                "你是企业内部助手，用户询问了报销相关流程。\n\n"
+                "请用自然对话语气回复，不要使用\"字段名：值\"的格式，\n"
+                "不要出现\"办理入口：\"、\"准备材料：\"、\"流程路径：\"、\"下一步：\"等标签。\n\n"
+                "回复要求：\n"
+                "- 2-4句话说清楚怎么报销\n"
+                "- 自然提到需要准备什么\n"
+                "- 自然提到常见注意事项\n"
+                "- 结尾留一个追问引导\n\n"
+                "参考风格：\n"
+                "\"出差报销需要准备发票、行程单和金额说明，在钉钉工作台的审批里选对应模板提交就行。"
+                "注意出差后30天内要报，超时财务会退回。不确定选哪个报销类型可以告诉我，我帮你找。\"\n\n"
+                f"用户问题：{user_input}\n"
+                f"已知报销规则：{canonical_block}\n\n"
+                "只输出JSON示例: {\"text\":\"...\"}"
+            )
+
         lines = [
             f"模式: {mode}",
             f"用户问题: {question.strip()}",
@@ -148,12 +190,59 @@ class LLMContentGenerationService:
                 flags.append("deny_missing_restriction_notice")
             if "申请路径" not in text:
                 flags.append("deny_missing_next_step")
+        if mode == "flow_guidance_reimbursement":
+            flags.extend(LLMContentGenerationService._validate_reimbursement_guidance_text(text))
         for value in disallowed_values:
             cleaned = value.strip()
             if cleaned and cleaned in text:
                 flags.append("contains_disallowed_content")
                 break
         return flags
+
+    @staticmethod
+    def _validate_reimbursement_guidance_text(text: str) -> list[str]:
+        flags: list[str] = []
+        sentence_count = LLMContentGenerationService._count_sentences(text)
+        if sentence_count < 2 or sentence_count > 4:
+            flags.append("flow_guidance_reimbursement_sentence_count_invalid")
+
+        if any(label in text for label in _REIMBURSEMENT_FORBIDDEN_LABELS):
+            flags.append("flow_guidance_reimbursement_contains_field_labels")
+
+        material_hits = sum(1 for token in _REIMBURSEMENT_MATERIAL_KEYWORDS if token in text)
+        if material_hits < 2:
+            flags.append("flow_guidance_reimbursement_missing_materials")
+
+        if "30天" not in text and "三十天" not in text:
+            flags.append("flow_guidance_reimbursement_missing_time_limit")
+
+        has_invoice_mismatch_notice = "金额与发票不符" in text or (
+            "金额" in text and "发票" in text and ("不符" in text or "不一致" in text)
+        )
+        if not has_invoice_mismatch_notice:
+            flags.append("flow_guidance_reimbursement_missing_mismatch_notice")
+
+        if not LLMContentGenerationService._ends_with_followup_prompt(text):
+            flags.append("flow_guidance_reimbursement_missing_followup_prompt")
+        return flags
+
+    @staticmethod
+    def _count_sentences(text: str) -> int:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized:
+            return 0
+        parts = [part.strip() for part in _SENTENCE_SPLIT_PATTERN.split(normalized) if part.strip()]
+        return len(parts)
+
+    @staticmethod
+    def _ends_with_followup_prompt(text: str) -> bool:
+        parts = [part.strip() for part in _SENTENCE_SPLIT_PATTERN.split(text.strip()) if part.strip()]
+        if not parts:
+            return False
+        last_sentence = parts[-1]
+        if text.strip().endswith(("？", "?")):
+            return True
+        return any(token in last_sentence for token in _REIMBURSEMENT_FOLLOWUP_HINTS)
 
     def _fallback_result(
         self,
