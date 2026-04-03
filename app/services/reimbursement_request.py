@@ -78,14 +78,26 @@ class ReimbursementApprovalCreator(Protocol):
 @dataclass
 class _ReimbursementSession:
     originator_user_id: str
-    stage: Literal["collecting_trip", "collecting_attachment", "collecting_company", "awaiting_confirmation"] = (
-        "collecting_trip"
-    )
+    stage: Literal[
+        "collecting_trip",
+        "collecting_attachment",
+        "collecting_company",
+        "awaiting_amount_conflict_confirmation",
+        "awaiting_confirmation",
+    ] = "collecting_trip"
     travel_candidates: tuple[TravelApplication, ...] = ()
     travel_process_instance_id: str = ""
     travel_display: str = ""
     department: str = ""
     amount: str = ""
+    table_amount: str = ""
+    uppercase_amount_text: str = ""
+    uppercase_amount_raw: str = ""
+    uppercase_amount_numeric: str = ""
+    amount_conflict: bool = False
+    amount_conflict_note: str = ""
+    amount_source: str = "table"
+    amount_source_note: str = ""
     cost_company: str = ""
     attachment_media_id: str = ""
     created_at: datetime | None = None
@@ -211,6 +223,14 @@ class ReimbursementRequestOrchestrator:
                 return self._attachment_failed_result(reason)
             session.department = process_result.department.strip()
             session.amount = process_result.amount.strip()
+            session.table_amount = process_result.table_amount.strip() or session.amount
+            session.uppercase_amount_text = process_result.uppercase_amount_text.strip()
+            session.uppercase_amount_raw = process_result.uppercase_amount_raw.strip() or session.uppercase_amount_text
+            session.uppercase_amount_numeric = process_result.uppercase_amount_numeric.strip()
+            session.amount_conflict = bool(process_result.amount_conflict)
+            session.amount_conflict_note = process_result.amount_conflict_note.strip()
+            session.amount_source = process_result.amount_source.strip() or "table"
+            session.amount_source_note = process_result.amount_source_note.strip()
             session.attachment_media_id = process_result.attachment_media_id.strip()
             if not session.department or not session.amount or not session.attachment_media_id:
                 return self._attachment_failed_result("附件解析不完整，请确认模板后重新上传。")
@@ -226,11 +246,20 @@ class ReimbursementRequestOrchestrator:
             if company not in self._company_options:
                 return self._collecting_company_result(session=session, invalid=True)
             session.cost_company = company
+            if session.amount_conflict:
+                session.stage = "awaiting_amount_conflict_confirmation"
+                session.updated_at = now
+                session.confirmation_started_at = now
+                self._sessions[key] = session
+                return self._amount_conflict_confirmation_result(session=session)
             session.stage = "awaiting_confirmation"
             session.updated_at = now
             session.confirmation_started_at = now
             self._sessions[key] = session
             return self._ready_result(session=session)
+
+        if session.stage == "awaiting_amount_conflict_confirmation":
+            return self._amount_conflict_confirmation_result(session=session, remind=True)
 
         if session.stage == "awaiting_confirmation":
             if normalized in _TEXT_CONFIRM_OR_CANCEL_TOKENS:
@@ -256,13 +285,42 @@ class ReimbursementRequestOrchestrator:
             self._sessions.pop(key, None)
             return self._confirmation_expired_result()
 
-        if session.stage != "awaiting_confirmation":
-            return self._not_found_result()
-
         normalized_action = self._normalize(action)
         if normalized_action == "reimbursement_cancel_submit":
             self._sessions.pop(key, None)
             return self._cancelled_result()
+
+        if session.stage == "awaiting_amount_conflict_confirmation":
+            if normalized_action == "reimbursement_amount_use_table":
+                if session.table_amount:
+                    session.amount = self._normalize_amount_text(session.table_amount)
+                session.amount_conflict = False
+                session.amount_conflict_note = "已选择按合计金额提交。"
+                session.amount_source = "table"
+                session.amount_source_note = "金额冲突已确认：按合计金额提交"
+                session.stage = "awaiting_confirmation"
+                session.updated_at = now
+                session.confirmation_started_at = now
+                self._sessions[key] = session
+                return self._ready_result(session=session)
+            if normalized_action == "reimbursement_amount_use_uppercase":
+                if not session.uppercase_amount_numeric:
+                    return self._amount_conflict_confirmation_result(session=session, remind=True)
+                session.amount = self._normalize_amount_text(session.uppercase_amount_numeric)
+                session.amount_conflict = False
+                session.amount_conflict_note = "已选择按大写金额提交。"
+                session.amount_source = "uppercase"
+                session.amount_source_note = "金额冲突已确认：按大写金额提交"
+                session.stage = "awaiting_confirmation"
+                session.updated_at = now
+                session.confirmation_started_at = now
+                self._sessions[key] = session
+                return self._ready_result(session=session)
+            return self._amount_conflict_confirmation_result(session=session, remind=True)
+
+        if session.stage != "awaiting_confirmation":
+            return self._not_found_result()
+
         if normalized_action != "reimbursement_confirm_submit":
             return self._waiting_button_action_result()
 
@@ -289,7 +347,7 @@ class ReimbursementRequestOrchestrator:
 
     @staticmethod
     def _is_confirmation_expired(*, session: _ReimbursementSession, now: datetime) -> bool:
-        if session.stage != "awaiting_confirmation":
+        if session.stage not in {"awaiting_confirmation", "awaiting_amount_conflict_confirmation"}:
             return False
         anchor = session.confirmation_started_at
         if anchor is None:
@@ -357,10 +415,14 @@ class ReimbursementRequestOrchestrator:
                     "event": "reimbursement_submit_fallback",
                     "originator_user_id": submission.originator_user_id,
                     "reason": result.reason,
+                    "failure_category": result.failure_category,
+                    "errcode": result.raw_errcode,
+                    "errmsg": result.raw_errmsg,
                 }
             },
         )
-        return self._handoff_fallback_result()
+        short_reason, suggestion = self._map_submit_failure_to_user_hint(result)
+        return self._handoff_fallback_result(short_reason=short_reason, suggestion=suggestion)
 
     @staticmethod
     def _parse_amount_value(raw: str) -> float:
@@ -412,13 +474,16 @@ class ReimbursementRequestOrchestrator:
 
     def _collecting_company_result(self, *, session: _ReimbursementSession, invalid: bool = False) -> ChatHandleResult:
         options = " / ".join(self._company_options)
-        prefix = (
-            "费用归属公司无效，请从以下选项中选择：\n"
-            if invalid
-            else "已解析：\n"
-            f"部门：{session.department}，金额：{self._normalize_amount_text(session.amount)}元\n\n"
-            "费用归属公司选哪个？\n"
-        )
+        if invalid:
+            prefix = "费用归属公司无效，请从以下选项中选择：\n"
+        else:
+            source_line = f"金额来源：{session.amount_source_note}\n" if session.amount_source_note else ""
+            prefix = (
+                "已解析：\n"
+                f"部门：{session.department}，金额：{self._normalize_amount_text(session.amount)}元\n"
+                f"{source_line}\n"
+                "费用归属公司选哪个？\n"
+            )
         return ChatHandleResult(
             handled=True,
             reason="reimbursement_travel_collecting_company",
@@ -439,6 +504,7 @@ class ReimbursementRequestOrchestrator:
     def _ready_result(self, *, session: _ReimbursementSession) -> ChatHandleResult:
         amount_text = f"{self._normalize_amount_text(session.amount)}元"
         over_five_thousand = "是" if self._parse_amount_value(session.amount) > 5000 else "否"
+        amount_source_line = f"\n金额来源：{session.amount_source_note}" if session.amount_source_note else ""
         card = {
             "card_type": "reimbursement_request_ready",
             "title": "差旅报销确认",
@@ -448,11 +514,12 @@ class ReimbursementRequestOrchestrator:
                 f"金额：{amount_text}\n"
                 f"归属公司：{session.cost_company}\n"
                 f"是否超5千：{over_five_thousand}\n"
-                "附件：已处理 ✓"
+                f"附件：已处理 ✓{amount_source_line}"
             ),
             "linked_trip": session.travel_display,
             "department": session.department,
             "amount": amount_text,
+            "amount_source": session.amount_source_note or session.amount_source,
             "cost_company": session.cost_company,
             "over_5000": over_five_thousand,
             "attachment_status": "已处理 ✓",
@@ -465,6 +532,50 @@ class ReimbursementRequestOrchestrator:
         return ChatHandleResult(
             handled=True,
             reason="reimbursement_travel_ready",
+            intent="reimbursement",
+            reply=AgentReply(channel="interactive_card", interactive_card=card),
+        )
+
+    def _amount_conflict_confirmation_result(
+        self,
+        *,
+        session: _ReimbursementSession,
+        remind: bool = False,
+    ) -> ChatHandleResult:
+        table_amount = f"{self._normalize_amount_text(session.table_amount)}元" if session.table_amount else "未识别"
+        uppercase_raw = session.uppercase_amount_raw or session.uppercase_amount_text or "未识别"
+        uppercase_numeric = (
+            f"{self._normalize_amount_text(session.uppercase_amount_numeric)}元"
+            if session.uppercase_amount_numeric
+            else "未识别"
+        )
+        note = session.amount_conflict_note or "检测到合计金额与大写金额不一致，请确认提交金额来源。"
+        summary = (
+            f"合计金额：{table_amount}\n"
+            f"大写金额：{uppercase_raw}\n"
+            f"大写换算：{uppercase_numeric}\n"
+            f"{note}"
+        )
+        if remind:
+            summary = "请先完成金额冲突确认。\n" + summary
+        card = {
+            "card_type": "reimbursement_amount_conflict_confirmation",
+            "title": "报销金额冲突确认",
+            "summary": summary,
+            "table_amount": table_amount,
+            "uppercase_amount_raw": uppercase_raw,
+            "uppercase_amount_numeric": uppercase_numeric,
+            "conflict_note": note,
+            "actions": [
+                {"label": "按合计提交", "action": "reimbursement_amount_use_table", "status": "primary"},
+                {"label": "按大写提交", "action": "reimbursement_amount_use_uppercase", "status": "primary"},
+                {"label": "取消", "action": "reimbursement_cancel_submit", "status": "warning"},
+            ],
+            "next_action": "请选择金额来源后再继续提交。",
+        }
+        return ChatHandleResult(
+            handled=True,
+            reason="reimbursement_travel_amount_conflict_confirmation",
             intent="reimbursement",
             reply=AgentReply(channel="interactive_card", interactive_card=card),
         )
@@ -488,13 +599,71 @@ class ReimbursementRequestOrchestrator:
         )
 
     @classmethod
-    def _handoff_fallback_result(cls) -> ChatHandleResult:
+    def _handoff_fallback_result_with_hint(cls, *, short_reason: str, suggestion: str) -> ChatHandleResult:
+        text = "自动提交流程失败，请到 OA 审批入口手动提交。"
+        normalized_reason = short_reason.strip()
+        normalized_suggestion = suggestion.strip()
+        if normalized_reason and normalized_suggestion:
+            text = (
+                "自动提交流程失败。\n"
+                f"失败原因：{normalized_reason}\n"
+                f"建议：{normalized_suggestion}"
+            )
+        elif normalized_reason:
+            text = (
+                "自动提交流程失败。\n"
+                f"失败原因：{normalized_reason}\n"
+                "建议：请稍后重试，若持续失败请联系管理员核查审批配置。"
+            )
+        return ChatHandleResult(
+            handled=False,
+            reason="reimbursement_travel_handoff_fallback",
+            intent="reimbursement",
+            reply=AgentReply(channel="text", text=text),
+        )
+
+    @classmethod
+    def _handoff_fallback_result(cls, *, short_reason: str = "", suggestion: str = "") -> ChatHandleResult:
+        if short_reason or suggestion:
+            return cls._handoff_fallback_result_with_hint(short_reason=short_reason, suggestion=suggestion)
         return ChatHandleResult(
             handled=False,
             reason="reimbursement_travel_handoff_fallback",
             intent="reimbursement",
             reply=AgentReply(channel="text", text="自动提交流程失败，请到 OA 审批入口手动提交。"),
         )
+
+    @staticmethod
+    def _map_submit_failure_to_user_hint(result: ReimbursementApprovalResult) -> tuple[str, str]:
+        category = (result.failure_category or "").strip().lower()
+        mapping: dict[str, tuple[str, str]] = {
+            "field_mapping": (
+                "审批字段映射与模板不一致。",
+                "请联系管理员核对审批表单字段名称与系统配置后重试。",
+            ),
+            "value_format": (
+                "审批字段值格式不符合模板要求。",
+                "请检查金额、日期、费用归属公司后重试。",
+            ),
+            "permission_identity": (
+                "当前账号暂无该审批发起权限。",
+                "请确认机器人应用授权与发起人审批权限后重试。",
+            ),
+            "transport_error": (
+                "审批接口调用失败或超时。",
+                "请稍后重试，若持续失败请联系管理员检查网络与OpenAPI配置。",
+            ),
+            "unknown": (
+                "审批接口返回未知错误。",
+                "请稍后重试并联系管理员查看日志中的错误码详情。",
+            ),
+        }
+        if category in mapping:
+            return mapping[category]
+        reason = (result.reason or "").strip()
+        if reason == "transport_error":
+            return mapping["transport_error"]
+        return mapping["unknown"]
 
     @classmethod
     def _cancelled_result(cls) -> ChatHandleResult:

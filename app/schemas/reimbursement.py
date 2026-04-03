@@ -24,6 +24,14 @@ class ReimbursementAttachmentProcessResult:
     department: str = ""
     amount: str = ""
     attachment_media_id: str = ""
+    table_amount: str = ""
+    uppercase_amount_text: str = ""
+    uppercase_amount_raw: str = ""
+    uppercase_amount_numeric: str = ""
+    amount_conflict: bool = False
+    amount_conflict_note: str = ""
+    amount_source: str = "table"
+    amount_source_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -44,3 +52,6 @@ class ReimbursementApprovalResult:
     success: bool
     reason: str
     process_instance_id: str = ""
+    failure_category: str = ""
+    raw_errcode: int | None = None
+    raw_errmsg: str = ""

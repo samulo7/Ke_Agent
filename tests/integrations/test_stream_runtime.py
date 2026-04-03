@@ -2515,6 +2515,109 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertEqual("YXQY", creator.submission.fixed_company)
         self.assertEqual("SY", creator.submission.cost_company)
 
+    def test_handle_single_chat_payload_reimbursement_amount_conflict_needs_choice(self) -> None:
+        sender = _FakeSender()
+        resolver = self._build_resolver()
+        creator = _StubReimbursementApprovalCreator(
+            ReimbursementApprovalResult(success=True, reason="submitted", process_instance_id="proc-rmb-stream-2")
+        )
+        attachment_result = ReimbursementAttachmentProcessResult(
+            success=True,
+            reason="processed",
+            department="总经办",
+            amount="106",
+            attachment_media_id="media-pdf-1",
+            table_amount="106",
+            uppercase_amount_raw="壹佰壹拾元整",
+            uppercase_amount_numeric="110",
+            amount_conflict=True,
+            amount_conflict_note="合计金额与大写金额不一致，请确认提交金额来源。",
+            amount_source="table_conflict",
+            amount_source_note="检测到金额冲突，待人工确认",
+        )
+        service = SingleChatService(
+            reimbursement_request_orchestrator=ReimbursementRequestOrchestrator(
+                travel_application_provider=_StubTravelApplicationProvider(),
+                attachment_processor=_StubReimbursementAttachmentProcessor(result=attachment_result),
+                approval_creator=creator,
+            )
+        )
+
+        handle_single_chat_payload(
+            _make_payload(
+                text="我要报销差旅费",
+                conversation_id="conv-rmb-stream-2",
+                sender_id="user-rmb-stream-2",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        handle_single_chat_payload(
+            _make_payload(
+                text="1",
+                conversation_id="conv-rmb-stream-2",
+                sender_id="user-rmb-stream-2",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        handle_single_chat_payload(
+            _make_payload(
+                text="",
+                message_type="file",
+                conversation_id="conv-rmb-stream-2",
+                sender_id="user-rmb-stream-2",
+                file_name="差旅费报销单.xlsx",
+                file_content_base64="ZmFrZQ==",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+
+        fourth = handle_single_chat_payload(
+            _make_payload(
+                text="SY",
+                conversation_id="conv-rmb-stream-2",
+                sender_id="user-rmb-stream-2",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertEqual("reimbursement_travel_amount_conflict_confirmation", fourth["reason"])
+        self.assertEqual("reimbursement_amount_conflict_confirmation", sender.card_payloads[-1]["card_type"])
+
+        fifth = handle_single_chat_payload(
+            _make_reimbursement_callback_payload(
+                action_id="reimbursement_amount_use_uppercase",
+                conversation_id="conv-rmb-stream-2",
+                sender_id="user-rmb-stream-2",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertEqual("reimbursement_travel_ready", fifth["reason"])
+        self.assertEqual("reimbursement_amount_use_uppercase", fifth["reimbursement_action"])
+        self.assertEqual("pending", fifth["reimbursement_status"])
+
+        sixth = handle_single_chat_payload(
+            _make_reimbursement_callback_payload(
+                action_id="reimbursement_confirm_submit",
+                conversation_id="conv-rmb-stream-2",
+                sender_id="user-rmb-stream-2",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertEqual("reimbursement_travel_submitted", sixth["reason"])
+        self.assertEqual("submitted", sixth["reimbursement_status"])
+        self.assertEqual("110", creator.submission.amount)
+
     def test_handle_single_chat_payload_leave_confirm_button_submits_text(self) -> None:
         sender = _FakeSender()
         resolver = self._build_resolver()
