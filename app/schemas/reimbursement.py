@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class ReimbursementAttachmentProcessResult:
     amount_conflict_note: str = ""
     amount_source: str = "table"
     amount_source_note: str = ""
+    extraction_evidence: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
