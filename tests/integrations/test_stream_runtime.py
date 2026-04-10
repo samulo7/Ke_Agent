@@ -167,7 +167,14 @@ class _StubReimbursementAttachmentProcessor:
             reason="processed",
             department="总经办",
             amount="106",
-            attachment_media_id="media-pdf-1",
+            attachment_media_id="media-image-1",
+            amount_source="screenshot",
+            amount_source_note="截图识别成功，待人工确认",
+            extraction_evidence={
+                "template_match": {"hit": True, "evidence": "模板已命中"},
+                "department_match": {"label": "部门", "hit": True},
+                "amount_match": {"row_header": "合计", "col_header": "合计金额", "row_hit": True, "col_hit": True},
+            },
         )
 
     def process(self, *, message, conversation_id: str, sender_id: str):  # type: ignore[no-untyped-def]
@@ -2465,23 +2472,35 @@ class StreamRuntimeTests(unittest.TestCase):
             user_context_resolver=resolver,
         )
         self.assertEqual("reimbursement_travel_collecting_attachment", second["reason"])
-        self.assertIn("差旅费报销单（Excel）", sender.text_messages[-1])
+        self.assertIn("报销单截图", sender.text_messages[-1])
 
         third = handle_single_chat_payload(
             _make_payload(
                 text="",
-                message_type="file",
+                message_type="picture",
                 conversation_id="conv-rmb-stream-1",
                 sender_id="user-rmb-stream-1",
-                file_name="差旅费报销单.xlsx",
+                file_name="报销单截图.png",
                 file_content_base64="ZmFrZQ==",
             ),
             service=service,
             sender=sender,
             user_context_resolver=resolver,
         )
-        self.assertEqual("reimbursement_travel_collecting_company", third["reason"])
-        self.assertIn("部门：总经办", sender.text_messages[-1])
+        self.assertEqual("reimbursement_travel_recognition_confirmation", third["reason"])
+        self.assertEqual("reimbursement_recognition_confirmation", sender.card_payloads[-1]["card_type"])
+
+        confirmed_recognition = handle_single_chat_payload(
+            _make_reimbursement_callback_payload(
+                action_id="reimbursement_recognition_confirm",
+                conversation_id="conv-rmb-stream-1",
+                sender_id="user-rmb-stream-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertEqual("reimbursement_travel_collecting_company", confirmed_recognition["reason"])
 
         fourth = handle_single_chat_payload(
             _make_payload(
@@ -2515,7 +2534,7 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertEqual("YXQY", creator.submission.fixed_company)
         self.assertEqual("SY", creator.submission.cost_company)
 
-    def test_handle_single_chat_payload_reimbursement_amount_conflict_needs_choice(self) -> None:
+    def test_handle_single_chat_payload_reimbursement_recognition_needs_confirmation(self) -> None:
         sender = _FakeSender()
         resolver = self._build_resolver()
         creator = _StubReimbursementApprovalCreator(
@@ -2526,14 +2545,14 @@ class StreamRuntimeTests(unittest.TestCase):
             reason="processed",
             department="总经办",
             amount="106",
-            attachment_media_id="media-pdf-1",
-            table_amount="106",
-            uppercase_amount_raw="壹佰壹拾元整",
-            uppercase_amount_numeric="110",
-            amount_conflict=True,
-            amount_conflict_note="合计金额与大写金额不一致，请确认提交金额来源。",
-            amount_source="table_conflict",
-            amount_source_note="检测到金额冲突，待人工确认",
+            attachment_media_id="media-image-1",
+            amount_source="screenshot",
+            amount_source_note="截图识别成功，待人工确认",
+            extraction_evidence={
+                "template_match": {"hit": True, "evidence": "模板已命中"},
+                "department_match": {"label": "部门", "hit": True},
+                "amount_match": {"row_header": "合计", "col_header": "合计金额", "row_hit": True, "col_hit": True},
+            },
         )
         service = SingleChatService(
             reimbursement_request_orchestrator=ReimbursementRequestOrchestrator(
@@ -2566,10 +2585,10 @@ class StreamRuntimeTests(unittest.TestCase):
         handle_single_chat_payload(
             _make_payload(
                 text="",
-                message_type="file",
+                message_type="picture",
                 conversation_id="conv-rmb-stream-2",
                 sender_id="user-rmb-stream-2",
-                file_name="差旅费报销单.xlsx",
+                file_name="报销单截图.png",
                 file_content_base64="ZmFrZQ==",
             ),
             service=service,
@@ -2587,12 +2606,12 @@ class StreamRuntimeTests(unittest.TestCase):
             sender=sender,
             user_context_resolver=resolver,
         )
-        self.assertEqual("reimbursement_travel_amount_conflict_confirmation", fourth["reason"])
-        self.assertEqual("reimbursement_amount_conflict_confirmation", sender.card_payloads[-1]["card_type"])
+        self.assertEqual("reimbursement_travel_recognition_confirmation", fourth["reason"])
+        self.assertEqual("reimbursement_recognition_confirmation", sender.card_payloads[-1]["card_type"])
 
         fifth = handle_single_chat_payload(
             _make_reimbursement_callback_payload(
-                action_id="reimbursement_amount_use_uppercase",
+                action_id="reimbursement_recognition_confirm",
                 conversation_id="conv-rmb-stream-2",
                 sender_id="user-rmb-stream-2",
             ),
@@ -2600,11 +2619,23 @@ class StreamRuntimeTests(unittest.TestCase):
             sender=sender,
             user_context_resolver=resolver,
         )
-        self.assertEqual("reimbursement_travel_ready", fifth["reason"])
-        self.assertEqual("reimbursement_amount_use_uppercase", fifth["reimbursement_action"])
+        self.assertEqual("reimbursement_travel_collecting_company", fifth["reason"])
+        self.assertEqual("reimbursement_recognition_confirm", fifth["reimbursement_action"])
         self.assertEqual("pending", fifth["reimbursement_status"])
 
         sixth = handle_single_chat_payload(
+            _make_payload(
+                text="SY",
+                conversation_id="conv-rmb-stream-2",
+                sender_id="user-rmb-stream-2",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        self.assertEqual("reimbursement_travel_ready", sixth["reason"])
+
+        seventh = handle_single_chat_payload(
             _make_reimbursement_callback_payload(
                 action_id="reimbursement_confirm_submit",
                 conversation_id="conv-rmb-stream-2",
@@ -2614,9 +2645,91 @@ class StreamRuntimeTests(unittest.TestCase):
             sender=sender,
             user_context_resolver=resolver,
         )
-        self.assertEqual("reimbursement_travel_submitted", sixth["reason"])
-        self.assertEqual("submitted", sixth["reimbursement_status"])
-        self.assertEqual("110", creator.submission.amount)
+        self.assertEqual("reimbursement_travel_submitted", seventh["reason"])
+        self.assertEqual("submitted", seventh["reimbursement_status"])
+        self.assertEqual("106", creator.submission.amount)
+
+    def test_handle_single_chat_payload_reimbursement_recognition_confirm_accepts_confirm_request_alias(self) -> None:
+        sender = _FakeSender()
+        resolver = self._build_resolver()
+        service = SingleChatService(
+            reimbursement_request_orchestrator=ReimbursementRequestOrchestrator(
+                travel_application_provider=_StubTravelApplicationProvider(),
+                attachment_processor=_StubReimbursementAttachmentProcessor(
+                    result=ReimbursementAttachmentProcessResult(
+                        success=True,
+                        reason="processed",
+                        department="总经办",
+                        amount="106",
+                        attachment_media_id="media-image-1",
+                        amount_source="screenshot",
+                        amount_source_note="截图识别成功，待人工确认",
+                        extraction_evidence={
+                            "template_match": {"hit": True, "evidence": "模板已命中"},
+                            "department_match": {"label": "部门", "hit": True},
+                            "amount_match": {"row_header": "合计", "col_header": "合计金额", "row_hit": True, "col_hit": True},
+                        },
+                    )
+                ),
+                approval_creator=_StubReimbursementApprovalCreator(
+                    ReimbursementApprovalResult(success=True, reason="submitted", process_instance_id="proc-rmb-stream-alias-1")
+                ),
+            )
+        )
+
+        handle_single_chat_payload(
+            _make_payload(
+                text="我要报销差旅费",
+                conversation_id="conv-rmb-stream-alias-1",
+                sender_id="user-rmb-stream-alias-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        handle_single_chat_payload(
+            _make_payload(
+                text="1",
+                conversation_id="conv-rmb-stream-alias-1",
+                sender_id="user-rmb-stream-alias-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        handle_single_chat_payload(
+            _make_payload(
+                text="",
+                message_type="picture",
+                conversation_id="conv-rmb-stream-alias-1",
+                sender_id="user-rmb-stream-alias-1",
+                file_name="报销单截图.png",
+                file_content_base64="ZmFrZQ==",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+
+        confirmed = handle_single_chat_payload(
+            {
+                "data": {
+                    "type": "actionCallback",
+                    "userId": "user-rmb-stream-alias-1",
+                    "extension": "{}",
+                    "content": "{\"cardPrivateData\":{\"actionIds\":[\"confirm_request\"],\"params\":{}}}",
+                    "spaceId": "conv-rmb-stream-alias-1",
+                    "outTrackId": "reimbursement-confirm-alias-1",
+                    "value": "{\"cardPrivateData\":{\"actionIds\":[\"confirm_request\"],\"params\":{}}}",
+                }
+            },
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+
+        self.assertEqual("reimbursement_travel_collecting_company", confirmed["reason"])
+        self.assertEqual("confirm_request", confirmed["reimbursement_action"])
 
     def test_handle_single_chat_payload_leave_confirm_button_submits_text(self) -> None:
         sender = _FakeSender()

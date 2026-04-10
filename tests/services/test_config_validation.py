@@ -221,6 +221,31 @@ class ConfigValidationTests(unittest.TestCase):
         ]
         self.assertEqual(1, len(matches))
 
+    def test_reimbursement_attachment_mode_defaults_to_screenshot_only(self) -> None:
+        result = validate_config(make_valid_env())
+        self.assertTrue(result.ok)
+        self.assertEqual("screenshot_only", result.resolved["DINGTALK_REIMBURSE_ATTACHMENT_MODE"])
+        self.assertEqual("qwen-vl-ocr-latest", result.resolved["DINGTALK_REIMBURSE_VISION_MODEL"])
+
+    def test_reimbursement_dedicated_vision_endpoint_and_key_are_resolved(self) -> None:
+        env = make_valid_env()
+        env["DINGTALK_REIMBURSE_VISION_API_KEY"] = "vision-key"
+        env["DINGTALK_REIMBURSE_VISION_BASE_URL"] = "https://vision.example/v1"
+        result = validate_config(env)
+        self.assertTrue(result.ok)
+        self.assertEqual("vision-key", result.resolved["DINGTALK_REIMBURSE_VISION_API_KEY"])
+        self.assertEqual("https://vision.example/v1", result.resolved["DINGTALK_REIMBURSE_VISION_BASE_URL"])
+
+    def test_reimbursement_attachment_mode_rejects_unsupported_value(self) -> None:
+        env = make_valid_env()
+        env["DINGTALK_REIMBURSE_ATTACHMENT_MODE"] = "excel"
+        result = validate_config(env)
+        self.assertFalse(result.ok)
+        matches = [
+            err for err in result.errors if err.key == "DINGTALK_REIMBURSE_ATTACHMENT_MODE" and err.code == "INVALID_VALUE"
+        ]
+        self.assertEqual(1, len(matches))
+
     def test_reimbursement_approval_enabled_requires_process_code(self) -> None:
         env = make_valid_env()
         env["DINGTALK_REIMBURSE_APPROVAL_ENABLED"] = "true"
@@ -245,6 +270,20 @@ class ConfigValidationTests(unittest.TestCase):
             and warning.code == "DISABLED_FEATURE_CONFIG_PRESENT"
         ]
         self.assertEqual(1, len(matches))
+
+    def test_reimbursement_approval_enabled_with_process_code_has_no_disabled_warning(self) -> None:
+        env = make_valid_env()
+        env["DINGTALK_REIMBURSE_APPROVAL_ENABLED"] = "true"
+        env["DINGTALK_REIMBURSE_APPROVAL_PROCESS_CODE"] = "PROC-RMB"
+        result = validate_config(env)
+        self.assertTrue(result.ok)
+        matches = [
+            warning
+            for warning in result.warnings
+            if warning.key == "DINGTALK_REIMBURSE_APPROVAL_ENABLED"
+            and warning.code == "DISABLED_FEATURE_CONFIG_PRESENT"
+        ]
+        self.assertEqual(0, len(matches))
 
     def test_travel_lookup_enabled_requires_travel_process_code(self) -> None:
         env = make_valid_env()

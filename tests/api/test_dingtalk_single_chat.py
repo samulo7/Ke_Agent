@@ -57,7 +57,14 @@ class _StubReimbursementAttachmentProcessor:
             reason="processed",
             department="总经办",
             amount="106",
-            attachment_media_id="media-pdf-1",
+            attachment_media_id="media-image-1",
+            amount_source="screenshot",
+            amount_source_note="截图识别成功，待人工确认",
+            extraction_evidence={
+                "template_match": {"hit": True, "evidence": "模板已命中"},
+                "department_match": {"label": "部门", "hit": True},
+                "amount_match": {"row_header": "合计", "col_header": "合计金额", "row_hit": True, "col_hit": True},
+            },
         )
 
     def process(self, *, message, conversation_id: str, sender_id: str):  # type: ignore[no-untyped-def]
@@ -525,16 +532,27 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
             "/dingtalk/stream/events",
             json=make_stream_payload(
                 text="",
-                message_type="file",
+                message_type="picture",
                 sender_id="finance-user",
                 conversation_id="conv-rmb-api-1",
-                file_name="差旅费报销单.xlsx",
+                file_name="报销单截图.png",
                 file_content_base64="ZmFrZQ==",
             ),
         )
         self.assertEqual(200, third.status_code)
-        self.assertEqual("reimbursement_travel_collecting_company", third.json()["reason"])
-        self.assertIn("部门：总经办", third.json()["reply"]["text"])
+        self.assertEqual("reimbursement_travel_recognition_confirmation", third.json()["reason"])
+        self.assertEqual("interactive_card", third.json()["reply"]["channel"])
+
+        confirmed_recognition = client.post(
+            "/dingtalk/stream/events",
+            json=make_reimbursement_button_callback_payload(
+                action_id="reimbursement_recognition_confirm",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-1",
+            ),
+        )
+        self.assertEqual(200, confirmed_recognition.status_code)
+        self.assertEqual("reimbursement_travel_collecting_company", confirmed_recognition.json()["reason"])
 
         fourth = client.post(
             "/dingtalk/stream/events",
@@ -572,10 +590,89 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertEqual("SY", approval_creator.submission.cost_company)
         self.assertEqual("106", approval_creator.submission.amount)
         self.assertEqual("否", approval_creator.submission.over_five_thousand)
-        self.assertEqual("media-pdf-1", approval_creator.submission.attachment_media_id)
+        self.assertEqual("media-image-1", approval_creator.submission.attachment_media_id)
         self.assertEqual("allow", body_fifth["permission_decision"])
 
-    def test_reimbursement_amount_conflict_requires_choice_before_submit(self) -> None:
+    def test_reimbursement_recognition_confirm_accepts_confirm_request_alias(self) -> None:
+        approval_creator = _StubReimbursementApprovalCreator(
+            ReimbursementApprovalResult(success=True, reason="submitted", process_instance_id="proc-rmb-api-alias-1")
+        )
+        attachment_result = ReimbursementAttachmentProcessResult(
+            success=True,
+            reason="processed",
+            department="总经办",
+            amount="106",
+            attachment_media_id="media-image-1",
+            amount_source="screenshot",
+            amount_source_note="截图识别成功，待人工确认",
+            extraction_evidence={
+                "template_match": {"hit": True, "evidence": "模板已命中"},
+                "department_match": {"label": "部门", "hit": True},
+                "amount_match": {"row_header": "合计", "col_header": "合计金额", "row_hit": True, "col_hit": True},
+            },
+        )
+        service = SingleChatService(
+            reimbursement_request_orchestrator=ReimbursementRequestOrchestrator(
+                travel_application_provider=_StubTravelApplicationProvider(),
+                attachment_processor=_StubReimbursementAttachmentProcessor(result=attachment_result),
+                approval_creator=approval_creator,
+            )
+        )
+        app = create_app(
+            log_stream=StringIO(),
+            single_chat_service=service,
+            user_context_resolver=_PermissionResolver(),
+        )
+        client = TestClient(app)
+
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要报销差旅费",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-alias-1",
+            ),
+        )
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="1",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-alias-1",
+            ),
+        )
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="",
+                message_type="picture",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-alias-1",
+                file_name="报销单截图.png",
+                file_content_base64="ZmFrZQ==",
+            ),
+        )
+
+        response = client.post(
+            "/dingtalk/stream/events",
+            json={
+                "data": {
+                    "type": "actionCallback",
+                    "userId": "finance-user",
+                    "extension": "{}",
+                    "content": "{\"cardPrivateData\":{\"actionIds\":[\"confirm_request\"],\"params\":{}}}",
+                    "spaceId": "conv-rmb-api-alias-1",
+                    "outTrackId": "reimbursement-confirm-alias-1",
+                    "value": "{\"cardPrivateData\":{\"actionIds\":[\"confirm_request\"],\"params\":{}}}",
+                }
+            },
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("reimbursement_travel_collecting_company", body["reason"])
+        self.assertEqual("confirm_request", body["reimbursement_action"])
+
+    def test_reimbursement_recognition_requires_confirmation_before_company_selection(self) -> None:
         clock = _FakeClock()
         approval_creator = _StubReimbursementApprovalCreator(
             ReimbursementApprovalResult(success=True, reason="submitted", process_instance_id="proc-rmb-api-2")
@@ -585,14 +682,14 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
             reason="processed",
             department="总经办",
             amount="106",
-            attachment_media_id="media-pdf-1",
-            table_amount="106",
-            uppercase_amount_raw="壹佰壹拾元整",
-            uppercase_amount_numeric="110",
-            amount_conflict=True,
-            amount_conflict_note="合计金额与大写金额不一致，请确认提交金额来源。",
-            amount_source="table_conflict",
-            amount_source_note="检测到金额冲突，待人工确认",
+            attachment_media_id="media-image-1",
+            amount_source="screenshot",
+            amount_source_note="截图识别成功，待人工确认",
+            extraction_evidence={
+                "template_match": {"hit": True, "evidence": "模板已命中"},
+                "department_match": {"label": "部门", "hit": True},
+                "amount_match": {"row_header": "合计", "col_header": "合计金额", "row_hit": True, "col_hit": True},
+            },
         )
         service = SingleChatService(
             reimbursement_request_orchestrator=ReimbursementRequestOrchestrator(
@@ -635,17 +732,17 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
             "/dingtalk/stream/events",
             json=make_stream_payload(
                 text="",
-                message_type="file",
+                message_type="picture",
                 sender_id="finance-user",
                 conversation_id="conv-rmb-api-2",
-                file_name="差旅费报销单.xlsx",
+                file_name="报销单截图.png",
                 file_content_base64="ZmFrZQ==",
             ),
         )
         self.assertEqual(200, third.status_code)
-        self.assertEqual("reimbursement_travel_collecting_company", third.json()["reason"])
+        self.assertEqual("reimbursement_travel_recognition_confirmation", third.json()["reason"])
 
-        fourth = client.post(
+        blocked = client.post(
             "/dingtalk/stream/events",
             json=make_stream_payload(
                 text="SY",
@@ -653,15 +750,27 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
                 conversation_id="conv-rmb-api-2",
             ),
         )
+        self.assertEqual(200, blocked.status_code)
+        self.assertEqual("reimbursement_travel_recognition_confirmation", blocked.json()["reason"])
+
+        fourth = client.post(
+            "/dingtalk/stream/events",
+            json=make_reimbursement_button_callback_payload(
+                action_id="reimbursement_recognition_confirm",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-2",
+            ),
+        )
         self.assertEqual(200, fourth.status_code)
         body_fourth = fourth.json()
-        self.assertEqual("reimbursement_travel_amount_conflict_confirmation", body_fourth["reason"])
-        self.assertEqual("interactive_card", body_fourth["reply"]["channel"])
+        self.assertEqual("reimbursement_travel_collecting_company", body_fourth["reason"])
+        self.assertEqual("reimbursement_recognition_confirm", body_fourth["reimbursement_action"])
+        self.assertEqual("pending", body_fourth["reimbursement_status"])
 
         fifth = client.post(
             "/dingtalk/stream/events",
-            json=make_reimbursement_button_callback_payload(
-                action_id="reimbursement_amount_use_uppercase",
+            json=make_stream_payload(
+                text="SY",
                 sender_id="finance-user",
                 conversation_id="conv-rmb-api-2",
             ),
@@ -669,8 +778,7 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertEqual(200, fifth.status_code)
         body_fifth = fifth.json()
         self.assertEqual("reimbursement_travel_ready", body_fifth["reason"])
-        self.assertEqual("reimbursement_amount_use_uppercase", body_fifth["reimbursement_action"])
-        self.assertEqual("pending", body_fifth["reimbursement_status"])
+        self.assertEqual("interactive_card", body_fifth["reply"]["channel"])
 
         sixth = client.post(
             "/dingtalk/stream/events",
@@ -684,7 +792,7 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         body_sixth = sixth.json()
         self.assertEqual("reimbursement_travel_submitted", body_sixth["reason"])
         self.assertEqual("submitted", body_sixth["reimbursement_status"])
-        self.assertEqual("110", approval_creator.submission.amount)
+        self.assertEqual("106", approval_creator.submission.amount)
 
     def test_leave_info_query_returns_flow_guidance_card(self) -> None:
         app = create_app(log_stream=StringIO())

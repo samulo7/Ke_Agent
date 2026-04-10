@@ -48,9 +48,6 @@ _DEFAULT_COMPANY_OPTIONS = (
     "DR",
 )
 _DEFAULT_FIXED_COMPANY = "YXQY"
-_SUPPORTED_ATTACHMENT_SUFFIXES = (".xlsx",)
-
-
 class TravelApplicationProvider(Protocol):
     def list_recent_approved(
         self,
@@ -81,6 +78,7 @@ class _ReimbursementSession:
     stage: Literal[
         "collecting_trip",
         "collecting_attachment",
+        "awaiting_recognition_confirmation",
         "collecting_company",
         "awaiting_amount_conflict_confirmation",
         "awaiting_confirmation",
@@ -100,6 +98,7 @@ class _ReimbursementSession:
     amount_source_note: str = ""
     cost_company: str = ""
     attachment_media_id: str = ""
+    recognition_evidence_summary: str = ""
     created_at: datetime | None = None
     updated_at: datetime | None = None
     confirmation_started_at: datetime | None = None
@@ -206,38 +205,54 @@ class ReimbursementRequestOrchestrator:
             return self._collecting_attachment_result()
 
         if session.stage == "collecting_attachment":
-            if message.message_type != "file":
+            if message.message_type != "picture":
                 return self._collecting_attachment_result(remind_upload=True)
-            suffix = (message.file_name or "").strip().lower()
-            if not any(suffix.endswith(ext) for ext in _SUPPORTED_ATTACHMENT_SUFFIXES):
-                return self._attachment_failed_result("仅支持上传 .xlsx 报销单，请重新发送。")
             if self._attachment_processor is None:
-                return self._attachment_failed_result("当前未启用附件处理能力，请联系管理员检查配置。")
+                return self._attachment_failed_result("当前未启用截图识别能力，请联系管理员检查配置。")
             process_result = self._attachment_processor.process(
                 message=message,
                 conversation_id=conversation_id,
                 sender_id=sender_id,
             )
             if not process_result.success:
-                reason = process_result.reason.strip() or "附件处理失败，请重新发送文件。"
+                reason = process_result.reason.strip() or "截图识别失败，请重新发送单张完整报销单截图。"
                 return self._attachment_failed_result(reason)
             session.department = process_result.department.strip()
             session.amount = process_result.amount.strip()
             session.table_amount = process_result.table_amount.strip() or session.amount
-            session.uppercase_amount_text = process_result.uppercase_amount_text.strip()
-            session.uppercase_amount_raw = process_result.uppercase_amount_raw.strip() or session.uppercase_amount_text
-            session.uppercase_amount_numeric = process_result.uppercase_amount_numeric.strip()
-            session.amount_conflict = bool(process_result.amount_conflict)
-            session.amount_conflict_note = process_result.amount_conflict_note.strip()
-            session.amount_source = process_result.amount_source.strip() or "table"
+            session.uppercase_amount_text = ""
+            session.uppercase_amount_raw = ""
+            session.uppercase_amount_numeric = ""
+            session.amount_conflict = False
+            session.amount_conflict_note = ""
+            session.amount_source = process_result.amount_source.strip() or "screenshot"
             session.amount_source_note = process_result.amount_source_note.strip()
             session.attachment_media_id = process_result.attachment_media_id.strip()
+            session.recognition_evidence_summary = self._build_recognition_evidence_summary(process_result.extraction_evidence)
             if not session.department or not session.amount or not session.attachment_media_id:
-                return self._attachment_failed_result("附件解析不完整，请确认模板后重新上传。")
-            session.stage = "collecting_company"
+                return self._attachment_failed_result("截图识别不完整，请重新发送单张完整报销单截图。")
+            session.stage = "awaiting_recognition_confirmation"
             session.updated_at = now
+            session.confirmation_started_at = now
             self._sessions[key] = session
-            return self._collecting_company_result(session=session)
+            self._logger.info(
+                "reimbursement.recognition.pending_confirm",
+                extra={
+                    "obs": {
+                        "module": "services.reimbursement_request",
+                        "event": "reimbursement_screenshot_recognition_pending_confirm",
+                        "originator_user_id": session.originator_user_id,
+                        "conversation_id": conversation_id,
+                        "sender_id": sender_id,
+                        "department": session.department,
+                        "amount": self._normalize_amount_text(session.amount),
+                    }
+                },
+            )
+            return self._recognition_confirmation_result(session=session)
+
+        if session.stage == "awaiting_recognition_confirmation":
+            return self._recognition_confirmation_result(session=session, remind=True)
 
         if session.stage == "collecting_company":
             if message.message_type != "text":
@@ -246,12 +261,6 @@ class ReimbursementRequestOrchestrator:
             if company not in self._company_options:
                 return self._collecting_company_result(session=session, invalid=True)
             session.cost_company = company
-            if session.amount_conflict:
-                session.stage = "awaiting_amount_conflict_confirmation"
-                session.updated_at = now
-                session.confirmation_started_at = now
-                self._sessions[key] = session
-                return self._amount_conflict_confirmation_result(session=session)
             session.stage = "awaiting_confirmation"
             session.updated_at = now
             session.confirmation_started_at = now
@@ -286,9 +295,60 @@ class ReimbursementRequestOrchestrator:
             return self._confirmation_expired_result()
 
         normalized_action = self._normalize(action)
+        if session.stage == "awaiting_recognition_confirmation":
+            if normalized_action == "confirm_request":
+                normalized_action = "reimbursement_recognition_confirm"
+            elif normalized_action == "cancel_request":
+                normalized_action = "reimbursement_recognition_retake"
+        elif session.stage == "awaiting_amount_conflict_confirmation":
+            if normalized_action == "confirm_request":
+                normalized_action = "reimbursement_amount_use_table"
+            elif normalized_action == "cancel_request":
+                normalized_action = "reimbursement_amount_use_uppercase"
+        elif session.stage == "awaiting_confirmation":
+            if normalized_action == "confirm_request":
+                normalized_action = "reimbursement_confirm_submit"
+            elif normalized_action == "cancel_request":
+                normalized_action = "reimbursement_cancel_submit"
         if normalized_action == "reimbursement_cancel_submit":
             self._sessions.pop(key, None)
             return self._cancelled_result()
+
+        if session.stage == "awaiting_recognition_confirmation":
+            if normalized_action == "reimbursement_recognition_retake":
+                session.department = ""
+                session.amount = ""
+                session.table_amount = ""
+                session.attachment_media_id = ""
+                session.recognition_evidence_summary = ""
+                session.amount_source = "screenshot"
+                session.amount_source_note = ""
+                session.stage = "collecting_attachment"
+                session.updated_at = now
+                session.confirmation_started_at = None
+                self._sessions[key] = session
+                return self._collecting_attachment_result(remind_upload=True)
+            if normalized_action == "reimbursement_recognition_confirm":
+                session.stage = "collecting_company"
+                session.updated_at = now
+                session.confirmation_started_at = None
+                self._sessions[key] = session
+                self._logger.info(
+                    "reimbursement.recognition.confirmed",
+                    extra={
+                        "obs": {
+                            "module": "services.reimbursement_request",
+                            "event": "reimbursement_screenshot_recognition_confirmed",
+                            "originator_user_id": session.originator_user_id,
+                            "conversation_id": conversation_id,
+                            "sender_id": sender_id,
+                            "department": session.department,
+                            "amount": self._normalize_amount_text(session.amount),
+                        }
+                    },
+                )
+                return self._collecting_company_result(session=session)
+            return self._recognition_confirmation_result(session=session, remind=True)
 
         if session.stage == "awaiting_amount_conflict_confirmation":
             if normalized_action == "reimbursement_amount_use_table":
@@ -347,7 +407,7 @@ class ReimbursementRequestOrchestrator:
 
     @staticmethod
     def _is_confirmation_expired(*, session: _ReimbursementSession, now: datetime) -> bool:
-        if session.stage not in {"awaiting_confirmation", "awaiting_amount_conflict_confirmation"}:
+        if session.stage not in {"awaiting_recognition_confirmation", "awaiting_confirmation", "awaiting_amount_conflict_confirmation"}:
             return False
         anchor = session.confirmation_started_at
         if anchor is None:
@@ -462,9 +522,9 @@ class ReimbursementRequestOrchestrator:
 
     @classmethod
     def _collecting_attachment_result(cls, *, remind_upload: bool = False) -> ChatHandleResult:
-        text = "请发送差旅费报销单（Excel）"
+        text = "请发送单张完整报销单截图"
         if remind_upload:
-            text = "当前步骤需要上传差旅费报销单（Excel），请直接发送 .xlsx 文件。"
+            text = "请发送单张完整报销单截图"
         return ChatHandleResult(
             handled=True,
             reason="reimbursement_travel_collecting_attachment",
@@ -493,13 +553,76 @@ class ReimbursementRequestOrchestrator:
 
     @classmethod
     def _attachment_failed_result(cls, reason: str) -> ChatHandleResult:
-        text = f"{reason}\n请重新上传差旅费报销单（Excel）。"
+        normalized = (reason or "").strip()
+        retry_hint = "请重新发送单张完整报销单截图"
+        actionable_tokens = (
+            retry_hint,
+            "请发送单张完整报销单截图",
+            "请稍后重试",
+            "请重试",
+            "请重发",
+            "请联系管理员",
+        )
+        if any(token in normalized for token in actionable_tokens):
+            text = normalized
+        elif normalized:
+            text = f"{normalized}\n{retry_hint}。"
+        else:
+            text = f"{retry_hint}。"
         return ChatHandleResult(
             handled=False,
             reason="reimbursement_travel_attachment_failed",
             intent="reimbursement",
             reply=AgentReply(channel="text", text=text),
         )
+
+    def _recognition_confirmation_result(self, *, session: _ReimbursementSession, remind: bool = False) -> ChatHandleResult:
+        amount_text = f"{self._normalize_amount_text(session.amount)}元"
+        summary = f"部门：{session.department}\n金额：{amount_text}"
+        if session.recognition_evidence_summary:
+            summary += f"\n证据：{session.recognition_evidence_summary}"
+        if remind:
+            summary = "请先确认识别结果或重传截图。\n" + summary
+        card = {
+            "card_type": "reimbursement_recognition_confirmation",
+            "title": "报销截图识别确认",
+            "summary": summary,
+            "department": session.department,
+            "amount": amount_text,
+            "evidence": session.recognition_evidence_summary,
+            "actions": [
+                {"label": "确认识别结果", "action": "reimbursement_recognition_confirm", "status": "primary"},
+                {"label": "重传截图", "action": "reimbursement_recognition_retake", "status": "warning"},
+            ],
+            "next_action": "请先确认识别结果，再继续选择费用归属公司。",
+        }
+        return ChatHandleResult(
+            handled=True,
+            reason="reimbursement_travel_recognition_confirmation",
+            intent="reimbursement",
+            reply=AgentReply(channel="interactive_card", interactive_card=card),
+        )
+
+    @staticmethod
+    def _build_recognition_evidence_summary(extraction_evidence: dict[str, object]) -> str:
+        template_match = extraction_evidence.get("template_match")
+        department_match = extraction_evidence.get("department_match")
+        amount_match = extraction_evidence.get("amount_match")
+        parts: list[str] = []
+        if isinstance(template_match, dict):
+            evidence = str(template_match.get("evidence") or "").strip()
+            parts.append(evidence or ("模板已命中" if template_match.get("hit") else "模板待人工确认"))
+        if isinstance(department_match, dict):
+            label = str(department_match.get("label") or "").strip()
+            if label:
+                parts.append(f"部门标签={label}")
+        if isinstance(amount_match, dict):
+            row_header = str(amount_match.get("row_header") or "").strip()
+            col_header = str(amount_match.get("col_header") or "").strip()
+            if row_header or col_header:
+                parts.append(f"金额定位={row_header}×{col_header}".strip("×"))
+        normalized_parts = [part for part in parts if part]
+        return "；".join(normalized_parts[:3])
 
     def _ready_result(self, *, session: _ReimbursementSession) -> ChatHandleResult:
         amount_text = f"{self._normalize_amount_text(session.amount)}元"

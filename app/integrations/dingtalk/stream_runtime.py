@@ -435,7 +435,11 @@ def _build_action_card_param_map(
     card_type = str(card_payload.get("card_type") or "").strip()
     if card_type == "leave_request_ready":
         workflow_type = "leave"
-    elif card_type == "reimbursement_request_ready":
+    elif card_type in {
+        "reimbursement_request_ready",
+        "reimbursement_recognition_confirmation",
+        "reimbursement_amount_conflict_confirmation",
+    }:
         workflow_type = "reimbursement"
     else:
         workflow_type = "file_request"
@@ -740,7 +744,13 @@ class _RequesterResultCardNotifier:
 
 def _is_template_driven_action_card(card_payload: Mapping[str, Any]) -> bool:
     card_type = str(card_payload.get("card_type") or "").strip()
-    return card_type in {"file_request_confirmation", "leave_request_ready", "reimbursement_request_ready"}
+    return card_type in {
+        "file_request_confirmation",
+        "leave_request_ready",
+        "reimbursement_request_ready",
+        "reimbursement_recognition_confirmation",
+        "reimbursement_amount_conflict_confirmation",
+    }
 
 
 def _dump_stream_event_if_enabled(*, payload: Any, trace_id: str, logger: logging.Logger) -> None:
@@ -1666,6 +1676,10 @@ def _normalize_reimbursement_action_text(raw: str, *, allow_alias: bool = False)
         return "reimbursement_confirm_submit"
     if normalized in {"reimbursement_cancel_submit", "reimbursementcancelsubmit"}:
         return "reimbursement_cancel_submit"
+    if normalized in {"reimbursement_recognition_confirm", "reimbursementrecognitionconfirm"}:
+        return "reimbursement_recognition_confirm"
+    if normalized in {"reimbursement_recognition_retake", "reimbursementrecognitionretake"}:
+        return "reimbursement_recognition_retake"
     if normalized in {"reimbursement_amount_use_table", "reimbursementamountusetable"}:
         return "reimbursement_amount_use_table"
     if normalized in {"reimbursement_amount_use_uppercase", "reimbursementamountuseuppercase"}:
@@ -1674,14 +1688,18 @@ def _normalize_reimbursement_action_text(raw: str, *, allow_alias: bool = False)
         return "reimbursement_confirm_submit"
     if normalized in {"取消报销"}:
         return "reimbursement_cancel_submit"
+    if normalized in {"确认识别结果", "确认识别"}:
+        return "reimbursement_recognition_confirm"
+    if normalized in {"重传截图", "重新截图", "重新上传截图"}:
+        return "reimbursement_recognition_retake"
     if normalized in {"按合计提交", "按合计", "使用合计金额", "合计提交"}:
         return "reimbursement_amount_use_table"
     if normalized in {"按大写提交", "按大写", "使用大写金额", "大写提交"}:
         return "reimbursement_amount_use_uppercase"
     if allow_alias and normalized == "confirm_request":
-        return "reimbursement_confirm_submit"
+        return "confirm_request"
     if allow_alias and normalized == "cancel_request":
-        return "reimbursement_cancel_submit"
+        return "cancel_request"
     return ""
 
 
@@ -1925,6 +1943,10 @@ class _SdkReplySender:
                 fallback_text_parts.append("当前确认卡片回调不可用，请重新发送“我要请假”后重试，或前往 OA 审批提交。")
             elif card_type == "reimbursement_request_ready":
                 fallback_text_parts.append("当前确认卡片回调不可用，请重新发送“我要报销差旅费”后重试，或前往 OA 审批提交。")
+            elif card_type == "reimbursement_recognition_confirmation":
+                fallback_text_parts.append("当前确认卡片回调不可用，请直接回复“确认识别结果”或“重传截图”。")
+            elif card_type == "reimbursement_amount_conflict_confirmation":
+                fallback_text_parts.append("当前确认卡片回调不可用，请直接回复“按合计提交”或“按大写提交”。")
             else:
                 fallback_text_parts.append("请回复“确认申请”或“取消”。")
             self._handler.reply_text("\n".join(fallback_text_parts), self._incoming_message)
@@ -1990,7 +2012,11 @@ class _SdkReplySender:
 
         if card_type == "leave_request_ready":
             out_track_id = f"leave-confirm-{uuid4().hex}"
-        elif card_type == "reimbursement_request_ready":
+        elif card_type in {
+            "reimbursement_request_ready",
+            "reimbursement_recognition_confirmation",
+            "reimbursement_amount_conflict_confirmation",
+        }:
             out_track_id = f"reimbursement-confirm-{uuid4().hex}"
         elif card_type == "file_request_confirmation":
             out_track_id = f"file-confirm-{uuid4().hex}"

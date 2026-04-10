@@ -312,6 +312,10 @@ def _normalize_reimbursement_action_text(raw: str, *, allow_alias: bool = False)
         return "reimbursement_confirm_submit"
     if normalized in {"reimbursement_cancel_submit", "reimbursementcancelsubmit"}:
         return "reimbursement_cancel_submit"
+    if normalized in {"reimbursement_recognition_confirm", "reimbursementrecognitionconfirm"}:
+        return "reimbursement_recognition_confirm"
+    if normalized in {"reimbursement_recognition_retake", "reimbursementrecognitionretake"}:
+        return "reimbursement_recognition_retake"
     if normalized in {"reimbursement_amount_use_table", "reimbursementamountusetable"}:
         return "reimbursement_amount_use_table"
     if normalized in {"reimbursement_amount_use_uppercase", "reimbursementamountuseuppercase"}:
@@ -320,14 +324,18 @@ def _normalize_reimbursement_action_text(raw: str, *, allow_alias: bool = False)
         return "reimbursement_confirm_submit"
     if normalized in {"取消报销"}:
         return "reimbursement_cancel_submit"
+    if normalized in {"确认识别结果", "确认识别"}:
+        return "reimbursement_recognition_confirm"
+    if normalized in {"重传截图", "重新截图", "重新上传截图"}:
+        return "reimbursement_recognition_retake"
     if normalized in {"按合计提交", "按合计", "使用合计金额", "合计提交"}:
         return "reimbursement_amount_use_table"
     if normalized in {"按大写提交", "按大写", "使用大写金额", "大写提交"}:
         return "reimbursement_amount_use_uppercase"
     if allow_alias and normalized == "confirm_request":
-        return "reimbursement_confirm_submit"
+        return "confirm_request"
     if allow_alias and normalized == "cancel_request":
-        return "reimbursement_cancel_submit"
+        return "cancel_request"
     return ""
 
 
