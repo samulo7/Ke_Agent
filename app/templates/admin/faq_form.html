@@ -1,0 +1,150 @@
+{% extends 'admin/layout.html' %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto" x-data="faqForm()">
+  <div class="grid grid-cols-1 xl:grid-cols-[1.1fr_0.9fr] gap-6">
+    <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+      <div class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium mb-2">问题</label>
+          <input x-model="form.title" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="例如：试用期员工可以请假吗？" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">标准答案</label>
+          <textarea x-model="form.summary" rows="4" class="w-full rounded-xl border border-slate-300 px-4 py-3"></textarea>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">适用范围</label>
+          <input x-model="form.applicability" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="全体员工" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">下一步</label>
+          <input x-model="form.next_step" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="如为病假，请补充证明材料。" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">关键词（逗号分隔）</label>
+          <input x-model="keywordsRaw" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="试用期, 请假, 病假" />
+        </div>
+      </div>
+      <div class="mt-6 flex flex-wrap gap-3">
+        <button @click="saveFaq" class="rounded-xl bg-indigo-600 text-white px-5 py-3 font-medium" x-text="docId ? '保存修改' : '保存 FAQ'"></button>
+        <button @click="goPreview" class="rounded-xl bg-slate-100 text-slate-700 px-5 py-3 font-medium">去验证</button>
+      </div>
+      <template x-if="message">
+        <div class="mt-4 rounded-xl border px-4 py-3 text-sm" :class="messageType === 'success' ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-amber-50 border-amber-200 text-amber-700'" x-text="message"></div>
+      </template>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm space-y-4">
+      <div>
+        <div class="text-sm font-medium text-slate-800">实时预览</div>
+        <div class="text-xs text-slate-500 mt-1">这是你当前输入生成的预览效果，真正命中结果以“去验证”页为准。</div>
+      </div>
+
+      <div class="rounded-2xl bg-slate-50 border border-slate-200 p-4 space-y-4">
+        <div class="flex justify-end">
+          <div class="max-w-md rounded-2xl bg-blue-500 text-white px-4 py-3 text-sm" x-text="form.title || '试用期员工可以请假吗？'"></div>
+        </div>
+        <div class="flex justify-start">
+          <div class="max-w-md rounded-2xl bg-white text-slate-800 px-4 py-3 text-sm whitespace-pre-wrap border border-slate-200" x-text="previewText"></div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 gap-3 text-sm">
+        <div class="rounded-xl bg-slate-50 border border-slate-200 px-4 py-3">
+          <div class="text-xs uppercase tracking-wide text-slate-400">适用范围</div>
+          <div class="mt-1 text-slate-700" x-text="form.applicability || '全体员工'"></div>
+        </div>
+        <div class="rounded-xl bg-slate-50 border border-slate-200 px-4 py-3">
+          <div class="text-xs uppercase tracking-wide text-slate-400">下一步</div>
+          <div class="mt-1 text-slate-700" x-text="form.next_step || '如为病假，请补充证明材料。'"></div>
+        </div>
+        <div class="rounded-xl bg-slate-50 border border-slate-200 px-4 py-3">
+          <div class="text-xs uppercase tracking-wide text-slate-400">关键词</div>
+          <div class="mt-2 flex flex-wrap gap-2">
+            <template x-for="tag in previewKeywords" :key="tag">
+              <span class="rounded-full bg-indigo-50 text-indigo-700 px-3 py-1 text-xs font-medium" x-text="tag"></span>
+            </template>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function faqForm() {
+  const initialData = {{ initial_data | tojson if initial_data else 'null' }};
+  const initialKnowledge = initialData ? initialData.knowledge : null;
+  return {
+    form: {
+      knowledge_kind: 'faq',
+      title: initialKnowledge?.title || '',
+      summary: initialKnowledge?.summary || '',
+      applicability: initialKnowledge?.applicability || '全体员工',
+      next_step: initialKnowledge?.next_step || '',
+      source_uri: initialKnowledge?.source_uri || 'admin-ui-faq',
+      updated_at: initialKnowledge?.updated_at || new Date().toISOString(),
+      owner: initialKnowledge?.owner || '{{ role_code }}',
+      department: initialKnowledge?.department || '{{ role_code }}',
+      permission_scope: initialKnowledge?.permission_scope || 'public',
+      permitted_depts: initialKnowledge?.permitted_depts || [],
+      keywords: initialKnowledge?.keywords || [],
+      intents: initialKnowledge?.intents || ['policy_process', 'leave'],
+      version_tag: initialKnowledge?.version_tag || 'v1',
+      category: 'faq'
+    },
+    keywordsRaw: initialKnowledge?.keywords?.join(', ') || '',
+    message: '',
+    messageType: 'success',
+    docId: initialKnowledge?.doc_id || '',
+    get previewText() {
+      return this.form.summary || '这里会显示机器人在钉钉里的文本回复预览。';
+    },
+    get previewKeywords() {
+      return this.keywordsRaw.split(',').map(v => v.trim()).filter(Boolean);
+    },
+    async saveFaq() {
+      if (!this.form.title.trim() || !this.form.summary.trim() || !this.form.next_step.trim()) {
+        this.messageType = 'error';
+        this.message = '请先补齐问题、标准答案和下一步。';
+        return false;
+      }
+      this.form.updated_at = new Date().toISOString();
+      this.form.keywords = this.previewKeywords;
+      const endpoint = this.docId ? `/admin/knowledge/${this.docId}` : '/admin/knowledge';
+      const method = this.docId ? 'PUT' : 'POST';
+      const res = await fetch(endpoint, {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Role': '{{ role_code }}',
+          'X-Admin-User-Id': 'ui-user'
+        },
+        body: JSON.stringify(this.form)
+      });
+      const data = await res.json();
+      if (data.ok) {
+        this.docId = data.data.doc_id;
+        this.messageType = 'success';
+        this.message = 'FAQ 已保存，现在可以去做钉钉对话验证。';
+        return true;
+      }
+      this.messageType = 'error';
+      this.message = data.detail?.error?.message || data.error?.message || '保存失败';
+      return false;
+    },
+    async goPreview() {
+      if (!this.docId) {
+        const saved = await this.saveFaq();
+        if (!saved) return;
+      }
+      const target = `/admin/ui/validation?as_role={{ role_code }}&doc_id=${this.docId}&title=${encodeURIComponent(this.form.title)}&question=${encodeURIComponent(this.form.title)}`;
+      window.location.href = target;
+    }
+  }
+}
+</script>
+{% endblock %}

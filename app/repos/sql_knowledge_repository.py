@@ -37,11 +37,17 @@ def bootstrap_sqlite_schema(
     *,
     docs_table: str = "knowledge_docs",
     chunks_table: str = "doc_chunks",
+    quote_fields_table: str = "knowledge_quote_fields",
+    validation_runs_table: str = "knowledge_validation_runs",
+    publish_logs_table: str = "knowledge_publish_logs",
 ) -> None:
-    """Create A-10/B-13 split tables for SQLite-based local verification."""
+    """Create A-10/B-13 + KB-OPS-01 tables for SQLite-based local verification."""
 
     docs = _validate_identifier(docs_table)
     chunks = _validate_identifier(chunks_table)
+    quote_fields = _validate_identifier(quote_fields_table)
+    validation_runs = _validate_identifier(validation_runs_table)
+    publish_logs = _validate_identifier(publish_logs_table)
     connection.executescript(
         f"""
         CREATE TABLE IF NOT EXISTS {docs} (
@@ -60,7 +66,15 @@ def bootstrap_sqlite_schema(
             keywords_csv TEXT NOT NULL DEFAULT '',
             intents_csv TEXT NOT NULL DEFAULT '',
             permission_scope TEXT NOT NULL DEFAULT 'public',
-            permitted_depts_csv TEXT NOT NULL DEFAULT ''
+            permitted_depts_csv TEXT NOT NULL DEFAULT '',
+            knowledge_kind TEXT NOT NULL DEFAULT 'policy_doc',
+            review_status TEXT NOT NULL DEFAULT 'draft',
+            created_by TEXT NOT NULL DEFAULT '',
+            updated_by TEXT NOT NULL DEFAULT '',
+            published_by TEXT NOT NULL DEFAULT '',
+            published_at TEXT NOT NULL DEFAULT '',
+            last_validated_at TEXT NOT NULL DEFAULT '',
+            is_deleted INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS {chunks} (
@@ -72,8 +86,62 @@ def bootstrap_sqlite_schema(
             FOREIGN KEY (doc_id) REFERENCES {docs}(doc_id)
         );
 
+        CREATE TABLE IF NOT EXISTS {quote_fields} (
+            doc_id TEXT PRIMARY KEY,
+            quote_item_name TEXT NOT NULL DEFAULT '',
+            quote_item_code TEXT NOT NULL DEFAULT '',
+            spec_model TEXT NOT NULL DEFAULT '',
+            quote_category TEXT NOT NULL DEFAULT '',
+            price_amount REAL NOT NULL DEFAULT 0,
+            price_currency TEXT NOT NULL DEFAULT 'CNY',
+            unit TEXT NOT NULL DEFAULT '',
+            tax_included INTEGER NOT NULL DEFAULT 1,
+            effective_date TEXT NOT NULL DEFAULT '',
+            expire_date TEXT NOT NULL DEFAULT '',
+            quote_version TEXT NOT NULL DEFAULT '',
+            non_standard_action TEXT NOT NULL DEFAULT '',
+            source_note TEXT NOT NULL DEFAULT '',
+            has_price_conflict INTEGER NOT NULL DEFAULT 0,
+            price_conflict_note TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY (doc_id) REFERENCES {docs}(doc_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS {validation_runs} (
+            validation_id TEXT PRIMARY KEY,
+            doc_id TEXT NOT NULL DEFAULT '',
+            question TEXT NOT NULL DEFAULT '',
+            role_context TEXT NOT NULL DEFAULT '',
+            dept_context TEXT NOT NULL DEFAULT '',
+            matched_doc_ids_json TEXT NOT NULL DEFAULT '[]',
+            reply_channel TEXT NOT NULL DEFAULT 'text',
+            reply_preview_json TEXT NOT NULL DEFAULT '{{}}',
+            permission_decision TEXT NOT NULL DEFAULT 'allow',
+            validation_result TEXT NOT NULL DEFAULT 'failed',
+            validated_by TEXT NOT NULL DEFAULT '',
+            validated_at TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY (doc_id) REFERENCES {docs}(doc_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS {publish_logs} (
+            publish_log_id TEXT PRIMARY KEY,
+            doc_id TEXT NOT NULL,
+            publish_action TEXT NOT NULL DEFAULT 'publish',
+            publish_status TEXT NOT NULL DEFAULT 'failed',
+            validation_id TEXT NOT NULL DEFAULT '',
+            published_by TEXT NOT NULL DEFAULT '',
+            published_at TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY (doc_id) REFERENCES {docs}(doc_id),
+            FOREIGN KEY (validation_id) REFERENCES {validation_runs}(validation_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_{chunks}_doc_id ON {chunks}(doc_id);
         CREATE INDEX IF NOT EXISTS idx_{docs}_status ON {docs}(status);
+        CREATE INDEX IF NOT EXISTS idx_{docs}_review_status ON {docs}(review_status);
+        CREATE INDEX IF NOT EXISTS idx_{docs}_knowledge_kind ON {docs}(knowledge_kind);
+        CREATE INDEX IF NOT EXISTS idx_{validation_runs}_doc_id ON {validation_runs}(doc_id);
+        CREATE INDEX IF NOT EXISTS idx_{publish_logs}_doc_id ON {publish_logs}(doc_id);
         """
     )
 

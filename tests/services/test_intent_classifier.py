@@ -68,8 +68,12 @@ LABELED_SAMPLES: list[tuple[str, IntentType]] = [
     ("B配件报价", "fixed_quote"),
     ("C组件多少钱一套", "fixed_quote"),
     ("这个型号价格", "fixed_quote"),
+    ("这个型号能按9折吗", "fixed_quote"),
     ("是否有固定报价", "fixed_quote"),
     ("报价单里的价格是多少", "fixed_quote"),
+    ("Z9特殊组件成本核算", "fixed_quote"),
+    ("这个配件费用怎么算", "fixed_quote"),
+    ("B2组件核价", "fixed_quote"),
     ("你好", "other"),
     ("在吗", "other"),
     ("今天天气怎么样", "other"),
@@ -97,6 +101,9 @@ class IntentClassifierTests(unittest.TestCase):
         self.assertEqual("reimbursement", self.classifier.classify("报销流程怎么走").intent)
         self.assertEqual("leave", self.classifier.classify("请假流程怎么走").intent)
         self.assertEqual("fixed_quote", self.classifier.classify("定影器报价流程").intent)
+        self.assertEqual("fixed_quote", self.classifier.classify("这个型号能按9折吗").intent)
+        self.assertEqual("fixed_quote", self.classifier.classify("Z9特殊组件成本核算").intent)
+        self.assertEqual("fixed_quote", self.classifier.classify("这个配件费用怎么算").intent)
 
     def test_confidence_is_reported_in_valid_range(self) -> None:
         outcome = self.classifier.classify("我要申请采购制度文件")

@@ -1,0 +1,174 @@
+{% extends 'admin/layout.html' %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto" x-data="quoteForm()">
+  <div class="grid grid-cols-1 xl:grid-cols-[1.1fr_0.9fr] gap-6">
+    <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm space-y-4">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-2">品名</label>
+          <input x-model="form.quote_fields.quote_item_name" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="黑色墨粉" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">型号/机型</label>
+          <input x-model="form.quote_fields.spec_model" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="7788" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">价格</label>
+          <input x-model.number="form.quote_fields.price_amount" type="number" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="1050" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">单位</label>
+          <input x-model="form.quote_fields.unit" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="元/支" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">生效日期</label>
+          <input x-model="form.quote_fields.effective_date" type="date" class="w-full rounded-xl border border-slate-300 px-4 py-3" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">版本号</label>
+          <input x-model="form.quote_fields.quote_version" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="V2026.04" />
+        </div>
+      </div>
+      <div>
+        <label class="block text-sm font-medium mb-2">适用范围</label>
+        <input x-model="form.applicability" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="适用于 7788 设备" />
+      </div>
+      <div>
+        <label class="block text-sm font-medium mb-2">非标准项处理方式</label>
+        <input x-model="form.quote_fields.non_standard_action" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="如数量或折扣条件不同，请联系商务确认。" />
+      </div>
+      <div class="flex flex-wrap gap-3 pt-2">
+        <button @click="saveQuote" class="rounded-xl bg-indigo-600 text-white px-5 py-3 font-medium" x-text="docId ? '保存修改' : '保存报价'"></button>
+        <button @click="goPreview" class="rounded-xl bg-slate-100 text-slate-700 px-5 py-3 font-medium">去验证</button>
+      </div>
+      <template x-if="message">
+        <div class="rounded-xl border px-4 py-3 text-sm" :class="messageType === 'success' ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-amber-50 border-amber-200 text-amber-700'" x-text="message"></div>
+      </template>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm space-y-4">
+      <div>
+        <div class="text-sm font-medium text-slate-800">实时预览</div>
+        <div class="text-xs text-slate-500 mt-1">这里预览的是你当前输入整理出来的回复草稿，真正命中效果以“去验证”页为准。</div>
+      </div>
+      <div class="rounded-2xl bg-slate-50 border border-slate-200 p-4 space-y-4">
+        <div class="flex justify-end">
+          <div class="max-w-md rounded-2xl bg-blue-500 text-white px-4 py-3 text-sm" x-text="questionPreview"></div>
+        </div>
+        <div class="flex justify-start">
+          <div class="max-w-md rounded-2xl bg-white text-slate-800 px-4 py-3 text-sm whitespace-pre-wrap border border-slate-200" x-text="answerPreview"></div>
+        </div>
+      </div>
+      <div class="grid grid-cols-1 gap-3 text-sm">
+        <div class="rounded-xl bg-slate-50 border border-slate-200 px-4 py-3">
+          <div class="text-xs uppercase tracking-wide text-slate-400">适用范围</div>
+          <div class="mt-1 text-slate-700" x-text="form.applicability || `适用于 ${form.quote_fields.spec_model || '该型号'} 设备`"></div>
+        </div>
+        <div class="rounded-xl bg-slate-50 border border-slate-200 px-4 py-3">
+          <div class="text-xs uppercase tracking-wide text-slate-400">版本信息</div>
+          <div class="mt-1 text-slate-700" x-text="form.quote_fields.quote_version || 'V2026.04'"></div>
+        </div>
+        <div class="rounded-xl bg-slate-50 border border-slate-200 px-4 py-3">
+          <div class="text-xs uppercase tracking-wide text-slate-400">非标准项处理方式</div>
+          <div class="mt-1 text-slate-700" x-text="form.quote_fields.non_standard_action || '如数量或折扣条件不同，请联系商务确认。'"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function quoteForm() {
+  const initialData = {{ initial_data | tojson if initial_data else 'null' }};
+  const initialKnowledge = initialData ? initialData.knowledge : null;
+  const initialQuote = initialData ? initialData.quote_fields : null;
+  return {
+    docId: initialKnowledge?.doc_id || '',
+    message: '',
+    messageType: 'success',
+    form: {
+      knowledge_kind: 'fixed_quote',
+      title: initialKnowledge?.title || '',
+      summary: initialKnowledge?.summary || '',
+      applicability: initialKnowledge?.applicability || '',
+      next_step: initialKnowledge?.next_step || '如数量或折扣条件不同，请联系商务确认。',
+      source_uri: initialKnowledge?.source_uri || 'admin-ui-quote',
+      updated_at: initialKnowledge?.updated_at || new Date().toISOString(),
+      owner: initialKnowledge?.owner || '{{ role_code }}',
+      department: initialKnowledge?.department || '{{ role_code }}',
+      permission_scope: initialKnowledge?.permission_scope || 'public',
+      permitted_depts: initialKnowledge?.permitted_depts || [],
+      keywords: initialKnowledge?.keywords || [],
+      intents: initialKnowledge?.intents || ['fixed_quote'],
+      version_tag: initialKnowledge?.version_tag || 'V2026.04',
+      category: 'quote',
+      quote_fields: {
+        quote_item_name: initialQuote?.quote_item_name || '',
+        spec_model: initialQuote?.spec_model || '',
+        quote_category: initialQuote?.quote_category || 'consumable',
+        price_amount: initialQuote?.price_amount || 0,
+        unit: initialQuote?.unit || '',
+        tax_included: initialQuote?.tax_included ?? true,
+        effective_date: initialQuote?.effective_date || '',
+        quote_version: initialQuote?.quote_version || 'V2026.04',
+        non_standard_action: initialQuote?.non_standard_action || '如数量或折扣条件不同，请联系商务确认。'
+      }
+    },
+    get questionPreview() {
+      const model = this.form.quote_fields.spec_model || '某型号';
+      const name = this.form.quote_fields.quote_item_name || '某报价项';
+      return `${model} ${name}多少钱？`;
+    },
+    get answerPreview() {
+      const price = this.form.quote_fields.price_amount || 0;
+      const unit = this.form.quote_fields.unit || '元/件';
+      return price > 0 ? `标准报价 ${price} ${unit}${this.form.quote_fields.tax_included ? '（含税）' : ''}。如条件变化，请联系商务确认。` : '这里会显示钉钉里的报价回复预览。';
+    },
+    async saveQuote() {
+      if (!this.form.quote_fields.quote_item_name.trim() || !this.form.quote_fields.spec_model.trim() || !this.form.quote_fields.unit.trim() || !this.form.quote_fields.effective_date.trim() || !this.form.quote_fields.non_standard_action.trim() || this.form.quote_fields.price_amount <= 0) {
+        this.messageType = 'error';
+        this.message = '请先补齐品名、型号、价格、单位、生效日期和非标准项处理方式。';
+        return false;
+      }
+      this.form.updated_at = new Date().toISOString();
+      this.form.title = `${this.form.quote_fields.spec_model} ${this.form.quote_fields.quote_item_name}`.trim();
+      this.form.summary = `标准报价 ${this.form.quote_fields.price_amount} ${this.form.quote_fields.unit}${this.form.quote_fields.tax_included ? '（含税）' : ''}。`;
+      this.form.applicability = this.form.applicability || `适用于 ${this.form.quote_fields.spec_model} 设备`;
+      this.form.keywords = [this.form.quote_fields.spec_model, this.form.quote_fields.quote_item_name, '报价'].filter(Boolean);
+      const endpoint = this.docId ? `/admin/knowledge/${this.docId}` : '/admin/knowledge';
+      const method = this.docId ? 'PUT' : 'POST';
+      const res = await fetch(endpoint, {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Role': '{{ role_code }}',
+          'X-Admin-User-Id': 'ui-user'
+        },
+        body: JSON.stringify(this.form)
+      });
+      const data = await res.json();
+      if (data.ok) {
+        this.docId = data.data.doc_id;
+        this.messageType = 'success';
+        this.message = '固定报价已保存，现在可以去做钉钉对话验证。';
+        return true;
+      }
+      this.messageType = 'error';
+      this.message = data.detail?.error?.message || data.error?.message || '保存失败';
+      return false;
+    },
+    async goPreview() {
+      if (!this.docId) {
+        const saved = await this.saveQuote();
+        if (!saved) return;
+      }
+      const target = `/admin/ui/validation?as_role={{ role_code }}&doc_id=${this.docId}&title=${encodeURIComponent(this.form.title)}&question=${encodeURIComponent(this.questionPreview)}`;
+      window.location.href = target;
+    }
+  }
+}
+</script>
+{% endblock %}

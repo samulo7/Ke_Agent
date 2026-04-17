@@ -107,7 +107,44 @@ class LLMIntentServiceTests(unittest.TestCase):
         self.assertTrue(result.fallback_used)
         self.assertIn("llm_error", result.reason)
 
-    def test_high_confidence_semantic_conflict_uses_rule_fallback(self) -> None:
+    def test_explicit_fixed_quote_rule_guard_overrides_llm_other(self) -> None:
+        client = _FakeLLMClient(payloads=[{"intent": "other", "confidence": 0.8, "reason": "uncertain"}])
+        service = LLMIntentService(
+            llm_client=client,
+            fallback_classifier=IntentClassifier(),
+            model="qwen-plus",
+            enabled=True,
+            rollout_percentage=100,
+            confidence_threshold=0.75,
+            timeout_seconds=10,
+            max_retries=2,
+        )
+
+        result = service.infer(text="Z9特殊组件成本核算", conversation_id="conv-1", sender_id="u-1")
+
+        self.assertTrue(result.fallback_used)
+        self.assertEqual("llm_explicit_rule_guard", result.reason)
+        self.assertEqual("fixed_quote", result.intent)
+
+    def test_explicit_fixed_quote_rule_guard_overrides_medium_confidence_policy_process(self) -> None:
+        client = _FakeLLMClient(payloads=[{"intent": "policy_process", "confidence": 0.8, "reason": "policy-like"}])
+        service = LLMIntentService(
+            llm_client=client,
+            fallback_classifier=IntentClassifier(),
+            model="qwen-plus",
+            enabled=True,
+            rollout_percentage=100,
+            confidence_threshold=0.75,
+            timeout_seconds=10,
+            max_retries=2,
+        )
+
+        result = service.infer(text="Z9特殊组件成本核算", conversation_id="conv-1", sender_id="u-1")
+
+        self.assertTrue(result.fallback_used)
+        self.assertEqual("llm_explicit_rule_guard", result.reason)
+        self.assertEqual("fixed_quote", result.intent)
+
         client = _FakeLLMClient(payloads=[{"intent": "policy_process", "confidence": 0.95, "reason": "wrong"}])
         service = LLMIntentService(
             llm_client=client,

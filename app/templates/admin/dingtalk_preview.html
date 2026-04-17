@@ -1,0 +1,147 @@
+{% extends 'admin/layout.html' %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto" x-data="dingtalkPreview()" x-init="init()">
+  <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
+    <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm space-y-4">
+      <div>
+        <label class="block text-sm font-medium mb-2">模拟员工在钉钉中的提问</label>
+        <input x-model="question" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="输入员工可能会问的问题" />
+      </div>
+      <div class="flex flex-wrap gap-3">
+        <button @click="preview" class="rounded-xl bg-indigo-600 text-white px-5 py-3 font-medium">立即验证</button>
+        <template x-if="canPublishNow">
+          <button @click="publishNow" class="rounded-xl bg-emerald-600 text-white px-5 py-3 font-medium">发布到机器人</button>
+        </template>
+        <template x-if="!canPublishNow">
+          <a href="/admin/ui/publish{{ role_query }}" class="rounded-xl bg-slate-100 text-slate-700 px-5 py-3 font-medium">去发布页</a>
+        </template>
+      </div>
+      <template x-if="message">
+        <div class="rounded-xl bg-slate-50 border border-slate-200 px-4 py-3 text-sm" x-text="message"></div>
+      </template>
+      <template x-if="matchedKnowledge.length">
+        <div class="pt-2">
+          <div class="text-sm font-medium mb-2">命中知识</div>
+          <div class="space-y-2">
+            <template x-for="item in matchedKnowledge" :key="item.doc_id">
+              <div class="rounded-xl border border-slate-200 px-4 py-3 text-sm bg-slate-50">
+                <span class="font-medium" x-text="item.title"></span>
+                <span class="text-slate-400 ml-2" x-text="`#${item.rank}`"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+      <div class="text-sm text-slate-500 mb-3">钉钉单聊预览</div>
+      <div class="space-y-4 min-h-[280px]">
+        <div class="flex justify-end" x-show="question">
+          <div class="max-w-md rounded-2xl bg-blue-500 text-white px-4 py-3 text-sm" x-text="question"></div>
+        </div>
+        <div class="flex justify-start">
+          <div class="max-w-md rounded-2xl bg-slate-100 text-slate-800 px-4 py-3 text-sm whitespace-pre-wrap" x-text="replyText"></div>
+        </div>
+      </div>
+      <div class="mt-5 border-t border-slate-100 pt-4 space-y-3">
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-400">来源</div>
+          <template x-if="citations.length">
+            <ul class="mt-2 space-y-2 text-sm text-slate-700">
+              <template x-for="item in citations" :key="item.source_id">
+                <li class="rounded-lg bg-slate-50 px-3 py-2 border border-slate-200">
+                  <span class="font-medium" x-text="item.title"></span>
+                  <span class="text-slate-400 ml-2" x-text="item.updated_at"></span>
+                </li>
+              </template>
+            </ul>
+          </template>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-400">下一步</div>
+          <div class="mt-2 text-sm text-slate-700" x-text="nextStep || '验证后可查看这里的下一步建议。'"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function dingtalkPreview() {
+  return {
+    docId: '{{ doc_id }}',
+    question: '{{ question }}' || '{{ title }}',
+    replyText: '这里会显示机器人在钉钉里的回复。',
+    matchedKnowledge: [],
+    citations: [],
+    nextStep: '',
+    message: '',
+    validationPassed: false,
+    async init() {
+      if (this.docId && this.question) {
+        await this.preview();
+      }
+    },
+    async preview() {
+      if (!this.question) {
+        this.message = '请先输入一个测试问题';
+        return;
+      }
+      const res = await fetch('/admin/validation/dingtalk-preview', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Role': '{{ role_code }}',
+          'X-Admin-User-Id': 'ui-user'
+        },
+        body: JSON.stringify({
+          question: this.question,
+          doc_id: this.docId,
+          dept_context: '{{ role_code }}'
+        })
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        this.validationPassed = false;
+        this.message = data.detail?.error?.message || data.error?.message || '验证失败';
+        return;
+      }
+      this.validationPassed = data.data.validation_result === 'passed';
+      this.message = this.validationPassed ? '验证通过，现在可以直接发布到机器人。' : '当前问题未稳定命中，建议继续调整。';
+      this.replyText = data.data.reply_preview.text || '未返回文本回复';
+      this.matchedKnowledge = data.data.matched_knowledge || [];
+      this.citations = data.data.citations || [];
+      this.nextStep = data.data.next_step || '';
+    },
+    get canPublishNow() {
+      return this.validationPassed && !!this.docId;
+    },
+    async publishNow() {
+      if (!this.docId) {
+        this.message = '当前没有可发布的知识。';
+        return;
+      }
+      const res = await fetch(`/admin/publish/${this.docId}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Role': '{{ role_code }}',
+          'X-Admin-User-Id': 'ui-user'
+        },
+        body: JSON.stringify({ publish_note: 'published from validation page' })
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        this.message = data.detail?.error?.message || data.error?.message || '发布失败';
+        return;
+      }
+      this.message = '发布成功，机器人现在可以使用这条知识。';
+    }
+  }
+}
+</script>
+{% endblock %}

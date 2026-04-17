@@ -432,7 +432,43 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertIn("content", body["llm_trace"])
         self.assertIn("orchestrator_shadow", body["llm_trace"])
 
-    def test_system_failure_returns_text_fallback_instead_of_500(self) -> None:
+    def test_fixed_quote_query_returns_knowledge_with_source_metadata(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post("/dingtalk/stream/events", json=make_stream_payload(text="XX定影器多少钱"))
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+
+        self.assertTrue(body["handled"])
+        self.assertEqual("knowledge_answer", body["reason"])
+        self.assertEqual("fixed_quote", body["intent"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("faq-quote-fuser-xx-2026-03", body["source_ids"])
+        self.assertIn("版本日期", body["reply"]["text"])
+        self.assertIn("2026-03-05", body["reply"]["text"])
+        self.assertIn("联系商务", body["reply"]["text"])
+        self.assertEqual("allow", body["permission_decision"])
+        self.assertTrue(body["knowledge_version"])
+        self.assertTrue(body["answered_at"])
+        self.assertGreaterEqual(len(body["citations"]), 1)
+
+    def test_out_of_scope_fixed_quote_query_returns_no_fabrication_text(self) -> None:
+        app = create_app(log_stream=StringIO())
+        client = TestClient(app)
+
+        response = client.post("/dingtalk/stream/events", json=make_stream_payload(text="Z9特殊组件成本核算"))
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+
+        self.assertFalse(body["handled"])
+        self.assertEqual("knowledge_no_hit", body["reason"])
+        self.assertEqual("fixed_quote", body["intent"])
+        self.assertEqual("text", body["reply"]["channel"])
+        self.assertIn("不提供推测价格", body["reply"]["text"])
+        self.assertIn("联系商务确认", body["reply"]["text"])
+        self.assertEqual([], body["source_ids"])
+
         app = create_app(
             log_stream=StringIO(),
             single_chat_service=SingleChatService(knowledge_answer_service=_RaisingKnowledgeAnswerService()),
@@ -672,6 +708,102 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertEqual("reimbursement_travel_collecting_company", body["reason"])
         self.assertEqual("confirm_request", body["reimbursement_action"])
 
+    def test_reimbursement_submit_accepts_generic_approval_action_alias(self) -> None:
+        approval_creator = _StubReimbursementApprovalCreator(
+            ReimbursementApprovalResult(success=True, reason="submitted", process_instance_id="proc-rmb-api-submit-alias-1")
+        )
+        attachment_result = ReimbursementAttachmentProcessResult(
+            success=True,
+            reason="processed",
+            department="总经办",
+            amount="106",
+            attachment_media_id="media-image-1",
+            amount_source="screenshot",
+            amount_source_note="截图识别成功，待人工确认",
+            extraction_evidence={
+                "template_match": {"hit": True, "evidence": "模板已命中"},
+                "department_match": {"label": "部门", "hit": True},
+                "amount_match": {"row_header": "合计", "col_header": "合计金额", "row_hit": True, "col_hit": True},
+            },
+        )
+        service = SingleChatService(
+            reimbursement_request_orchestrator=ReimbursementRequestOrchestrator(
+                travel_application_provider=_StubTravelApplicationProvider(),
+                attachment_processor=_StubReimbursementAttachmentProcessor(result=attachment_result),
+                approval_creator=approval_creator,
+            )
+        )
+        app = create_app(
+            log_stream=StringIO(),
+            single_chat_service=service,
+            user_context_resolver=_PermissionResolver(),
+        )
+        client = TestClient(app)
+
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="我要报销差旅费",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-submit-alias-1",
+            ),
+        )
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="1",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-submit-alias-1",
+            ),
+        )
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="",
+                message_type="picture",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-submit-alias-1",
+                file_name="报销单截图.png",
+                file_content_base64="ZmFrZQ==",
+            ),
+        )
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_reimbursement_button_callback_payload(
+                action_id="reimbursement_recognition_confirm",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-submit-alias-1",
+            ),
+        )
+        client.post(
+            "/dingtalk/stream/events",
+            json=make_stream_payload(
+                text="SY",
+                sender_id="finance-user",
+                conversation_id="conv-rmb-api-submit-alias-1",
+            ),
+        )
+
+        response = client.post(
+            "/dingtalk/stream/events",
+            json={
+                "data": {
+                    "type": "actionCallback",
+                    "userId": "finance-user",
+                    "approval_action": "确认申请",
+                    "spaceId": "conv-rmb-api-submit-alias-1",
+                    "workflowType": "reimbursement",
+                    "outTrackId": "reimbursement-confirm-submit-alias-1",
+                }
+            },
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("reimbursement_travel_submitted", body["reason"])
+        self.assertEqual("submitted", body["reimbursement_status"])
+        self.assertEqual("confirm_request", body["reimbursement_action"])
+        self.assertEqual("SY", approval_creator.submission.cost_company)
+
     def test_reimbursement_recognition_requires_confirmation_before_company_selection(self) -> None:
         clock = _FakeClock()
         approval_creator = _StubReimbursementApprovalCreator(
@@ -812,6 +944,78 @@ class DingTalkSingleChatApiTests(unittest.TestCase):
         self.assertIn("未提前申请（需提前1天）", body["reply"]["interactive_card"]["common_errors"])
         self.assertIn("假种选择错误", body["reply"]["interactive_card"]["common_errors"])
         self.assertEqual("interactive_card", body["dingtalk_payload"]["msgtype"])
+
+    def test_leave_policy_question_prefers_knowledge_answer_over_leave_workflow(self) -> None:
+        service, connection = build_permission_single_chat_service()
+        try:
+            connection.execute(
+                """
+                INSERT INTO knowledge_docs (
+                    doc_id,
+                    source_type,
+                    title,
+                    summary,
+                    applicability,
+                    next_step,
+                    source_uri,
+                    updated_at,
+                    status,
+                    owner,
+                    category,
+                    version_tag,
+                    keywords_csv,
+                    intents_csv,
+                    permission_scope,
+                    permitted_depts_csv
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "faq-leave-trial-01",
+                    "faq",
+                    "试用期员工可以请假吗",
+                    "试用期员工可以按公司制度申请事假/病假。",
+                    "全体员工",
+                    "如为病假，请补充证明材料。",
+                    "FAQ/HR/试用期请假",
+                    "2026-04-17",
+                    "active",
+                    "hr",
+                    "faq",
+                    "v1",
+                    "试用期,请假,病假",
+                    "leave,policy_process",
+                    "public",
+                    "",
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO doc_chunks (chunk_id, doc_id, chunk_index, chunk_text, chunk_vector)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    "chunk-faq-leave-trial-01",
+                    "faq-leave-trial-01",
+                    0,
+                    "试用期员工可以按公司制度申请事假病假，如为病假需补充证明材料。",
+                    "[]",
+                ),
+            )
+            connection.commit()
+
+            app = create_app(log_stream=StringIO(), single_chat_service=service)
+            client = TestClient(app)
+            response = client.post("/dingtalk/stream/events", json=make_stream_payload(text="试用期员工可以请假吗？"))
+            self.assertEqual(200, response.status_code)
+            body = response.json()
+
+            self.assertTrue(body["handled"])
+            self.assertEqual("knowledge_answer", body["reason"])
+            self.assertEqual("leave", body["intent"])
+            self.assertEqual("text", body["reply"]["channel"])
+            self.assertIn("试用期员工可以按公司制度申请事假/病假", body["reply"]["text"])
+        finally:
+            connection.close()
 
     def test_plain_leave_word_starts_leave_workflow(self) -> None:
         app = create_app(log_stream=StringIO())

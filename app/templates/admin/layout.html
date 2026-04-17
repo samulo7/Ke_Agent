@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ page_title }} · KeAgent</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+  <div class="min-h-screen flex">
+    <aside class="w-72 bg-slate-900 text-slate-100 flex flex-col">
+      <div class="px-6 py-5 border-b border-slate-800">
+        <div class="text-sm text-slate-400">KeAgent</div>
+        <div class="text-xl font-semibold mt-1">机器人知识运营后台</div>
+        <div class="mt-4 inline-flex items-center rounded-full px-3 py-1 text-xs font-medium bg-slate-800 text-slate-200">
+          当前角色：{{ role_code }}
+        </div>
+      </div>
+      <nav class="px-4 py-5 space-y-2 text-sm">
+        {% if permissions.menus.knowledge %}
+        <a href="/admin/ui/knowledge{{ role_query }}" class="block rounded-xl px-4 py-3 {% if active_nav == 'knowledge' %}bg-indigo-500 text-white{% else %}text-slate-200 hover:bg-slate-800{% endif %}">机器人知识管理</a>
+        {% endif %}
+        {% if permissions.menus.validation %}
+        <a href="/admin/ui/validation{{ role_query }}" class="block rounded-xl px-4 py-3 {% if active_nav == 'validation' %}bg-indigo-500 text-white{% else %}text-slate-200 hover:bg-slate-800{% endif %}">钉钉对话验证</a>
+        {% endif %}
+        {% if permissions.menus.publish %}
+        <a href="/admin/ui/publish{{ role_query }}" class="block rounded-xl px-4 py-3 {% if active_nav == 'publish' %}bg-indigo-500 text-white{% else %}text-slate-200 hover:bg-slate-800{% endif %}">发布到机器人</a>
+        {% endif %}
+      </nav>
+      <div class="mt-auto p-4 text-xs text-slate-400 border-t border-slate-800">
+        当前阶段：KB-OPS-01 最小闭环
+      </div>
+    </aside>
+
+    <main class="flex-1 min-w-0">
+      <header class="bg-white border-b border-slate-200 px-8 py-5 flex items-center justify-between">
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-400">DingTalk Robot Ops</div>
+          <h1 class="text-2xl font-semibold mt-1">{{ page_title }}</h1>
+        </div>
+        <div class="flex items-center gap-3">
+          <div class="text-sm text-slate-500">目标：录入知识 → 钉钉验证 → 发布到机器人</div>
+          <div x-data="{ role: '{{ role_code }}' }" class="flex items-center gap-2">
+            <label class="text-sm text-slate-500">切换角色</label>
+            <select x-model="role" @change="window.location.href = window.location.pathname + '?as_role=' + role" class="rounded-xl border border-slate-300 px-3 py-2 text-sm bg-white">
+              <option value="admin">admin</option>
+              <option value="hr">hr</option>
+              <option value="business">business</option>
+              <option value="finance">finance</option>
+            </select>
+          </div>
+        </div>
+      </header>
+      <section class="p-8">
+        {% block content %}{% endblock %}
+      </section>
+    </main>
+  </div>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -45,11 +45,16 @@ class KnowledgeAnswerServiceTests(unittest.TestCase):
         self.assertIn("来源：", answer.text)
         self.assertIn("下一步：", answer.text)
         self.assertIn("faq-quote-fuser-xx-2026-03", answer.source_ids)
+        self.assertIn("1200 元/台", answer.text)
+        self.assertIn("版本日期", answer.text)
+        self.assertIn("2026-03-05", answer.text)
+        self.assertIn("联系商务", answer.text)
 
     def test_fixed_quote_no_hit_does_not_fabricate_price(self) -> None:
         answer = self.service.answer(question="Z9特殊组件成本核算", intent="fixed_quote")
         self.assertFalse(answer.found)
         self.assertIn("不提供推测价格", answer.text)
+        self.assertIn("联系商务确认", answer.text)
         self.assertEqual(0, len(answer.source_ids))
         self.assertEqual(0, len(answer.citations))
 

@@ -118,6 +118,18 @@ class LLMIntentService:
                 validation_passed=False,
             )
 
+        guarded_intent = self._apply_explicit_rule_guard(
+            fallback=fallback,
+            llm_intent=intent,
+            llm_confidence=confidence,
+        )
+        if guarded_intent is not None:
+            return self._fallback_result(
+                fallback=fallback,
+                reason="llm_explicit_rule_guard",
+                validation_passed=False,
+            )
+
         # High-confidence semantic mismatch guard: keep rule outcome to avoid silent misroute.
         if self._is_high_conflict(fallback=fallback, llm_intent=intent, llm_confidence=confidence):
             return self._fallback_result(
@@ -164,6 +176,23 @@ class LLMIntentService:
             and fallback.confidence >= 0.9
             and fallback.intent != "other"
         )
+
+    @staticmethod
+    def _apply_explicit_rule_guard(
+        *,
+        fallback: IntentClassification,
+        llm_intent: IntentType,
+        llm_confidence: float,
+    ) -> IntentType | None:
+        if fallback.intent != "fixed_quote":
+            return None
+        if llm_intent == "fixed_quote":
+            return None
+        if llm_intent == "other":
+            return fallback.intent
+        if llm_intent == "policy_process" and llm_confidence < 0.9:
+            return fallback.intent
+        return None
 
     def _fallback_result(
         self,

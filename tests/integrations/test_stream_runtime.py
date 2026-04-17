@@ -1185,6 +1185,155 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertEqual("true", response["userPrivateData"]["cardParamMap"]["actions_locked"])
         self.assertIn("未找到待确认请假", response["userPrivateData"]["cardParamMap"]["summary"])
 
+    @patch("app.integrations.dingtalk.stream_runtime._load_dingtalk_sdk")
+    def test_card_callback_handler_reimbursement_recognition_confirm_locks_old_card_and_prompts_company_reply(
+        self,
+        mock_load_sdk,
+    ) -> None:  # type: ignore[no-untyped-def]
+        class _FakeAckMessage:
+            STATUS_OK = 200
+            STATUS_BAD_REQUEST = 400
+            STATUS_SYSTEM_EXCEPTION = 500
+
+        class _FakeCredential:
+            def __init__(self, client_id: str, client_secret: str) -> None:
+                self.client_id = client_id
+                self.client_secret = client_secret
+
+        class _FakeCallbackHandler:
+            TOPIC_CARD_CALLBACK = "/v1.0/card/instances/callback"
+
+            def __init__(self) -> None:
+                self.dingtalk_client = _FakeDingTalkClient()
+
+        class _FakeChatbotHandler(_FakeCallbackHandler):
+            pass
+
+        class _FakeChatbotMessage:
+            TOPIC = "/v1.0/im/bot/messages/get"
+
+            @staticmethod
+            def from_dict(payload: Mapping[str, Any]) -> Any:
+                return SimpleNamespace(
+                    sender_staff_id=str(payload.get("senderStaffId") or payload.get("sender_id") or ""),
+                    conversation_type=str(payload.get("conversationType") or payload.get("conversation_type") or "1"),
+                    session_webhook=str(payload.get("sessionWebhook") or ""),
+                )
+
+        class _FakeDingTalkStreamClient:
+            OPEN_CONNECTION_API = ""
+
+            def __init__(self, credential: _FakeCredential, logger: Any = None) -> None:
+                self.credential = credential
+                self.logger = logger
+                self.registered_topics: list[str] = []
+                self.handlers: dict[str, Any] = {}
+
+            def register_callback_handler(self, topic: str, handler: Any) -> None:
+                self.registered_topics.append(topic)
+                self.handlers[topic] = handler
+
+        fake_sdk = SimpleNamespace(
+            AckMessage=_FakeAckMessage,
+            Credential=_FakeCredential,
+            CallbackHandler=_FakeCallbackHandler,
+            ChatbotHandler=_FakeChatbotHandler,
+            ChatbotMessage=_FakeChatbotMessage,
+            DingTalkStreamClient=_FakeDingTalkStreamClient,
+        )
+        fake_stream_module = SimpleNamespace(DingTalkStreamClient=_FakeDingTalkStreamClient)
+        fake_card_module = _FakeCardModule()
+        fake_card_replier_module = SimpleNamespace(AICardReplier=None)
+        mock_load_sdk.return_value = (fake_sdk, fake_stream_module, fake_card_module, fake_card_replier_module)
+
+        resolver = self._build_resolver()
+        sender = _FakeSender()
+        service = SingleChatService(
+            reimbursement_request_orchestrator=ReimbursementRequestOrchestrator(
+                travel_application_provider=_StubTravelApplicationProvider(),
+                attachment_processor=_StubReimbursementAttachmentProcessor(
+                    result=ReimbursementAttachmentProcessResult(
+                        success=True,
+                        reason="processed",
+                        department="总经办",
+                        amount="106",
+                        attachment_media_id="media-image-1",
+                        amount_source="screenshot",
+                        amount_source_note="截图识别成功，待人工确认",
+                        extraction_evidence={
+                            "template_match": {"hit": True, "evidence": "模板已命中"},
+                            "department_match": {"label": "部门", "hit": True},
+                            "amount_match": {"row_header": "合计", "col_header": "合计金额", "row_hit": True, "col_hit": True},
+                        },
+                    )
+                ),
+                approval_creator=_StubReimbursementApprovalCreator(
+                    ReimbursementApprovalResult(success=True, reason="submitted", process_instance_id="proc-rmb-card-1")
+                ),
+            )
+        )
+
+        handle_single_chat_payload(
+            _make_payload(
+                text="我要报销差旅费",
+                conversation_id="conv-rmb-card-1",
+                sender_id="user-rmb-card-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        handle_single_chat_payload(
+            _make_payload(
+                text="1",
+                conversation_id="conv-rmb-card-1",
+                sender_id="user-rmb-card-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        handle_single_chat_payload(
+            _make_payload(
+                text="",
+                message_type="picture",
+                conversation_id="conv-rmb-card-1",
+                sender_id="user-rmb-card-1",
+                file_name="报销单截图.png",
+                file_content_base64="ZmFrZQ==",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+
+        client = build_stream_client(
+            DingTalkStreamCredentials(
+                client_id="client-id",
+                client_secret="client-secret",
+                agent_id="agent-id",
+            ),
+            single_chat_service=service,
+            user_context_resolver=resolver,  # type: ignore[arg-type]
+        )
+        card_handler = client.handlers["/v1.0/card/instances/callback"]
+        callback_message = SimpleNamespace(
+            headers=SimpleNamespace(message_id="trace-rmb-card-1", topic="/v1.0/card/instances/callback"),
+            data=_make_reimbursement_callback_payload(
+                action_id="reimbursement_recognition_confirm",
+                sender_id="user-rmb-card-1",
+                conversation_id="conv-rmb-card-1",
+            ),
+            extensions={},
+        )
+
+        code, response = asyncio.run(card_handler.process(callback_message))
+
+        self.assertEqual(200, code)
+        self.assertEqual("pending", response["userPrivateData"]["cardParamMap"]["reimbursement_status"])
+        self.assertEqual("true", response["userPrivateData"]["cardParamMap"]["actions_locked"])
+        self.assertIn("请直接回复以下费用归属公司代码之一", response["userPrivateData"]["cardParamMap"]["summary"])
+
     @patch("app.integrations.dingtalk.stream_runtime.requests.post")
     @patch("app.integrations.dingtalk.stream_runtime._load_dingtalk_sdk")
     def test_card_callback_handler_approve_pushes_result_card_to_requester(
@@ -2155,7 +2304,45 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertIn("content", outcome["llm_trace"])
         self.assertIn("orchestrator_shadow", outcome["llm_trace"])
 
-    def test_handle_single_chat_payload_returns_system_fallback_on_service_error(self) -> None:
+    def test_handle_single_chat_payload_returns_fixed_quote_knowledge_answer(self) -> None:
+        sender = _FakeSender()
+        outcome = handle_single_chat_payload(
+            _make_payload(text="XX定影器多少钱"),
+            service=SingleChatService(),
+            sender=sender,
+            user_context_resolver=self._build_resolver(),
+        )
+
+        self.assertTrue(outcome["handled"])
+        self.assertEqual("knowledge_answer", outcome["reason"])
+        self.assertEqual("fixed_quote", outcome["intent"])
+        self.assertEqual("text", outcome["channel"])
+        self.assertIn("faq-quote-fuser-xx-2026-03", outcome["source_ids"])
+        self.assertIn("版本日期", sender.text_messages[-1])
+        self.assertIn("2026-03-05", sender.text_messages[-1])
+        self.assertIn("联系商务", sender.text_messages[-1])
+        self.assertEqual("allow", outcome["permission_decision"])
+        self.assertTrue(outcome["knowledge_version"])
+        self.assertTrue(outcome["answered_at"])
+        self.assertGreaterEqual(len(outcome["citations"]), 1)
+
+    def test_handle_single_chat_payload_returns_no_fabrication_text_for_out_of_scope_fixed_quote(self) -> None:
+        sender = _FakeSender()
+        outcome = handle_single_chat_payload(
+            _make_payload(text="Z9特殊组件成本核算"),
+            service=SingleChatService(),
+            sender=sender,
+            user_context_resolver=self._build_resolver(),
+        )
+
+        self.assertFalse(outcome["handled"])
+        self.assertEqual("knowledge_no_hit", outcome["reason"])
+        self.assertEqual("fixed_quote", outcome["intent"])
+        self.assertEqual("text", outcome["channel"])
+        self.assertIn("不提供推测价格", sender.text_messages[-1])
+        self.assertIn("联系商务确认", sender.text_messages[-1])
+        self.assertEqual([], outcome["source_ids"])
+
         sender = _FakeSender()
         service = SingleChatService(knowledge_answer_service=_RaisingKnowledgeAnswerService())
         outcome = handle_single_chat_payload(
@@ -2622,6 +2809,7 @@ class StreamRuntimeTests(unittest.TestCase):
         self.assertEqual("reimbursement_travel_collecting_company", fifth["reason"])
         self.assertEqual("reimbursement_recognition_confirm", fifth["reimbursement_action"])
         self.assertEqual("pending", fifth["reimbursement_status"])
+        self.assertIn("请直接回复以下费用归属公司代码之一", sender.text_messages[-1])
 
         sixth = handle_single_chat_payload(
             _make_payload(
@@ -2730,6 +2918,110 @@ class StreamRuntimeTests(unittest.TestCase):
 
         self.assertEqual("reimbursement_travel_collecting_company", confirmed["reason"])
         self.assertEqual("confirm_request", confirmed["reimbursement_action"])
+
+    def test_handle_single_chat_payload_reimbursement_submit_accepts_generic_approval_action_alias(self) -> None:
+        sender = _FakeSender()
+        resolver = self._build_resolver()
+        creator = _StubReimbursementApprovalCreator(
+            ReimbursementApprovalResult(success=True, reason="submitted", process_instance_id="proc-rmb-stream-submit-alias-1")
+        )
+        service = SingleChatService(
+            reimbursement_request_orchestrator=ReimbursementRequestOrchestrator(
+                travel_application_provider=_StubTravelApplicationProvider(),
+                attachment_processor=_StubReimbursementAttachmentProcessor(
+                    result=ReimbursementAttachmentProcessResult(
+                        success=True,
+                        reason="processed",
+                        department="总经办",
+                        amount="106",
+                        attachment_media_id="media-image-1",
+                        amount_source="screenshot",
+                        amount_source_note="截图识别成功，待人工确认",
+                        extraction_evidence={
+                            "template_match": {"hit": True, "evidence": "模板已命中"},
+                            "department_match": {"label": "部门", "hit": True},
+                            "amount_match": {"row_header": "合计", "col_header": "合计金额", "row_hit": True, "col_hit": True},
+                        },
+                    )
+                ),
+                approval_creator=creator,
+            )
+        )
+
+        handle_single_chat_payload(
+            _make_payload(
+                text="我要报销差旅费",
+                conversation_id="conv-rmb-stream-submit-alias-1",
+                sender_id="user-rmb-stream-submit-alias-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        handle_single_chat_payload(
+            _make_payload(
+                text="1",
+                conversation_id="conv-rmb-stream-submit-alias-1",
+                sender_id="user-rmb-stream-submit-alias-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        handle_single_chat_payload(
+            _make_payload(
+                text="",
+                message_type="picture",
+                conversation_id="conv-rmb-stream-submit-alias-1",
+                sender_id="user-rmb-stream-submit-alias-1",
+                file_name="报销单截图.png",
+                file_content_base64="ZmFrZQ==",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        handle_single_chat_payload(
+            _make_reimbursement_callback_payload(
+                action_id="reimbursement_recognition_confirm",
+                conversation_id="conv-rmb-stream-submit-alias-1",
+                sender_id="user-rmb-stream-submit-alias-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+        handle_single_chat_payload(
+            _make_payload(
+                text="SY",
+                conversation_id="conv-rmb-stream-submit-alias-1",
+                sender_id="user-rmb-stream-submit-alias-1",
+            ),
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+
+        confirmed = handle_single_chat_payload(
+            {
+                "data": {
+                    "type": "actionCallback",
+                    "userId": "user-rmb-stream-submit-alias-1",
+                    "approval_action": "确认申请",
+                    "spaceId": "conv-rmb-stream-submit-alias-1",
+                    "workflowType": "reimbursement",
+                    "outTrackId": "reimbursement-confirm-submit-alias-1",
+                }
+            },
+            service=service,
+            sender=sender,
+            user_context_resolver=resolver,
+        )
+
+        self.assertEqual("reimbursement_travel_submitted", confirmed["reason"])
+        self.assertEqual("submitted", confirmed["reimbursement_status"])
+        self.assertEqual("confirm_request", confirmed["reimbursement_action"])
+        self.assertEqual("SY", creator.submission.cost_company)
 
     def test_handle_single_chat_payload_leave_confirm_button_submits_text(self) -> None:
         sender = _FakeSender()

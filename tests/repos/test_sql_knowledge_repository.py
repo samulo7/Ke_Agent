@@ -147,6 +147,23 @@ class SQLKnowledgeRepositoryTests(unittest.TestCase):
         self.assertNotIn("permission_scope", chunk_columns)
         self.assertNotIn("permitted_depts_csv", chunk_columns)
 
+    def test_kb_ops_columns_exist_in_knowledge_docs(self) -> None:
+        docs_columns = self._table_columns("knowledge_docs")
+
+        self.assertIn("knowledge_kind", docs_columns)
+        self.assertIn("review_status", docs_columns)
+        self.assertIn("created_by", docs_columns)
+        self.assertIn("updated_by", docs_columns)
+        self.assertIn("published_by", docs_columns)
+        self.assertIn("published_at", docs_columns)
+        self.assertIn("last_validated_at", docs_columns)
+        self.assertIn("is_deleted", docs_columns)
+
+    def test_kb_ops_supporting_tables_exist(self) -> None:
+        self.assertTrue(self._table_exists("knowledge_quote_fields"))
+        self.assertTrue(self._table_exists("knowledge_validation_runs"))
+        self.assertTrue(self._table_exists("knowledge_publish_logs"))
+
     def test_sql_join_permission_filter_matches_department_access(self) -> None:
         sales_entries = self.repository.list_entries_for_retrieval(
             intent="policy_process",
@@ -207,6 +224,13 @@ class SQLKnowledgeRepositoryTests(unittest.TestCase):
     def _table_columns(self, table_name: str) -> set[str]:
         rows = self.connection.execute(f"PRAGMA table_info({table_name})").fetchall()
         return {str(row["name"]) for row in rows}
+
+    def _table_exists(self, table_name: str) -> bool:
+        row = self.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return row is not None
 
 
 if __name__ == "__main__":

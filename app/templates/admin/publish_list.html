@@ -1,0 +1,82 @@
+{% extends 'admin/layout.html' %}
+
+{% block content %}
+<div class="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
+  <div class="px-6 py-5 border-b border-slate-100 flex items-center justify-between">
+    <div>
+      <div class="text-sm text-slate-500">发布后将进入机器人可回答范围</div>
+      <div class="text-lg font-semibold mt-1">待发布知识</div>
+    </div>
+  </div>
+  <div class="overflow-x-auto">
+    <table class="min-w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500">
+        <tr>
+          <th class="text-left px-5 py-3">标题</th>
+          <th class="text-left px-5 py-3">类型</th>
+          <th class="text-left px-5 py-3">负责人</th>
+          <th class="text-left px-5 py-3">最近验证</th>
+          <th class="text-left px-5 py-3">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in items %}
+        <tr class="border-t border-slate-100 hover:bg-slate-50" x-data="publishRow('{{ item.doc_id }}')">
+          <td class="px-5 py-4 font-medium text-slate-800">{{ item.title }}</td>
+          <td class="px-5 py-4">{{ item.knowledge_kind }}</td>
+          <td class="px-5 py-4">{{ item.owner }}</td>
+          <td class="px-5 py-4 text-slate-500">{{ item.last_validated_at or '未验证' }}</td>
+          <td class="px-5 py-4">
+            {% if item.can_publish %}
+            <div class="flex gap-2 items-center">
+              <button @click="publish" class="rounded-lg bg-emerald-600 text-white px-4 py-2 text-xs font-medium">发布到机器人</button>
+              <a href="/admin/ui/validation?as_role={{ role_code }}&doc_id={{ item.doc_id }}&title={{ item.title|urlencode }}" class="rounded-lg bg-slate-100 text-slate-700 px-4 py-2 text-xs font-medium">去验证</a>
+              {% if item.knowledge_kind == 'faq' %}
+              <a href="/admin/ui/knowledge/faq/new{{ role_query }}&doc_id={{ item.doc_id }}" class="rounded-lg bg-slate-100 text-slate-700 px-4 py-2 text-xs font-medium">去修改</a>
+              {% elif item.knowledge_kind == 'fixed_quote' %}
+              <a href="/admin/ui/knowledge/fixed-quote/new{{ role_query }}&doc_id={{ item.doc_id }}" class="rounded-lg bg-slate-100 text-slate-700 px-4 py-2 text-xs font-medium">去修改</a>
+              {% endif %}
+            </div>
+            <div class="mt-2 text-xs text-slate-500" x-text="message"></div>
+            {% else %}
+            <span class="text-xs text-slate-400">当前角色无发布权限</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="5" class="px-5 py-12 text-center text-slate-400">当前没有可发布的知识</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function publishRow(docId) {
+  return {
+    message: '',
+    async publish() {
+      const res = await fetch(`/admin/publish/${docId}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Role': '{{ role_code }}',
+          'X-Admin-User-Id': 'ui-user'
+        },
+        body: JSON.stringify({ publish_note: 'published from ui' })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        this.message = '发布成功，刷新页面后可看到最新状态。';
+        return;
+      }
+      this.message = data.detail?.error?.message || data.error?.message || '发布失败';
+    }
+  }
+}
+</script>
+{% endblock %}

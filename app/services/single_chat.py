@@ -349,16 +349,17 @@ class SingleChatService:
                     reply=AgentReply(channel="text", text="请假信息暂未收集成功，请重试。"),
                 )
                 return self._apply_llm_trace(result=result, llm_trace=llm_trace)
-            return ChatHandleResult(
-                handled=True,
-                reason="flow_guidance_card",
-                intent=intent,
-                reply=AgentReply(
-                    channel="interactive_card",
-                    interactive_card=build_flow_guidance_card(intent="leave", question=question),
-                ),
-                llm_trace=llm_trace,
-            )
+            if not self._should_route_leave_to_knowledge_answer(question):
+                return ChatHandleResult(
+                    handled=True,
+                    reason="flow_guidance_card",
+                    intent=intent,
+                    reply=AgentReply(
+                        channel="interactive_card",
+                        interactive_card=build_flow_guidance_card(intent="leave", question=question),
+                    ),
+                    llm_trace=llm_trace,
+                )
 
         if intent == "reimbursement":
             if self._should_start_reimbursement_workflow(question=question):
@@ -607,6 +608,7 @@ class SingleChatService:
         if not any(token in normalized for token in leave_scope_tokens):
             return False
         info_tokens = ("流程", "入口", "在哪", "怎么", "如何", "规则", "制度", "说明")
+        consult_tokens = ("可以", "可不可以", "能不能", "能否", "是否", "可否", "行不行", "吗", "么")
         action_tokens = (
             "我要",
             "我想",
@@ -625,7 +627,17 @@ class SingleChatService:
             "到",
             "至",
         )
-        return any(token in normalized for token in info_tokens) and not any(token in normalized for token in action_tokens)
+        has_info_signal = any(token in normalized for token in info_tokens)
+        has_consult_signal = any(token in normalized for token in consult_tokens)
+        has_action_signal = any(token in normalized for token in action_tokens)
+        return (has_info_signal or has_consult_signal) and not has_action_signal
+
+    def _should_route_leave_to_knowledge_answer(self, question: str) -> bool:
+        normalized = self._normalize(question)
+        if not normalized:
+            return False
+        policy_tokens = ("试用期", "转正", "审批人", "材料", "证明", "天数", "多久", "几天", "能不能", "可以", "是否")
+        return self._is_leave_information_query(question) and any(token in normalized for token in policy_tokens)
 
     def _should_start_reimbursement_workflow(self, *, question: str) -> bool:
         normalized = self._normalize(question)

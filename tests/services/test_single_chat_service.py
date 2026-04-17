@@ -86,7 +86,14 @@ class _StubReimbursementAttachmentProcessor:
             reason="processed",
             department="总经办",
             amount="106",
-            attachment_media_id="media-pdf-1",
+            attachment_media_id="media-image-1",
+            amount_source="screenshot",
+            amount_source_note="截图识别成功，待人工确认",
+            extraction_evidence={
+                "template_match": {"hit": True, "evidence": "模板已命中"},
+                "department_match": {"label": "部门", "hit": True},
+                "amount_match": {"row_header": "合计", "col_header": "合计金额", "row_hit": True, "col_hit": True},
+            },
         )
 
     def process(self, *, message, conversation_id: str, sender_id: str):  # type: ignore[no-untyped-def]
@@ -761,7 +768,29 @@ class SingleChatServiceTests(unittest.TestCase):
         self.assertTrue(result.answered_at)
         self.assertGreaterEqual(len(result.citations), 1)
 
-    def test_result_contains_llm_trace_contract_fields(self) -> None:
+    def test_returns_knowledge_text_answer_for_fixed_quote_question(self) -> None:
+        service = SingleChatService()
+        result = service.handle(make_message(text="XX定影器多少钱"))
+        self.assertTrue(result.handled)
+        self.assertEqual("text", result.reply.channel)
+        self.assertEqual("fixed_quote", result.intent)
+        self.assertEqual("knowledge_answer", result.reason)
+        self.assertIn("faq-quote-fuser-xx-2026-03", result.source_ids)
+        self.assertIn("版本日期", result.reply.text or "")
+        self.assertIn("2026-03-05", result.reply.text or "")
+        self.assertIn("联系商务", result.reply.text or "")
+
+    def test_out_of_scope_fixed_quote_query_returns_no_fabrication_text(self) -> None:
+        service = SingleChatService()
+        result = service.handle(make_message(text="Z9特殊组件成本核算"))
+        self.assertFalse(result.handled)
+        self.assertEqual("text", result.reply.channel)
+        self.assertEqual("fixed_quote", result.intent)
+        self.assertEqual("knowledge_no_hit", result.reason)
+        self.assertIn("不提供推测价格", result.reply.text or "")
+        self.assertIn("联系商务确认", result.reply.text or "")
+        self.assertEqual(0, len(result.source_ids))
+
         service = SingleChatService(
             llm_intent_service=_StubLLMIntentService(intent="policy_process"),  # type: ignore[arg-type]
             orchestrator_shadow_service=_StubShadowService(),  # type: ignore[arg-type]
@@ -841,6 +870,74 @@ class SingleChatServiceTests(unittest.TestCase):
         self.assertEqual("text", result.reply.channel)
         self.assertIn("请假类型", result.reply.text or "")
 
+    def test_leave_policy_question_prefers_knowledge_answer_over_leave_workflow(self) -> None:
+        service, connection = _build_permission_aware_service()
+        try:
+            connection.execute(
+                """
+                INSERT INTO knowledge_docs (
+                    doc_id,
+                    source_type,
+                    title,
+                    summary,
+                    applicability,
+                    next_step,
+                    source_uri,
+                    updated_at,
+                    status,
+                    owner,
+                    category,
+                    version_tag,
+                    keywords_csv,
+                    intents_csv,
+                    permission_scope,
+                    permitted_depts_csv
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "faq-leave-trial-01",
+                    "faq",
+                    "试用期员工可以请假吗",
+                    "试用期员工可以按公司制度申请事假/病假。",
+                    "全体员工",
+                    "如为病假，请补充证明材料。",
+                    "FAQ/HR/试用期请假",
+                    "2026-04-17",
+                    "active",
+                    "hr",
+                    "faq",
+                    "v1",
+                    "试用期,请假,病假",
+                    "leave,policy_process",
+                    "public",
+                    "",
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO doc_chunks (chunk_id, doc_id, chunk_index, chunk_text, chunk_vector)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    "chunk-faq-leave-trial-01",
+                    "faq-leave-trial-01",
+                    0,
+                    "试用期员工可以按公司制度申请事假病假，如为病假需补充证明材料。",
+                    "[]",
+                ),
+            )
+            connection.commit()
+
+            result = service.handle(make_message(text="试用期员工可以请假吗？"))
+
+            self.assertTrue(result.handled)
+            self.assertEqual("knowledge_answer", result.reason)
+            self.assertEqual("leave", result.intent)
+            self.assertIn("试用期员工可以按公司制度申请事假/病假", result.reply.text or "")
+            self.assertNotEqual("leave_workflow_collecting", result.reason)
+        finally:
+            connection.close()
+
     def test_returns_flow_guidance_text_for_reimbursement(self) -> None:
         service = SingleChatService()
         result = service.handle(make_message(text="出差报销怎么弄"))
@@ -908,21 +1005,32 @@ class SingleChatServiceTests(unittest.TestCase):
             )
         )
         self.assertEqual("reimbursement_travel_collecting_attachment", select.reason)
-        self.assertIn("差旅费报销单（Excel）", select.reply.text or "")
+        self.assertIn("报销单截图", select.reply.text or "")
 
         upload = service.handle(
             make_message(
-                message_type="file",
+                message_type="picture",
                 text="",
-                file_name="差旅费报销单.xlsx",
+                file_name="报销单截图.png",
                 file_content_base64="ZmFrZQ==",
                 conversation_id="conv-rmb-1",
                 sender_id="user-rmb-1",
             )
         )
-        self.assertEqual("reimbursement_travel_collecting_company", upload.reason)
-        self.assertIn("部门：总经办", upload.reply.text or "")
-        self.assertIn("金额：106元", upload.reply.text or "")
+        self.assertEqual("reimbursement_travel_recognition_confirmation", upload.reason)
+        self.assertEqual("interactive_card", upload.reply.channel)
+        upload_card = upload.reply.interactive_card or {}
+        self.assertEqual("reimbursement_recognition_confirmation", upload_card.get("card_type"))
+        self.assertIn("部门：总经办", upload_card.get("summary", ""))
+        self.assertIn("金额：106元", upload_card.get("summary", ""))
+
+        recognized = service.handle_reimbursement_confirmation_action_by_session(
+            action="reimbursement_recognition_confirm",
+            conversation_id="conv-rmb-1",
+            sender_id="user-rmb-1",
+        )
+        self.assertEqual("reimbursement_travel_collecting_company", recognized.reason)
+        self.assertIn("总经办", recognized.reply.text or "")
 
         choose = service.handle(
             make_message(
