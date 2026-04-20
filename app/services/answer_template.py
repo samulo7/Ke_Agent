@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from app.schemas.dingtalk_chat import IntentType
@@ -9,7 +10,7 @@ from app.schemas.tone import ToneProfile
 
 @dataclass(frozen=True)
 class UnifiedAnswerTemplate:
-    """Canonical A-09 answer template for FAQ/document knowledge hits."""
+    """Canonical A-09 answer template for document knowledge hits."""
 
     conclusion: str
     steps: tuple[str, ...]
@@ -36,21 +37,56 @@ class UnifiedAnswerTemplate:
         return "文档" if source_type == "document" else "FAQ"
 
 
+@dataclass(frozen=True)
+class FAQAnswerTemplate:
+    """Answer template for non-quote FAQ hits."""
+
+    conclusion: str
+    applicability: str
+    sources: tuple[KnowledgeCitation, ...]
+    suggestion: str
+
+    def to_text(self) -> str:
+        lines: list[str] = [
+            f"结论：{self.conclusion}",
+            f"适用范围：{_normalize_applicability(self.applicability)}",
+        ]
+        if self.suggestion.strip():
+            lines.append(f"建议：{self.suggestion.strip()}")
+        lines.append("来源：")
+        for index, source in enumerate(self.sources, start=1):
+            lines.append(
+                f"{index}. [{source.source_id}] {source.title}"
+                f"（FAQ，更新于 {source.updated_at}）"
+            )
+        return "\n".join(lines)
+
+
 def build_unified_answer_template(
     *,
     evidences: tuple[RetrievedEvidence, ...],
     citations: tuple[KnowledgeCitation, ...],
     intent: IntentType,
     tone_profile: ToneProfile,
-) -> UnifiedAnswerTemplate:
+    question: str,
+) -> UnifiedAnswerTemplate | FAQAnswerTemplate:
     selected_evidences, selected_citations = _select_display_evidences_and_citations(
         evidences=evidences,
         citations=citations,
     )
     primary = selected_evidences[0].entry
+    if primary.source_type == "faq" and intent != "fixed_quote":
+        return FAQAnswerTemplate(
+            conclusion=primary.summary,
+            applicability=primary.applicability,
+            sources=selected_citations,
+            suggestion=primary.next_step,
+        )
+
     steps = [_build_applicability_step(applicability=primary.applicability, tone_profile=tone_profile)]
 
     if intent == "fixed_quote":
+        steps.append(_build_fixed_quote_version_step(updated_at=primary.updated_at, tone_profile=tone_profile))
         steps.append(_build_fixed_quote_step(tone_profile=tone_profile))
     elif intent in {"policy_process", "other"}:
         steps.append(_build_policy_step(tone_profile=tone_profile))
@@ -66,7 +102,11 @@ def build_unified_answer_template(
         steps.append(_build_related_step(related_titles=related_titles, tone_profile=tone_profile))
 
     return UnifiedAnswerTemplate(
-        conclusion=primary.summary,
+        conclusion=(
+            _build_document_conclusion(search_text=primary.search_text, summary=primary.summary, question=question)
+            if primary.source_type == "document"
+            else primary.summary
+        ),
         steps=tuple(steps),
         sources=selected_citations,
         next_step=primary.next_step,
@@ -96,6 +136,49 @@ def _select_display_evidences_and_citations(
     return tuple(selected_evidences), selected_citations
 
 
+def _build_document_conclusion(*, search_text: str, summary: str, question: str) -> str:
+    terms = _extract_match_terms(question)
+    best_segment = ""
+    best_score = 0
+    for raw_segment in re.split(r"[\n。！？!?；;]", search_text):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        normalized_segment = _normalize_for_match(segment)
+        matched_terms = [term for term in terms if term in normalized_segment]
+        if not matched_terms:
+            continue
+        score = sum(max(len(term), 2) for term in matched_terms) - (segment.count(".") + segment.count("…") + segment.count("·")) * 3
+        if "目录" in segment:
+            score -= 20
+        if score > best_score:
+            best_segment = segment
+            best_score = score
+    return best_segment or summary
+
+
+def _extract_match_terms(question: str) -> tuple[str, ...]:
+    terms: list[str] = []
+    for raw in re.findall(r"[\u4e00-\u9fff]{2,16}|[A-Za-z0-9][A-Za-z0-9_-]{1,31}", question):
+        normalized = _normalize_for_match(raw)
+        if len(normalized) < 2:
+            continue
+        candidates = [normalized]
+        if all("\u4e00" <= char <= "\u9fff" for char in normalized) and len(normalized) > 4:
+            for size in range(2, min(4, len(normalized)) + 1):
+                for index in range(len(normalized) - size + 1):
+                    candidates.append(normalized[index : index + size])
+        for candidate in candidates:
+            if len(candidate) < 2 or candidate in terms:
+                continue
+            terms.append(candidate)
+    return tuple(terms)
+
+
+def _normalize_for_match(text: str) -> str:
+    return "".join(text.strip().lower().split())
+
+
 def _supporting_score_threshold(*, primary_score: int) -> int:
     if primary_score >= 30:
         return max(15, int(primary_score * 0.6))
@@ -113,12 +196,20 @@ def _build_applicability_step(*, applicability: str, tone_profile: ToneProfile) 
     return f"这个规则一般适用于：{normalized}"
 
 
+def _build_fixed_quote_version_step(*, updated_at: str, tone_profile: ToneProfile) -> str:
+    if tone_profile == "formal":
+        return f"本报价版本日期：{updated_at}，请以下方来源更新时间为准。"
+    if tone_profile == "neutral":
+        return f"本报价版本日期：{updated_at}，请以下方来源更新时间为准。"
+    return f"这条报价当前版本日期是 {updated_at}，以来源更新时间为准。"
+
+
 def _build_fixed_quote_step(*, tone_profile: ToneProfile) -> str:
     if tone_profile == "formal":
-        return "如型号、税率或数量与实际需求不一致，请先联系商务确认后再下单。"
+        return "如型号、税率、数量或折扣条件与实际需求不一致，请先联系商务确认后再下单。"
     if tone_profile == "neutral":
-        return "如果型号、税率或数量和实际情况不同，建议先联系商务确认后再下单。"
-    return "型号、税率、数量只要有一项不一样，都先和商务对一下再下单。"
+        return "如果型号、税率、数量或折扣条件和实际情况不同，建议先联系商务确认后再下单。"
+    return "型号、税率、数量、折扣条件只要有一项不一样，都先联系商务确认再下单。"
 
 
 def _build_policy_step(*, tone_profile: ToneProfile) -> str:

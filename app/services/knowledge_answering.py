@@ -64,6 +64,7 @@ class KnowledgeAnswerService:
                 citations=all_citations,
                 intent=intent,
                 tone_profile=tone_profile,
+                question=question,
             )
             citations = template.sources
             deterministic_text = template.to_text()

@@ -9,13 +9,14 @@ from app.api.admin_knowledge import router as admin_knowledge_router
 from app.api.admin_pages import router as admin_pages_router
 from app.api.dingtalk import router as dingtalk_router
 from app.api.health import router as health_router
+from app.core.env_loader import load_project_env
 from app.core.structured_logging import configure_structured_logging
 from app.core.trace_middleware import TraceMiddleware
 from app.rag.knowledge_retriever import KnowledgeRetriever
-from app.repos.sql_knowledge_repository import SQLKnowledgeRepository
 from app.services.admin_knowledge import (
     AdminKnowledgeService,
     build_default_admin_knowledge_service,
+    build_knowledge_repository,
     build_shared_admin_runtime_services,
 )
 from app.services.health import HealthService
@@ -33,6 +34,7 @@ def create_app(
     log_level: str = "INFO",
     log_stream: TextIO | None = None,
 ) -> FastAPI:
+    load_project_env()
     configure_structured_logging(level=log_level, stream=log_stream)
     app = FastAPI(title="keagent")
     app.add_middleware(TraceMiddleware)
@@ -42,7 +44,7 @@ def create_app(
         admin_knowledge_service, knowledge_answer_service = build_shared_admin_runtime_services()
         single_chat_service = SingleChatService(knowledge_answer_service=knowledge_answer_service)
     elif single_chat_service is None and admin_knowledge_service is not None:
-        repository = SQLKnowledgeRepository(connection=admin_knowledge_service.connection)
+        repository = build_knowledge_repository(connection=admin_knowledge_service.connection)
         knowledge_answer_service = KnowledgeAnswerService(
             retriever=KnowledgeRetriever(repository=repository),
             repository=repository,

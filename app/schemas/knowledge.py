@@ -32,6 +32,7 @@ class KnowledgeEntry:
     updated_at: str
     keywords: tuple[str, ...]
     intents: tuple[IntentType, ...]
+    search_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ class RestrictedKnowledgeEntry:
     updated_at: str
     keywords: tuple[str, ...]
     intents: tuple[IntentType, ...]
+    search_text: str = ""
 
 
 @dataclass(frozen=True)

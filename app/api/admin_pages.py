@@ -57,6 +57,15 @@ def _assert_kind_create_access(*, permissions: dict[str, Any], kind: str) -> Non
         raise HTTPException(status_code=403, detail="forbidden")
 
 
+def _uploadable_document_kinds(*, permissions: dict[str, Any]) -> list[str]:
+    available: list[str] = []
+    for kind in ("policy_doc", "restricted_doc"):
+        kind_perms = permissions.get("knowledge_permissions", {}).get(kind, {})
+        if kind_perms.get("can_create", False):
+            available.append(kind)
+    return available
+
+
 @router.get("/knowledge", response_class=HTMLResponse)
 def knowledge_list_page(
     request: Request,
@@ -125,6 +134,28 @@ def fixed_quote_form_page(request: Request, doc_id: str = Query(default="")) -> 
             "page_title": "新增固定报价" if not doc_id else "编辑固定报价",
             "active_nav": "knowledge",
             "initial_data": initial_data,
+        },
+    )
+
+
+@router.get("/knowledge/upload", response_class=HTMLResponse)
+def document_upload_page(request: Request, knowledge_kind: str = Query(default="policy_doc")) -> HTMLResponse:
+    ctx = _page_context(request)
+    _assert_menu_access(permissions=ctx["permissions"], menu_key="knowledge")
+    available_kinds = _uploadable_document_kinds(permissions=ctx["permissions"])
+    if not available_kinds:
+        raise HTTPException(status_code=403, detail="forbidden")
+    if knowledge_kind not in available_kinds:
+        knowledge_kind = available_kinds[0]
+    return _TEMPLATES.TemplateResponse(
+        request,
+        "admin/document_upload.html",
+        {
+            **ctx,
+            "page_title": "上传知识文档",
+            "active_nav": "knowledge",
+            "knowledge_kind": knowledge_kind,
+            "available_kinds": available_kinds,
         },
     )
 

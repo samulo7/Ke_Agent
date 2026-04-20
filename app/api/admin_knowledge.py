@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from app.services.admin_knowledge import (
@@ -156,6 +157,47 @@ def _error_response(exc: Exception) -> HTTPException:
     )
 
 
+def _split_csv_form(raw_value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in raw_value.split(",") if item.strip())
+
+
+def _build_upload_input(
+    *,
+    knowledge_kind: str,
+    title: str,
+    summary: str,
+    applicability: str,
+    next_step: str,
+    source_uri: str,
+    owner: str,
+    department: str,
+    permission_scope: str,
+    permitted_depts: str,
+    keywords: str,
+    intents: str,
+    version_tag: str,
+    category: str,
+) -> KnowledgeInput:
+    return KnowledgeInput(
+        knowledge_kind=knowledge_kind,  # type: ignore[arg-type]
+        title=title,
+        summary=summary,
+        applicability=applicability,
+        next_step=next_step,
+        source_uri=source_uri,
+        updated_at=datetime.now(timezone.utc).isoformat(),
+        owner=owner,
+        department=department,
+        permission_scope=permission_scope,
+        permitted_depts=_split_csv_form(permitted_depts),
+        keywords=_split_csv_form(keywords),
+        intents=_split_csv_form(intents),
+        version_tag=version_tag,
+        category=category,
+        quote_fields=None,
+    )
+
+
 @router.get("/me/permissions")
 def get_current_permissions(request: Request) -> dict[str, Any]:
     service = _service(request)
@@ -193,6 +235,17 @@ def list_knowledge(
     return {"ok": True, "data": data}
 
 
+@router.get("/knowledge/{doc_id}")
+def get_knowledge_detail(request: Request, doc_id: str) -> dict[str, Any]:
+    service = _service(request)
+    role_code = RoleContextMixin.resolve_role(request)
+    try:
+        data = service.get_knowledge_detail(role_code=role_code, doc_id=doc_id)  # type: ignore[arg-type]
+    except Exception as exc:
+        raise _error_response(exc) from exc
+    return {"ok": True, "data": data}
+
+
 @router.post("/knowledge")
 def create_knowledge(request: Request, payload: KnowledgePayload) -> dict[str, Any]:
     service = _service(request)
@@ -203,6 +256,57 @@ def create_knowledge(request: Request, payload: KnowledgePayload) -> dict[str, A
             user_id=user_id,
             role_code=role_code,  # type: ignore[arg-type]
             payload=payload.to_input(),
+        )
+    except Exception as exc:
+        raise _error_response(exc) from exc
+    return {"ok": True, "data": data}
+
+
+@router.post("/knowledge/upload")
+async def upload_knowledge(
+    request: Request,
+    knowledge_kind: str = Form(...),
+    title: str = Form(...),
+    summary: str = Form(default=""),
+    applicability: str = Form(default=""),
+    next_step: str = Form(default=""),
+    source_uri: str = Form(default=""),
+    owner: str = Form(...),
+    department: str = Form(default=""),
+    permission_scope: str = Form(default="public"),
+    permitted_depts: str = Form(default=""),
+    keywords: str = Form(default=""),
+    intents: str = Form(default=""),
+    version_tag: str = Form(default=""),
+    category: str = Form(default=""),
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    service = _service(request)
+    role_code = RoleContextMixin.resolve_role(request)
+    user_id = RoleContextMixin.resolve_user_id(request)
+    try:
+        payload = _build_upload_input(
+            knowledge_kind=knowledge_kind,
+            title=title,
+            summary=summary,
+            applicability=applicability,
+            next_step=next_step,
+            source_uri=source_uri,
+            owner=owner,
+            department=department,
+            permission_scope=permission_scope,
+            permitted_depts=permitted_depts,
+            keywords=keywords,
+            intents=intents,
+            version_tag=version_tag,
+            category=category,
+        )
+        data = service.upload_knowledge_document(
+            user_id=user_id,
+            role_code=role_code,  # type: ignore[arg-type]
+            payload=payload,
+            filename=file.filename or "",
+            content=await file.read(),
         )
     except Exception as exc:
         raise _error_response(exc) from exc

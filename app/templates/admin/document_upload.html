@@ -1,0 +1,241 @@
+{% extends 'admin/layout.html' %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto" x-data="documentUploadForm()" x-init="syncKindDefaults()">
+  <div class="grid grid-cols-1 xl:grid-cols-[1.05fr_0.95fr] gap-6">
+    <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm space-y-4">
+      <div>
+        <div class="text-lg font-semibold text-slate-800">上传知识文档</div>
+        <div class="text-sm text-slate-500 mt-1">支持 txt / md / docx / pdf 上传，保存后可直接进入验证与发布链路。</div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-2">知识类型</label>
+          <select x-model="form.knowledge_kind" @change="syncKindDefaults()" class="w-full rounded-xl border border-slate-300 px-4 py-3">
+            {% for kind in available_kinds %}
+            <option value="{{ kind }}">{{ '制度文档' if kind == 'policy_doc' else '受限文档' }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">标题</label>
+          <input x-model="form.title" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="例如：员工出差报销制度" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">适用范围</label>
+          <input x-model="form.applicability" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="全体员工" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">下一步</label>
+          <input x-model="form.next_step" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="如需提交材料，请按制度补齐。" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">负责人</label>
+          <input x-model="form.owner" class="w-full rounded-xl border border-slate-300 px-4 py-3" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">部门</label>
+          <input x-model="form.department" class="w-full rounded-xl border border-slate-300 px-4 py-3" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">权限范围</label>
+          <select x-model="form.permission_scope" class="w-full rounded-xl border border-slate-300 px-4 py-3">
+            <option value="public">public</option>
+            <option value="department">department</option>
+            <option value="sensitive">sensitive</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">允许部门（逗号分隔）</label>
+          <input x-model="permittedDeptsRaw" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="admin, finance" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">关键词（逗号分隔）</label>
+          <input x-model="keywordsRaw" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="出差, 报销, 差旅" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">意图（逗号分隔）</label>
+          <input x-model="intentsRaw" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="policy_process, reimbursement" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">版本</label>
+          <input x-model="form.version_tag" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="v1" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">分类</label>
+          <input x-model="form.category" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="policy" />
+        </div>
+      </div>
+
+      <div>
+        <label class="block text-sm font-medium mb-2">摘要（可留空，系统将从文档自动提取）</label>
+        <textarea x-model="form.summary" rows="4" class="w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="可手动补充简要摘要"></textarea>
+      </div>
+
+      <div>
+        <label class="block text-sm font-medium mb-2">上传文件</label>
+        <input type="file" @change="onFileChange" accept=".txt,.md,.docx,.pdf" class="block w-full rounded-xl border border-slate-300 px-4 py-3 bg-white" />
+        <div class="text-xs text-slate-500 mt-2" x-text="fileName || '尚未选择文件'"></div>
+      </div>
+
+      <div class="flex flex-wrap gap-3">
+        <button @click="uploadDocument" class="rounded-xl bg-indigo-600 text-white px-5 py-3 font-medium">上传并保存</button>
+        <button @click="goPreview" class="rounded-xl bg-slate-100 text-slate-700 px-5 py-3 font-medium">上传后去验证</button>
+      </div>
+
+      <template x-if="message">
+        <div class="rounded-xl border px-4 py-3 text-sm" :class="messageType === 'success' ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-amber-50 border-amber-200 text-amber-700'" x-text="message"></div>
+      </template>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm space-y-4">
+      <div>
+        <div class="text-sm font-medium text-slate-800">上传预览</div>
+        <div class="text-xs text-slate-500 mt-1">保存后可直接复用现有钉钉验证与发布链路。</div>
+      </div>
+
+      <div class="rounded-2xl bg-slate-50 border border-slate-200 p-4 space-y-4">
+        <div class="text-xs uppercase tracking-wide text-slate-400">标题</div>
+        <div class="text-lg font-semibold text-slate-800" x-text="form.title || '员工出差报销制度'"></div>
+        <div class="text-xs uppercase tracking-wide text-slate-400">摘要</div>
+        <div class="text-sm text-slate-700 whitespace-pre-wrap" x-text="form.summary || '未填写摘要时，系统将在上传时自动生成。'"></div>
+      </div>
+
+      <div class="grid grid-cols-1 gap-3 text-sm">
+        <div class="rounded-xl bg-slate-50 border border-slate-200 px-4 py-3">
+          <div class="text-xs uppercase tracking-wide text-slate-400">知识类型</div>
+          <div class="mt-1 text-slate-700" x-text="form.knowledge_kind"></div>
+        </div>
+        <div class="rounded-xl bg-slate-50 border border-slate-200 px-4 py-3">
+          <div class="text-xs uppercase tracking-wide text-slate-400">权限范围</div>
+          <div class="mt-1 text-slate-700" x-text="form.permission_scope"></div>
+        </div>
+        <div class="rounded-xl bg-slate-50 border border-slate-200 px-4 py-3">
+          <div class="text-xs uppercase tracking-wide text-slate-400">关键词</div>
+          <div class="mt-2 flex flex-wrap gap-2">
+            <template x-for="tag in previewKeywords" :key="tag">
+              <span class="rounded-full bg-indigo-50 text-indigo-700 px-3 py-1 text-xs font-medium" x-text="tag"></span>
+            </template>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function documentUploadForm() {
+  return {
+    form: {
+      knowledge_kind: '{{ knowledge_kind }}',
+      title: '',
+      summary: '',
+      applicability: '全体员工',
+      next_step: '',
+      owner: '{{ role_code }}',
+      department: '{{ role_code }}',
+      permission_scope: '{{ "department" if knowledge_kind == "restricted_doc" else "public" }}',
+      version_tag: 'v1',
+      category: '{{ "restricted" if knowledge_kind == "restricted_doc" else "policy" }}'
+    },
+    keywordsRaw: '',
+    intentsRaw: 'policy_process',
+    permittedDeptsRaw: '{{ role_code if knowledge_kind == "restricted_doc" else "" }}',
+    file: null,
+    fileName: '',
+    uploadedDocId: '',
+    message: '',
+    messageType: 'success',
+    get previewKeywords() {
+      return this.keywordsRaw.split(',').map(v => v.trim()).filter(Boolean);
+    },
+    syncKindDefaults() {
+      if (this.form.knowledge_kind === 'restricted_doc') {
+        if (this.form.permission_scope === 'public') {
+          this.form.permission_scope = 'department';
+        }
+        if (!this.form.category || this.form.category === 'policy') {
+          this.form.category = 'restricted';
+        }
+        if (!this.permittedDeptsRaw.trim()) {
+          this.permittedDeptsRaw = '{{ role_code }}';
+        }
+        return;
+      }
+      if (this.form.permission_scope !== 'public') {
+        this.form.permission_scope = 'public';
+      }
+      if (!this.form.category || this.form.category === 'restricted') {
+        this.form.category = 'policy';
+      }
+      this.permittedDeptsRaw = '';
+    },
+    onFileChange(event) {
+      this.file = event.target.files[0] || null;
+      this.fileName = this.file ? this.file.name : '';
+      if (this.file && !this.form.title.trim()) {
+        this.form.title = this.file.name.replace(/\.[^.]+$/, '');
+      }
+    },
+    async uploadDocument() {
+      if (!this.file) {
+        this.messageType = 'error';
+        this.message = '请先选择要上传的文档。';
+        return false;
+      }
+      if (!this.form.title.trim() || !this.form.owner.trim()) {
+        this.messageType = 'error';
+        this.message = '请先补齐标题和负责人。';
+        return false;
+      }
+      const formData = new FormData();
+      formData.append('knowledge_kind', this.form.knowledge_kind);
+      formData.append('title', this.form.title);
+      formData.append('summary', this.form.summary);
+      formData.append('applicability', this.form.applicability);
+      formData.append('next_step', this.form.next_step);
+      formData.append('source_uri', '');
+      formData.append('owner', this.form.owner);
+      formData.append('department', this.form.department);
+      formData.append('permission_scope', this.form.permission_scope);
+      formData.append('permitted_depts', this.permittedDeptsRaw);
+      formData.append('keywords', this.keywordsRaw);
+      formData.append('intents', this.intentsRaw);
+      formData.append('version_tag', this.form.version_tag);
+      formData.append('category', this.form.category);
+      formData.append('file', this.file);
+
+      const res = await fetch('/admin/knowledge/upload', {
+        method: 'POST',
+        headers: {
+          'X-Admin-Role': '{{ role_code }}',
+          'X-Admin-User-Id': 'ui-user'
+        },
+        body: formData
+      });
+      const data = await res.json();
+      if (data.ok) {
+        this.uploadedDocId = data.data.doc_id;
+        this.messageType = 'success';
+        this.message = '文档已上传并保存到知识库草稿，可继续去验证。';
+        return true;
+      }
+      this.messageType = 'error';
+      this.message = data.detail?.error?.message || data.error?.message || '上传失败';
+      return false;
+    },
+    async goPreview() {
+      if (!this.uploadedDocId) {
+        const uploaded = await this.uploadDocument();
+        if (!uploaded) return;
+      }
+      const target = `/admin/ui/validation?as_role={{ role_code }}&doc_id=${this.uploadedDocId}&title=${encodeURIComponent(this.form.title)}&question=${encodeURIComponent(this.form.title)}`;
+      window.location.href = target;
+    }
+  }
+}
+</script>
+{% endblock %}

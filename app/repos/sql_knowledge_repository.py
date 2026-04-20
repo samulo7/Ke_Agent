@@ -174,7 +174,19 @@ class SQLKnowledgeRepository(KnowledgeRepository):
             d.source_uri,
             d.updated_at,
             d.keywords_csv,
-            d.intents_csv
+            d.intents_csv,
+            COALESCE(
+                (
+                    SELECT GROUP_CONCAT(chunk_text, '\n')
+                    FROM (
+                        SELECT chunk_text
+                        FROM {self._chunks_table}
+                        WHERE doc_id = d.doc_id
+                        ORDER BY chunk_index
+                    ) ordered_chunks
+                ),
+                ''
+            ) AS search_text
         FROM {self._chunks_table} c
         JOIN {self._docs_table} d
             ON d.doc_id = c.doc_id
@@ -205,7 +217,19 @@ class SQLKnowledgeRepository(KnowledgeRepository):
             d.source_uri,
             d.updated_at,
             d.keywords_csv,
-            d.intents_csv
+            d.intents_csv,
+            COALESCE(
+                (
+                    SELECT GROUP_CONCAT(chunk_text, '\n')
+                    FROM (
+                        SELECT chunk_text
+                        FROM {self._chunks_table}
+                        WHERE doc_id = d.doc_id
+                        ORDER BY chunk_index
+                    ) ordered_chunks
+                ),
+                ''
+            ) AS search_text
         FROM {self._chunks_table} c
         JOIN {self._docs_table} d
             ON d.doc_id = c.doc_id
@@ -248,7 +272,19 @@ class SQLKnowledgeRepository(KnowledgeRepository):
             d.permission_scope,
             d.updated_at,
             d.keywords_csv,
-            d.intents_csv
+            d.intents_csv,
+            COALESCE(
+                (
+                    SELECT GROUP_CONCAT(chunk_text, '\n')
+                    FROM (
+                        SELECT chunk_text
+                        FROM {self._chunks_table}
+                        WHERE doc_id = d.doc_id
+                        ORDER BY chunk_index
+                    ) ordered_chunks
+                ),
+                ''
+            ) AS search_text
         FROM {self._docs_table} d
         WHERE d.status = ?
           AND REPLACE(',' || COALESCE(d.intents_csv, '') || ',', ' ', '') LIKE ?
@@ -283,6 +319,7 @@ class SQLKnowledgeRepository(KnowledgeRepository):
             updated_at=str(row[7]),
             keywords=keywords,
             intents=intents or ("other",),  # type: ignore[arg-type]
+            search_text=str(row[10] or ""),
         )
 
     @staticmethod
@@ -300,4 +337,5 @@ class SQLKnowledgeRepository(KnowledgeRepository):
             updated_at=str(row[7]),
             keywords=keywords,
             intents=intents or ("other",),  # type: ignore[arg-type]
+            search_text=str(row[10] or ""),
         )

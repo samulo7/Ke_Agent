@@ -6,7 +6,7 @@ import unittest
 from app.rag.knowledge_retriever import KnowledgeRetriever
 from app.repos.in_memory_knowledge_repository import InMemoryKnowledgeRepository
 from app.repos.sql_knowledge_repository import SQLKnowledgeRepository, bootstrap_sqlite_schema
-from app.schemas.knowledge import KnowledgeAccessContext
+from app.schemas.knowledge import KnowledgeAccessContext, KnowledgeEntry
 from app.services.knowledge_answering import KnowledgeAnswerService
 from app.services.tone_resolver import ToneResolver
 
@@ -36,6 +36,19 @@ class KnowledgeAnswerServiceTests(unittest.TestCase):
         self.assertLess(answer.text.index("结论："), answer.text.index("步骤："))
         self.assertLess(answer.text.index("步骤："), answer.text.index("来源："))
         self.assertLess(answer.text.index("来源："), answer.text.index("下一步："))
+
+    def test_non_quote_faq_uses_faq_template_not_process_steps(self) -> None:
+        answer = self.service.answer(question="FAQ：制度文档入口说明", intent="policy_process")
+        self.assertTrue(answer.found)
+        self.assertIn("faq-policy-entry-2026-02", answer.source_ids)
+        self.assertIn("结论：", answer.text)
+        self.assertIn("适用范围：", answer.text)
+        self.assertIn("建议：", answer.text)
+        self.assertIn("来源：", answer.text)
+        self.assertNotIn("步骤：", answer.text)
+        self.assertNotIn("提交流程", answer.text)
+        self.assertNotIn("入口：", answer.text)
+        self.assertNotIn("下一步：", answer.text)
 
     def test_fixed_quote_hit_uses_same_unified_template(self) -> None:
         answer = self.service.answer(question="XX定影器多少钱", intent="fixed_quote")
@@ -79,6 +92,34 @@ class KnowledgeAnswerServiceTests(unittest.TestCase):
         self.assertIn("doc-process-procurement-contract-2026-03", answer.source_ids)
         self.assertNotIn("doc-process-leave-2026-01", answer.source_ids)
         self.assertNotIn("doc-process-reimbursement-2026-02", answer.source_ids)
+
+    def test_document_answer_uses_matching_chunk_excerpt_as_conclusion(self) -> None:
+        repository = InMemoryKnowledgeRepository(
+            entries=(
+                KnowledgeEntry(
+                    source_id="doc-yunxin-handbook",
+                    source_type="document",
+                    title="Yunxin Handbook",
+                    summary="Onboarding rules overview.",
+                    applicability="For all employees",
+                    next_step="Contact HR if needed.",
+                    source_uri="upload:yunxin-handbook.pdf",
+                    updated_at="2026-04-20",
+                    keywords=("employee",),
+                    intents=("policy_process",),
+                    search_text="Employees must fill in their nickname during onboarding and keep it consistent in the system.\nOther details.",
+                ),
+            )
+        )
+        service = KnowledgeAnswerService(
+            retriever=KnowledgeRetriever(repository=repository, top_k=5),
+            repository=repository,
+            tone_resolver=ToneResolver(default_tone="conversational"),
+        )
+
+        answer = service.answer(question="how to fill nickname", intent="policy_process")
+        self.assertTrue(answer.found)
+        self.assertIn("nickname", answer.text.lower())
 
 
 class KnowledgeAnswerServicePermissionTests(unittest.TestCase):

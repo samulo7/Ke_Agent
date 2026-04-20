@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from io import BytesIO
+import os
 import sqlite3
+import tempfile
 import unittest
 
+from docx import Document
 from fastapi.testclient import TestClient
 
 from app.api.main import create_app
@@ -21,6 +25,58 @@ class AdminKnowledgeApiTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.connection.close()
+
+    @staticmethod
+    def _build_docx_bytes(*paragraphs: str) -> bytes:
+        document = Document()
+        for paragraph in paragraphs:
+            document.add_paragraph(paragraph)
+        buffer = BytesIO()
+        document.save(buffer)
+        return buffer.getvalue()
+
+    @staticmethod
+    def _build_pdf_bytes(text: str) -> bytes:
+        stream = f"BT\n/F1 18 Tf\n50 100 Td\n({text}) Tj\nET".encode("latin-1")
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream",
+        ]
+        chunks = [b"%PDF-1.4\n"]
+        offsets = [0]
+        for index, body in enumerate(objects, start=1):
+            offsets.append(sum(len(chunk) for chunk in chunks))
+            chunks.append(f"{index} 0 obj\n".encode("ascii") + body + b"\nendobj\n")
+        xref_offset = sum(len(chunk) for chunk in chunks)
+        xref = [f"xref\n0 {len(objects) + 1}\n".encode("ascii"), b"0000000000 65535 f \n"]
+        for offset in offsets[1:]:
+            xref.append(f"{offset:010d} 00000 n \n".encode("ascii"))
+        chunks.extend(xref)
+        chunks.append(f"trailer\n<< /Root 1 0 R /Size {len(objects) + 1} >>\nstartxref\n{xref_offset}\n%%EOF".encode("ascii"))
+        return b"".join(chunks)
+
+    @staticmethod
+    def _upload_form_data(**overrides: str) -> dict[str, str]:
+        payload = {
+            "knowledge_kind": "policy_doc",
+            "title": "员工出差报销制度",
+            "applicability": "全体员工",
+            "next_step": "如金额超标，请先与直属主管确认。",
+            "source_uri": "policy-handbook-v1",
+            "owner": "hr",
+            "department": "hr",
+            "permission_scope": "public",
+            "permitted_depts": "",
+            "keywords": "出差,报销,差旅",
+            "intents": "policy_process,reimbursement",
+            "version_tag": "v1",
+            "category": "policy",
+        }
+        payload.update(overrides)
+        return payload
 
     def test_get_permissions_for_hr_role(self) -> None:
         response = self.client.get(
@@ -259,6 +315,49 @@ class AdminKnowledgeApiTests(unittest.TestCase):
         self.assertEqual("published", publish_body["data"]["review_status"])
         self.assertEqual("u-hr-01", publish_body["data"]["published_by"])
 
+    def test_preview_uses_selected_faq_intents_when_question_classification_differs(self) -> None:
+        create_response = self.client.post(
+            "/admin/knowledge",
+            headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+            json={
+                "knowledge_kind": "faq",
+                "title": "上班可以玩手机吗",
+                "summary": "工作时间不能长时间浏览手机娱乐。",
+                "applicability": "全体员工",
+                "next_step": "如需紧急处理个人事项，请先和主管说明。",
+                "source_uri": "employee-handbook-v3",
+                "updated_at": "2026-04-20T14:12:00+08:00",
+                "owner": "hr",
+                "department": "hr",
+                "permission_scope": "public",
+                "permitted_depts": [],
+                "keywords": ["上班期间", "手机", "禁止"],
+                "intents": ["policy_process", "leave"],
+                "version_tag": "v1",
+                "category": "faq"
+            },
+        )
+        self.assertEqual(200, create_response.status_code)
+        doc_id = create_response.json()["data"]["doc_id"]
+
+        preview_response = self.client.post(
+            "/admin/validation/dingtalk-preview",
+            headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+            json={"question": "上班可以玩手机吗", "doc_id": doc_id, "dept_context": "hr"},
+        )
+        self.assertEqual(200, preview_response.status_code)
+        preview_body = preview_response.json()
+        self.assertEqual("passed", preview_body["data"]["validation_result"])
+        self.assertIn("工作时间不能长时间浏览手机娱乐", preview_body["data"]["reply_preview"]["text"])
+
+        publish_response = self.client.post(
+            f"/admin/publish/{doc_id}",
+            headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+            json={"publish_note": "ready for robot"},
+        )
+        self.assertEqual(200, publish_response.status_code)
+        self.assertEqual("published", publish_response.json()["data"]["review_status"])
+
     def test_preview_generates_fixed_quote_reply_and_business_can_publish(self) -> None:
         create_response = self.client.post(
             "/admin/knowledge",
@@ -365,6 +464,264 @@ class AdminKnowledgeApiTests(unittest.TestCase):
         body = runtime_response.json()
         self.assertEqual("knowledge_answer", body["reason"])
         self.assertIn("试用期员工可以按公司制度申请事假/病假", body["reply"]["text"])
+    def test_default_app_uses_shared_runtime_knowledge_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["KEAGENT_SQLITE_PATH"] = f"{temp_dir}/runtime.sqlite3"
+            try:
+                app = create_app()
+                client = TestClient(app)
+
+                create_response = client.post(
+                    "/admin/knowledge",
+                    headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+                    json={
+                        "knowledge_kind": "faq",
+                        "title": "试用期员工可以请假吗",
+                        "summary": "试用期员工可以按公司制度申请事假/病假。",
+                        "applicability": "全体员工",
+                        "next_step": "如为病假，请补充证明材料。",
+                        "source_uri": "employee-handbook-v3",
+                        "updated_at": "2026-04-17T09:12:00+08:00",
+                        "owner": "hr",
+                        "department": "hr",
+                        "permission_scope": "public",
+                        "permitted_depts": [],
+                        "keywords": ["试用期", "请假", "病假"],
+                        "intents": ["policy_process", "leave"],
+                        "version_tag": "v1",
+                        "category": "faq"
+                    },
+                )
+                doc_id = create_response.json()["data"]["doc_id"]
+
+                client.post(
+                    "/admin/validation/dingtalk-preview",
+                    headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+                    json={"question": "试用期员工可以请假吗？", "doc_id": doc_id, "dept_context": "hr"},
+                )
+                client.post(
+                    f"/admin/publish/{doc_id}",
+                    headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+                    json={"publish_note": "ready for robot"},
+                )
+
+                runtime_response = client.post(
+                    "/dingtalk/stream/events",
+                    json={
+                        "conversationType": "1",
+                        "conversationId": "conv-default-share-1",
+                        "msgId": "msg-default-share-1",
+                        "senderId": "sender-default-share-1",
+                        "senderStaffId": "staff-default-share-1",
+                        "senderNick": "tester",
+                        "text": {"content": "试用期员工可以请假吗？"},
+                        "msgtype": "text",
+                        "robotCode": "ding-default-share",
+                    },
+                )
+                self.assertEqual(200, runtime_response.status_code)
+                body = runtime_response.json()
+                self.assertEqual("knowledge_answer", body["reason"])
+                self.assertIn("试用期员工可以按公司制度申请事假/病假", body["reply"]["text"])
+                self.assertIn(doc_id, body["source_ids"])
+            finally:
+                admin_service = getattr(app.state, "admin_knowledge_service", None)
+                if admin_service is not None:
+                    admin_service.connection.close()
+                os.environ.pop("KEAGENT_SQLITE_PATH", None)
+    def test_hr_can_upload_policy_document(self) -> None:
+        response = self.client.post(
+            "/admin/knowledge/upload",
+            headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+            data=self._upload_form_data(),
+            files={
+                "file": (
+                    "travel-policy.txt",
+                    "员工出差需先提交出差审批。报销需在返程后五个工作日内完成。".encode("utf-8"),
+                    "text/plain",
+                )
+            },
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual("draft", body["data"]["review_status"])
+        self.assertEqual("document", body["data"]["source_type"])
+        self.assertGreaterEqual(body["data"]["chunk_count"], 1)
+
+        doc_id = body["data"]["doc_id"]
+        row = self.connection.execute(
+            "SELECT title, summary, source_uri, knowledge_kind, permission_scope, keywords_csv FROM knowledge_docs WHERE doc_id = ?",
+            (doc_id,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual("员工出差报销制度", row["title"])
+        self.assertEqual("policy_doc", row["knowledge_kind"])
+        self.assertEqual("public", row["permission_scope"])
+        self.assertIn("员工出差需先提交出差审批", row["summary"])
+        self.assertIn("travel-policy.txt", row["source_uri"])
+        self.assertTrue(row["keywords_csv"])
+
+        chunk_rows = self.connection.execute(
+            "SELECT chunk_index, chunk_text FROM doc_chunks WHERE doc_id = ? ORDER BY chunk_index",
+            (doc_id,),
+        ).fetchall()
+        self.assertGreaterEqual(len(chunk_rows), 1)
+        self.assertIn("报销需在返程后五个工作日内完成", chunk_rows[0]["chunk_text"])
+
+    def test_uploaded_policy_document_can_be_previewed_and_published(self) -> None:
+        upload_response = self.client.post(
+            "/admin/knowledge/upload",
+            headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+            data=self._upload_form_data(title="Onboarding Handbook", summary="General onboarding overview", keywords="", intents="policy_process,reimbursement"),
+            files={
+                "file": (
+                    "travel-policy.txt",
+                    "Employees must fill in their nickname during onboarding. Travel reimbursement requires approval before submission.".encode("utf-8"),
+                    "text/plain",
+                )
+            },
+        )
+        self.assertEqual(200, upload_response.status_code)
+        doc_id = upload_response.json()["data"]["doc_id"]
+
+        preview_response = self.client.post(
+            "/admin/validation/dingtalk-preview",
+            headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+            json={"question": "how to fill nickname", "doc_id": doc_id, "dept_context": "hr"},
+        )
+        self.assertEqual(200, preview_response.status_code)
+        preview_body = preview_response.json()
+        self.assertEqual("passed", preview_body["data"]["validation_result"])
+        self.assertIn("nickname", preview_body["data"]["reply_preview"]["text"].lower())
+
+        publish_response = self.client.post(
+            f"/admin/publish/{doc_id}",
+            headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+            json={"publish_note": "uploaded document ready"},
+        )
+        self.assertEqual(200, publish_response.status_code)
+        self.assertEqual("published", publish_response.json()["data"]["review_status"])
+
+    def test_upload_rejects_scanned_pdf_without_extractable_text(self) -> None:
+        response = self.client.post(
+            "/admin/knowledge/upload",
+            headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+            data=self._upload_form_data(title="扫描版手册", keywords="", intents="policy_process"),
+            files={
+                "file": (
+                    "scanned-handbook.pdf",
+                    self._build_pdf_bytes(""),
+                    "application/pdf",
+                )
+            },
+        )
+        self.assertEqual(400, response.status_code)
+        body = response.json()
+        self.assertEqual("VALIDATION_ERROR", body["detail"]["error"]["code"])
+        self.assertIn("ocr", body["detail"]["error"]["message"].lower())
+
+    def test_admin_can_upload_restricted_docx_document(self) -> None:
+        response = self.client.post(
+            "/admin/knowledge/upload",
+            headers={"X-Admin-Role": "admin", "X-Admin-User-Id": "u-admin-01"},
+            data=self._upload_form_data(
+                knowledge_kind="restricted_doc",
+                title="高管差旅特别政策",
+                owner="admin",
+                department="admin",
+                permission_scope="department",
+                permitted_depts="admin,finance",
+                keywords="高管,差旅,审批",
+                intents="policy_process",
+                version_tag="v2",
+                category="restricted",
+            ),
+            files={
+                "file": (
+                    "exec-policy.docx",
+                    self._build_docx_bytes("高管出差需提前报备。", "仅 admin 与 finance 可查看完整内容。"),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("document", body["data"]["source_type"])
+
+        detail_response = self.client.get(
+            f"/admin/knowledge/{body['data']['doc_id']}",
+            headers={"X-Admin-Role": "admin", "X-Admin-User-Id": "u-admin-01"},
+        )
+        self.assertEqual(200, detail_response.status_code)
+        detail_body = detail_response.json()
+        self.assertEqual("restricted_doc", detail_body["data"]["knowledge"]["knowledge_kind"])
+        self.assertEqual("department", detail_body["data"]["knowledge"]["permission_scope"])
+        self.assertEqual(["admin", "finance"], detail_body["data"]["knowledge"]["permitted_depts"])
+
+    def test_business_cannot_upload_policy_document(self) -> None:
+        response = self.client.post(
+            "/admin/knowledge/upload",
+            headers={"X-Admin-Role": "business", "X-Admin-User-Id": "u-biz-01"},
+            data=self._upload_form_data(owner="business", department="business"),
+            files={
+                "file": (
+                    "travel-policy.txt",
+                    "商务团队无权上传政策文档。".encode("utf-8"),
+                    "text/plain",
+                )
+            },
+        )
+        self.assertEqual(403, response.status_code)
+        body = response.json()
+        self.assertEqual("FORBIDDEN", body["detail"]["error"]["code"])
+
+    def test_hr_can_upload_pdf_document(self) -> None:
+        response = self.client.post(
+            "/admin/knowledge/upload",
+            headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+            data=self._upload_form_data(title="PDF 制度文档", keywords="pdf,制度", intents="policy_process"),
+            files={
+                "file": (
+                    "travel-policy.pdf",
+                    self._build_pdf_bytes("Hello PDF Policy"),
+                    "application/pdf",
+                )
+            },
+        )
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertTrue(body["ok"])
+        doc_id = body["data"]["doc_id"]
+        row = self.connection.execute(
+            "SELECT summary, source_uri FROM knowledge_docs WHERE doc_id = ?",
+            (doc_id,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertIn("Hello PDF Policy", row["summary"])
+        self.assertIn("travel-policy.pdf", row["source_uri"])
+
+    def test_default_app_supports_explicit_sqlite_backend_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["KEAGENT_DB_BACKEND"] = "sqlite"
+            os.environ["KEAGENT_SQLITE_PATH"] = f"{temp_dir}/runtime.sqlite3"
+            try:
+                app = create_app()
+                client = TestClient(app)
+                response = client.get(
+                    "/admin/me/permissions",
+                    headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+                )
+                self.assertEqual(200, response.status_code)
+                self.assertTrue(response.json()["ok"])
+            finally:
+                admin_service = getattr(app.state, "admin_knowledge_service", None)
+                if admin_service is not None:
+                    admin_service.connection.close()
+                os.environ.pop("KEAGENT_DB_BACKEND", None)
+                os.environ.pop("KEAGENT_SQLITE_PATH", None)
 
 
 if __name__ == "__main__":

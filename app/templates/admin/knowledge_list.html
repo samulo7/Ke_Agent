@@ -13,6 +13,8 @@
         <select name="knowledge_kind" class="w-full rounded-xl border border-slate-300 px-4 py-3">
           <option value="" {% if not knowledge_kind %}selected{% endif %}>全部</option>
           <option value="faq" {% if knowledge_kind == 'faq' %}selected{% endif %}>FAQ</option>
+          <option value="policy_doc" {% if knowledge_kind == 'policy_doc' %}selected{% endif %}>制度文档</option>
+          <option value="restricted_doc" {% if knowledge_kind == 'restricted_doc' %}selected{% endif %}>受限文档</option>
           <option value="fixed_quote" {% if knowledge_kind == 'fixed_quote' %}selected{% endif %}>固定报价</option>
         </select>
       </div>
@@ -25,6 +27,9 @@
   <div class="flex flex-wrap gap-3">
     {% if permissions.knowledge_permissions.faq.can_create %}
     <a href="/admin/ui/knowledge/faq/new{{ role_query }}" class="rounded-xl bg-white border border-slate-200 px-4 py-3 text-sm font-medium shadow-sm">+ 新增 FAQ</a>
+    {% endif %}
+    {% if permissions.knowledge_permissions.policy_doc.can_create or permissions.knowledge_permissions.restricted_doc.can_create %}
+    <a href="/admin/ui/knowledge/upload{{ role_query }}" class="rounded-xl bg-white border border-slate-200 px-4 py-3 text-sm font-medium shadow-sm">+ 上传知识文档</a>
     {% endif %}
     {% if permissions.knowledge_permissions.fixed_quote.can_create %}
     <a href="/admin/ui/knowledge/fixed-quote/new{{ role_query }}" class="rounded-xl bg-white border border-slate-200 px-4 py-3 text-sm font-medium shadow-sm">+ 新增固定报价</a>

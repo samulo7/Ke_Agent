@@ -30,6 +30,7 @@ class AdminPagesTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertIn("机器人知识管理", response.text)
         self.assertIn("新增 FAQ", response.text)
+        self.assertIn("上传知识文档", response.text)
         self.assertNotIn("新增固定报价", response.text)
 
     def test_fixed_quote_form_for_hr_is_forbidden(self) -> None:
@@ -46,6 +47,22 @@ class AdminPagesTests(unittest.TestCase):
         )
         self.assertEqual(200, response.status_code)
         self.assertIn("新增固定报价", response.text)
+
+    def test_document_upload_page_renders_for_hr(self) -> None:
+        response = self.client.get(
+            "/admin/ui/knowledge/upload",
+            headers={"X-Admin-Role": "hr", "X-Admin-User-Id": "u-hr-01"},
+        )
+        self.assertEqual(200, response.status_code)
+        self.assertIn("上传知识文档", response.text)
+        self.assertIn("制度文档", response.text)
+
+    def test_document_upload_page_is_forbidden_for_business(self) -> None:
+        response = self.client.get(
+            "/admin/ui/knowledge/upload",
+            headers={"X-Admin-Role": "business", "X-Admin-User-Id": "u-biz-01"},
+        )
+        self.assertEqual(403, response.status_code)
 
     def test_validation_page_renders(self) -> None:
         response = self.client.get(

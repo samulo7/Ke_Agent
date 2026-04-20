@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from io import BytesIO
+import os
 import sqlite3
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
+from app.core.env_loader import load_project_env
 from app.rag.knowledge_retriever import KnowledgeRetriever
 from app.rag.sample_corpus import SAMPLE_KNOWLEDGE_VERSION, load_sample_entries
+from app.repos.postgres_knowledge_repository import PostgresKnowledgeRepository
+from app.repos.postgres_schema import bootstrap_postgres_schema
+from app.repos.runtime_connection import DBBackend, RuntimeConnection, detect_backend, wrap_runtime_connection
 from app.repos.sql_knowledge_repository import SQLKnowledgeRepository, bootstrap_sqlite_schema
+from app.schemas.dingtalk_chat import IntentType
 from app.schemas.knowledge import KnowledgeAccessContext, KnowledgeEntry
 from app.services.intent_classifier import IntentClassifier
 from app.services.knowledge_answering import KnowledgeAnswerService
@@ -54,6 +63,14 @@ class KnowledgeInput:
     version_tag: str
     category: str
     quote_fields: QuoteFieldsInput | None = None
+
+
+@dataclass(frozen=True)
+class ParsedKnowledgeDocument:
+    summary: str
+    source_uri: str
+    chunk_texts: tuple[str, ...]
+    extracted_keywords: tuple[str, ...]
 
 
 _MENU_PERMISSIONS: dict[RoleCode, dict[str, bool]] = {
@@ -140,14 +157,17 @@ class AdminKnowledgeValidationError(ValueError):
 
 
 class AdminKnowledgeService:
-    def __init__(self, *, connection: sqlite3.Connection) -> None:
-        self._connection = connection
-        self._connection.row_factory = sqlite3.Row
+    def __init__(self, *, connection: Any) -> None:
+        self._connection = wrap_runtime_connection(connection)
         self._intent_classifier = IntentClassifier()
 
     @property
-    def connection(self) -> sqlite3.Connection:
+    def connection(self) -> RuntimeConnection:
         return self._connection
+
+    @property
+    def backend(self) -> DBBackend:
+        return self._connection.backend
 
     def get_permissions(self, *, user_id: str, role_code: RoleCode) -> dict[str, Any]:
         self._validate_role(role_code)
@@ -321,6 +341,85 @@ class AdminKnowledgeService:
         self._connection.commit()
         return {"doc_id": doc_id, "review_status": "draft"}
 
+    def upload_knowledge_document(
+        self,
+        *,
+        user_id: str,
+        role_code: RoleCode,
+        payload: KnowledgeInput,
+        filename: str,
+        content: bytes,
+    ) -> dict[str, Any]:
+        self._assert_action_allowed(role_code=role_code, knowledge_kind=payload.knowledge_kind, action="can_create")
+        if payload.knowledge_kind not in {"policy_doc", "restricted_doc"}:
+            raise AdminKnowledgeValidationError("document upload only supports policy_doc or restricted_doc", field="knowledge_kind")
+        parsed = self._parse_uploaded_document(filename=filename, content=content)
+        parsed_payload = KnowledgeInput(
+            knowledge_kind=payload.knowledge_kind,
+            title=payload.title,
+            summary=payload.summary.strip() or parsed.summary,
+            applicability=payload.applicability,
+            next_step=payload.next_step,
+            source_uri=_merge_source_uri(base=payload.source_uri, uploaded=parsed.source_uri),
+            updated_at=payload.updated_at,
+            owner=payload.owner,
+            department=payload.department,
+            permission_scope=payload.permission_scope,
+            permitted_depts=payload.permitted_depts,
+            keywords=_merge_keywords(payload.keywords, parsed.extracted_keywords),
+            intents=payload.intents,
+            version_tag=payload.version_tag,
+            category=payload.category,
+            quote_fields=None,
+        )
+        self._validate_payload(parsed_payload)
+        doc_id = f"doc-{uuid.uuid4().hex[:12]}"
+        self._connection.execute(
+            """
+            INSERT INTO knowledge_docs (
+                doc_id, source_type, title, summary, applicability, next_step, source_uri, updated_at,
+                status, owner, category, version_tag, keywords_csv, intents_csv, permission_scope,
+                permitted_depts_csv, knowledge_kind, review_status, created_by, updated_by,
+                published_by, published_at, last_validated_at, is_deleted
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                doc_id,
+                "document",
+                parsed_payload.title,
+                parsed_payload.summary,
+                parsed_payload.applicability,
+                parsed_payload.next_step,
+                parsed_payload.source_uri,
+                parsed_payload.updated_at,
+                "active",
+                parsed_payload.owner,
+                parsed_payload.category,
+                parsed_payload.version_tag,
+                _csv(parsed_payload.keywords),
+                _csv(parsed_payload.intents),
+                parsed_payload.permission_scope,
+                _csv(parsed_payload.permitted_depts),
+                parsed_payload.knowledge_kind,
+                "draft",
+                user_id,
+                user_id,
+                "",
+                "",
+                "",
+                0,
+            ),
+        )
+        self._replace_document_chunks(doc_id=doc_id, chunk_texts=parsed.chunk_texts)
+        self._connection.commit()
+        return {
+            "doc_id": doc_id,
+            "review_status": "draft",
+            "source_type": "document",
+            "chunk_count": len(parsed.chunk_texts),
+            "updated_at": parsed_payload.updated_at,
+        }
+
     def update_knowledge(
         self,
         *,
@@ -396,21 +495,34 @@ class AdminKnowledgeService:
         question = question.strip()
         if not question:
             raise AdminKnowledgeValidationError("question is required", field="question")
+        target = None
         if doc_id:
             target = self._get_doc(doc_id)
             if target is None:
                 raise AdminKnowledgeNotFoundError(f"knowledge not found: {doc_id}")
-        repository = SQLKnowledgeRepository(connection=self._connection)
+        repository = build_knowledge_repository(connection=self._connection)
         retriever = KnowledgeRetriever(repository=repository)
         answer_service = KnowledgeAnswerService(retriever=retriever, repository=repository)
         intent = self._intent_classifier.classify(question).intent
-        answer = answer_service.answer(
-            question=question,
-            intent=intent,
-            access_context=KnowledgeAccessContext(user_id=user_id, dept_id=dept_context),
-            conversation_id="admin-preview",
-            sender_id=user_id,
-        )
+        candidate_intents = self._validation_candidate_intents(target=target, classified_intent=intent)
+        answer = None
+        answer_intent = intent
+        for candidate_intent in candidate_intents:
+            candidate_answer = answer_service.answer(
+                question=question,
+                intent=candidate_intent,
+                access_context=KnowledgeAccessContext(user_id=user_id, dept_id=dept_context),
+                conversation_id="admin-preview",
+                sender_id=user_id,
+            )
+            if candidate_answer.found or candidate_answer.permission_decision in {"summary_only", "deny"}:
+                answer = candidate_answer
+                answer_intent = candidate_intent
+                break
+            if answer is None:
+                answer = candidate_answer
+                answer_intent = candidate_intent
+        assert answer is not None
         validation_id = f"validation-{uuid.uuid4().hex[:12]}"
         validation_result = "passed" if answer.found or answer.permission_decision in {"summary_only", "deny"} else "failed"
         matched_doc_ids = list(answer.source_ids)
@@ -423,6 +535,7 @@ class AdminKnowledgeService:
             "text": answer.text,
             "interactive_card": None,
         }
+        validation_doc_id = doc_id if doc_id else (None if self.backend == "postgres" else "")
         self._connection.execute(
             """
             INSERT INTO knowledge_validation_runs (
@@ -433,7 +546,7 @@ class AdminKnowledgeService:
             """,
             (
                 validation_id,
-                doc_id,
+                validation_doc_id,
                 question,
                 role_code,
                 dept_context,
@@ -444,7 +557,7 @@ class AdminKnowledgeService:
                 validation_result,
                 user_id,
                 answer.answered_at,
-                f"intent={intent}",
+                f"intent={answer_intent}",
             ),
         )
         if doc_id and validation_result == "passed":
@@ -494,13 +607,14 @@ class AdminKnowledgeService:
             ("published", user_id, published_at, doc_id),
         )
         publish_log_id = f"publish-{uuid.uuid4().hex[:12]}"
+        validation_ref = None if self.backend == "postgres" else ""
         self._connection.execute(
             """
             INSERT INTO knowledge_publish_logs (
                 publish_log_id, doc_id, publish_action, publish_status, validation_id, published_by, published_at, note
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (publish_log_id, doc_id, "publish", "success", "", user_id, published_at, publish_note),
+            (publish_log_id, doc_id, "publish", "success", validation_ref, user_id, published_at, publish_note),
         )
         self._connection.commit()
         return {
@@ -510,7 +624,16 @@ class AdminKnowledgeService:
             "published_by": user_id,
         }
 
-    def _precheck_publish(self, row: sqlite3.Row) -> None:
+    @staticmethod
+    def _validation_candidate_intents(*, target: Any | None, classified_intent: IntentType) -> tuple[IntentType, ...]:
+        candidates: list[IntentType] = [classified_intent]
+        if target is not None:
+            for raw_intent in _parse_csv(str(target["intents_csv"] or "")):
+                if raw_intent not in candidates:
+                    candidates.append(raw_intent)
+        return tuple(candidates)
+
+    def _precheck_publish(self, row: Any) -> None:
         if not str(row["last_validated_at"] or "").strip():
             raise AdminKnowledgeValidationError("knowledge has not been validated", field="last_validated_at")
         knowledge_kind = str(row["knowledge_kind"] or "policy_doc")
@@ -586,6 +709,63 @@ class AdminKnowledgeService:
             (f"chunk-{doc_id}-0", doc_id, 0, chunk_text, "[]"),
         )
 
+    def _replace_document_chunks(self, *, doc_id: str, chunk_texts: Sequence[str]) -> None:
+        self._connection.execute("DELETE FROM doc_chunks WHERE doc_id = ?", (doc_id,))
+        for index, chunk_text in enumerate(chunk_texts):
+            self._connection.execute(
+                """
+                INSERT INTO doc_chunks (chunk_id, doc_id, chunk_index, chunk_text, chunk_vector)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (f"chunk-{doc_id}-{index}", doc_id, index, chunk_text, "[]"),
+            )
+
+    def _parse_uploaded_document(self, *, filename: str, content: bytes) -> ParsedKnowledgeDocument:
+        normalized_name = filename.strip()
+        if not normalized_name:
+            raise AdminKnowledgeValidationError("filename is required", field="file")
+        suffix = Path(normalized_name).suffix.lower()
+        if suffix in {".txt", ".md"}:
+            text = content.decode("utf-8-sig", errors="ignore")
+        elif suffix == ".docx":
+            text = self._extract_docx_text(content)
+        elif suffix == ".pdf":
+            text = self._extract_pdf_text(content)
+        else:
+            raise AdminKnowledgeValidationError("unsupported file type", field="file")
+        normalized_text = _normalize_document_text(text)
+        if not normalized_text:
+            raise AdminKnowledgeValidationError("document content is empty", field="file")
+        chunk_texts = _split_document_chunks(normalized_text)
+        summary = _build_document_summary(_pick_summary_source(chunk_texts))
+        return ParsedKnowledgeDocument(
+            summary=summary,
+            source_uri=f"upload:{normalized_name}",
+            chunk_texts=chunk_texts,
+            extracted_keywords=_extract_document_keywords(title=Path(normalized_name).stem, chunk_texts=chunk_texts),
+        )
+
+    @staticmethod
+    def _extract_docx_text(content: bytes) -> str:
+        from docx import Document
+
+        document = Document(BytesIO(content))
+        return "\n".join(paragraph.text for paragraph in document.paragraphs)
+
+    @staticmethod
+    def _extract_pdf_text(content: bytes) -> str:
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:
+            raise AdminKnowledgeValidationError("pdf upload requires an installed PDF parser dependency", field="file") from exc
+
+        reader = PdfReader(BytesIO(content))
+        texts = [(page.extract_text() or "").strip() for page in reader.pages]
+        extracted = "\n".join(text for text in texts if text)
+        if _looks_like_scanned_pdf(extracted):
+            raise AdminKnowledgeValidationError("pdf appears to be scanned or text extraction failed; OCR is not supported yet", field="file")
+        return extracted
+
     @staticmethod
     def _chunk_text_for_payload(payload: KnowledgeInput) -> str:
         parts = [payload.title, payload.summary, payload.applicability, payload.next_step, _csv(payload.keywords)]
@@ -601,7 +781,7 @@ class AdminKnowledgeService:
             )
         return "\n".join(part.strip() for part in parts if part and part.strip())
 
-    def _row_to_list_item(self, *, row: sqlite3.Row, role_code: RoleCode) -> dict[str, Any]:
+    def _row_to_list_item(self, *, row: Any, role_code: RoleCode) -> dict[str, Any]:
         knowledge_kind = str(row["knowledge_kind"] or "policy_doc")
         permissions = _KIND_PERMISSIONS[role_code][knowledge_kind]
         return {
@@ -619,7 +799,7 @@ class AdminKnowledgeService:
             **permissions,
         }
 
-    def _get_doc(self, doc_id: str) -> sqlite3.Row | None:
+    def _get_doc(self, doc_id: str) -> Any | None:
         return self._connection.execute(
             "SELECT * FROM knowledge_docs WHERE doc_id = ? AND is_deleted = 0",
             (doc_id,),
@@ -664,12 +844,10 @@ class AdminKnowledgeService:
 
 
 def build_shared_admin_runtime_services() -> tuple[AdminKnowledgeService, KnowledgeAnswerService]:
-    connection = sqlite3.connect(":memory:", check_same_thread=False)
-    connection.row_factory = sqlite3.Row
-    bootstrap_sqlite_schema(connection)
+    connection = connect_runtime_db()
     _seed_sample_entries_if_empty(connection)
     admin_service = AdminKnowledgeService(connection=connection)
-    repository = SQLKnowledgeRepository(connection=connection, version=SAMPLE_KNOWLEDGE_VERSION)
+    repository = build_knowledge_repository(connection=connection, version=SAMPLE_KNOWLEDGE_VERSION)
     answer_service = KnowledgeAnswerService(
         retriever=KnowledgeRetriever(repository=repository),
         repository=repository,
@@ -682,14 +860,73 @@ def build_default_admin_knowledge_service() -> AdminKnowledgeService:
     return admin_service
 
 
-def _seed_sample_entries_if_empty(connection: sqlite3.Connection) -> None:
-    row = connection.execute("SELECT COUNT(*) AS total FROM knowledge_docs").fetchone()
-    total = int(row[0] if row is not None else 0)
+def build_knowledge_repository(*, connection: Any, version: str = "a10-sql-v1") -> SQLKnowledgeRepository | PostgresKnowledgeRepository:
+    runtime = wrap_runtime_connection(connection)
+    if runtime.backend == "postgres":
+        return PostgresKnowledgeRepository(connection=runtime, version=version)
+    return SQLKnowledgeRepository(connection=runtime.raw, version=version)
+
+
+def connect_shared_runtime_db() -> RuntimeConnection:
+    return connect_runtime_db()
+
+
+def connect_runtime_db() -> RuntimeConnection:
+    explicit_backend = os.getenv("KEAGENT_DB_BACKEND")
+    explicit_sqlite_path = os.getenv("KEAGENT_SQLITE_PATH")
+    load_project_env()
+    backend_value = explicit_backend if explicit_backend is not None else ("sqlite" if explicit_sqlite_path else os.getenv("KEAGENT_DB_BACKEND"))
+    backend = _resolve_db_backend(backend_value)
+    if backend == "postgres":
+        return connect_postgres_runtime_db()
+    return connect_sqlite_runtime_db()
+
+
+def connect_sqlite_runtime_db() -> RuntimeConnection:
+    raw_path = (os.getenv("KEAGENT_SQLITE_PATH") or "").strip()
+    if raw_path:
+        db_path = Path(raw_path)
+    else:
+        db_path = Path(__file__).resolve().parents[2] / ".local" / "keagent_runtime.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(db_path), check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    bootstrap_sqlite_schema(connection)
+    return RuntimeConnection(backend="sqlite", raw=connection)
+
+
+def connect_postgres_runtime_db() -> RuntimeConnection:
+    import psycopg
+    from psycopg.rows import dict_row
+
+    host = (os.getenv("PG_HOST") or "").strip()
+    database = (os.getenv("PG_DATABASE") or "").strip()
+    user = (os.getenv("PG_USER") or "").strip()
+    password = (os.getenv("PG_PASSWORD") or "").strip()
+    port = int((os.getenv("PG_PORT") or "5432").strip() or "5432")
+    if not host or not database or not user or not password:
+        raise AdminKnowledgeValidationError("PG_* config is required for postgres backend", field="PG_HOST")
+    connection = psycopg.connect(
+        host=host,
+        port=port,
+        dbname=database,
+        user=user,
+        password=password,
+        row_factory=dict_row,
+    )
+    bootstrap_postgres_schema(connection)
+    return RuntimeConnection(backend="postgres", raw=connection)
+
+
+def _seed_sample_entries_if_empty(connection: Any) -> None:
+    runtime = wrap_runtime_connection(connection)
+    row = runtime.execute("SELECT COUNT(*) AS total FROM knowledge_docs").fetchone()
+    total = int((row or {}).get("total", 0) if isinstance(row, dict) else row["total"] if row is not None else 0)
     if total > 0:
         return
     for index, entry in enumerate(load_sample_entries()):
         knowledge_kind = _infer_knowledge_kind(entry)
-        connection.execute(
+        runtime.execute(
             """
             INSERT INTO knowledge_docs (
                 doc_id, source_type, title, summary, applicability, next_step, source_uri, updated_at,
@@ -725,7 +962,7 @@ def _seed_sample_entries_if_empty(connection: sqlite3.Connection) -> None:
                 0,
             ),
         )
-        connection.execute(
+        runtime.execute(
             """
             INSERT INTO doc_chunks (chunk_id, doc_id, chunk_index, chunk_text, chunk_vector)
             VALUES (?, ?, ?, ?, ?)
@@ -738,7 +975,14 @@ def _seed_sample_entries_if_empty(connection: sqlite3.Connection) -> None:
                 "[]",
             ),
         )
-    connection.commit()
+    runtime.commit()
+
+
+def _resolve_db_backend(raw_value: str | None) -> DBBackend:
+    normalized = (raw_value or "sqlite").strip().lower()
+    if normalized == "postgres":
+        return "postgres"
+    return "sqlite"
 
 
 def _infer_knowledge_kind(entry: KnowledgeEntry) -> str:
@@ -751,6 +995,90 @@ def _infer_knowledge_kind(entry: KnowledgeEntry) -> str:
 
 def _csv(items: Sequence[str]) -> str:
     return ",".join(item.strip() for item in items if item.strip())
+
+
+def _normalize_document_text(raw: str) -> str:
+    lines = [line.strip() for line in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    compact = [line for line in lines if line]
+    return "\n".join(compact)
+
+
+def _split_document_chunks(raw: str, *, max_chars: int = 800) -> tuple[str, ...]:
+    paragraphs = [paragraph.strip() for paragraph in raw.split("\n") if paragraph.strip()]
+    chunks: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        candidate = paragraph if not current else f"{current}\n{paragraph}"
+        if current and len(candidate) > max_chars:
+            chunks.append(current)
+            current = paragraph
+            continue
+        current = candidate
+    if current:
+        chunks.append(current)
+    return tuple(chunks) if chunks else (raw[:max_chars],)
+
+
+def _pick_summary_source(chunk_texts: Sequence[str]) -> str:
+    def score(text: str) -> int:
+        normalized = text.replace("\n", " ")
+        cjk_count = sum(1 for char in normalized if "\u4e00" <= char <= "\u9fff")
+        alpha_num_count = sum(1 for char in normalized if char.isalnum())
+        dot_leader_penalty = normalized.count(".") + normalized.count("·") + normalized.count("…")
+        toc_penalty = 20 if "目录" in normalized else 0
+        return cjk_count * 2 + alpha_num_count - dot_leader_penalty * 3 - toc_penalty
+
+    return max(chunk_texts, key=score) if chunk_texts else ""
+
+
+def _extract_document_keywords(*, title: str, chunk_texts: Sequence[str], max_keywords: int = 20) -> tuple[str, ...]:
+    import re
+    from collections import Counter
+
+    counter: Counter[str] = Counter()
+    seed_text = "\n".join((title, *chunk_texts))
+    for token in re.findall(r"[\u4e00-\u9fff]{2,8}|[A-Za-z0-9][A-Za-z0-9._-]{1,31}", seed_text):
+        normalized = token.strip()
+        if not normalized or normalized.isdigit() or normalized in {"目录", "员工", "手册", "制度", "说明", "流程"}:
+            continue
+        counter[normalized] += 1
+    ranked = sorted(counter.items(), key=lambda item: (-item[1], -len(item[0]), item[0]))
+    return tuple(token for token, _ in ranked[:max_keywords])
+
+
+def _looks_like_scanned_pdf(raw: str) -> bool:
+    normalized = _normalize_document_text(raw)
+    if not normalized:
+        return True
+    signal_count = sum(1 for char in normalized if char.isalnum() or "\u4e00" <= char <= "\u9fff")
+    return signal_count < 8
+
+
+def _build_document_summary(raw: str, *, max_chars: int = 220) -> str:
+    summary = raw.replace("\n", " ").strip()
+    if len(summary) <= max_chars:
+        return summary
+    return summary[: max_chars - 1].rstrip() + "…"
+
+
+def _merge_keywords(primary: Sequence[str], extracted: Sequence[str], *, limit: int = 20) -> tuple[str, ...]:
+    merged: list[str] = []
+    for item in (*primary, *extracted):
+        normalized = item.strip()
+        if not normalized or normalized in merged:
+            continue
+        merged.append(normalized)
+        if len(merged) >= limit:
+            break
+    return tuple(merged)
+
+
+def _merge_source_uri(*, base: str, uploaded: str) -> str:
+    normalized_base = base.strip()
+    normalized_uploaded = uploaded.strip()
+    if normalized_base and normalized_uploaded:
+        return f"{normalized_base}|{normalized_uploaded}"
+    return normalized_base or normalized_uploaded
 
 
 def _parse_csv(raw: str) -> list[str]:
